@@ -137,6 +137,20 @@ make market-factor-catalog
 FACTOR_SYMBOL=BTCUSDT FACTOR_INTERVAL=4h make market-factor-sample
 ```
 
+Run the exploratory cross-sectional evaluator with the declared major-symbol
+universe:
+
+```bash
+make factor-evaluate
+```
+
+For every factor, the training segment fixes whether high or low values are the
+active direction. The test segment then reports cross-sectional rank IC, ICIR,
+quarterly and cross-symbol stability, and an equal-weight long/short portfolio
+using next-bar open-to-close returns with turnover costs. The resulting ranking
+is a research-lead generator: because the test segment is used to rank factors,
+it cannot also serve as untouched confirmation for a strategy built from it.
+
 To discover current and historical USDT Spot symbols and materialize resumable
 1h batches (still without downloading the batches):
 
