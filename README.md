@@ -69,6 +69,43 @@ continues at the checkpoint's `next_action` and may mark the request consumed.
 `data-inventory-plan` writes a no-download plan for the full universe and
 rolling historical-liquidity top-N work; it does not start a backfill.
 
+## Unified local market-data interface
+
+`MarketDataStore` is the read-only research entry point for the local database.
+It exposes spot trade bars; USD-M perpetual trade, mark, index, and premium-index
+bars; native funding events; and native 5-minute open-interest/positioning
+metrics without requiring a strategy to know the underlying SQLite tables.
+It does not download or mutate data.
+
+```python
+from pathlib import Path
+from crypto_quant.market_data import MarketDataStore, USD_M_PERPETUAL
+
+data = MarketDataStore(Path("market_data/crypto_quant.sqlite"))
+bars = data.load_bars(USD_M_PERPETUAL, "BTCUSDT", interval="4h")
+features = data.load_feature_frame(
+    USD_M_PERPETUAL,
+    "BTCUSDT",
+    interval="4h",
+    include_funding=True,
+    include_metrics=True,
+)
+```
+
+Multi-hour and daily bars use the common local 1-hour base whenever it is
+available, so symbols follow one aggregation rule even when a legacy exact bar
+table also exists. Buckets with a missing source hour are omitted rather than
+filled; `derive=False` can explicitly request a stored exact interval. Auxiliary
+events use a backward as-of join, retain their original observation timestamps,
+and therefore cannot leak a later observation into an earlier bar.
+
+Inspect the whole local catalog or exact coverage for selected symbols:
+
+```bash
+make market-data-catalog
+MARKET_DATA_SYMBOLS=BTCUSDT,ETHUSDT make market-data-catalog
+```
+
 To discover current and historical USDT Spot symbols and materialize resumable
 1h batches (still without downloading the batches):
 
