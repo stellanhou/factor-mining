@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crypto-quant-research"
+version = "0.1.0"
+description = "Personal crypto quant research and backtesting system"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "requests>=2.31",
+  "tabulate>=0.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+crypto-quant = "crypto_quant.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

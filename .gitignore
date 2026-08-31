@@ -1,0 +1,38 @@
+# Local credentials. Commit only the empty template.
+.env
+.env.*
+!.env.example
+
+# Local market data and databases are rebuilt by the data pipelines.
+market_data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Generated research and runtime artifacts.
+experiments/audits/
+experiments/briefs/
+experiments/data_requests/
+experiments/demo_sessions/
+experiments/download_logs/
+experiments/futures_backfill/
+experiments/runs/
+experiments/shadow_sessions/
+experiments/testnet_sessions/
+
+# Python and local tool caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Editor and operating-system files.
+.DS_Store
+.idea/
+.vscode/
