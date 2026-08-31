@@ -64,6 +64,7 @@ from .strategy_platform import MetricInputs, STRATEGY_FAMILIES, StrategyPlatform
 from .demo_platform import DemoExecutionOrchestrator, make_demo_orchestrator
 from .data_requests import DataRequestStore, build_inventory_plan, build_dynamic_top50_plan, resume_inventory_plan, run_inventory_plan, run_top50_plan
 from .futures_backfill import build_um_futures_core_plan, repair_partial_metrics, run_um_futures_core_plan, um_futures_core_status
+from .market_data import MarketDataStore
 from .reporting import run_first_study
 from .basket_trend import run_basket_trend_study
 from .basket_vol_beta import run_basket_vol_beta_study
@@ -226,6 +227,17 @@ def main() -> None:
     futures_metrics_repair.add_argument("--plan-id", required=True)
     futures_metrics_repair.add_argument("--db", type=Path, default=DEFAULT_DB)
     futures_metrics_repair.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+
+    market_catalog = subparsers.add_parser(
+        "market-data-catalog",
+        help="show unified local spot and USD-M data coverage",
+    )
+    market_catalog.add_argument("--db", type=Path, default=DEFAULT_DB)
+    market_catalog.add_argument(
+        "--symbols",
+        default="",
+        help="optional comma-separated symbols for exact per-symbol coverage",
+    )
 
     status = subparsers.add_parser("status", help="show local market-data coverage")
     status.add_argument("--db", type=Path, default=DEFAULT_DB)
@@ -867,6 +879,9 @@ def main() -> None:
         _print_json(um_futures_core_status(args.plan_id, db_path=args.db, output_root=args.output))
     elif args.command == "futures-core-repair-metrics":
         _print_json(repair_partial_metrics(args.plan_id, db_path=args.db, output_root=args.output))
+    elif args.command == "market-data-catalog":
+        symbols = [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
+        _print_json(MarketDataStore(args.db).catalog(symbols or None))
     elif args.command == "update-data":
         symbols = [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
         counts = update_klines(
@@ -903,6 +918,7 @@ def main() -> None:
                     "funding_rates": funding_snapshot(args.db),
                     "open_interest": open_interest_snapshot(args.db),
                     "positioning": positioning_snapshot(args.db),
+                    "unified_market_data": data_audit["unified_market_data"],
                     "source_statuses": source_statuses,
                 }
             )
