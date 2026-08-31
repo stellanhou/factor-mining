@@ -106,6 +106,37 @@ make market-data-catalog
 MARKET_DATA_SYMBOLS=BTCUSDT,ETHUSDT make market-data-catalog
 ```
 
+## Causal derived factors
+
+`FactorEngine` turns the unified source data into a stable factor frame for one
+symbol. The first catalog includes basis, mark/index dislocation, funding carry,
+open-interest change, long/short positioning, taker flow, liquidity, relative
+returns, and realized volatility. Missing optional inputs produce `NaN` only for
+their dependent factors and are listed in `input_availability`; they do not
+silently remove the symbol.
+
+```python
+from pathlib import Path
+from crypto_quant.factors import load_factor_frame
+
+factors = load_factor_frame(
+    Path("market_data/crypto_quant.sqlite"),
+    "BTCUSDT",
+    interval="4h",
+    start="2023-01-01",
+)
+```
+
+Every row is timestamped by the base bar open and includes `available_at`, the
+actual bar close. Price sources must be closed by `available_at`; funding and
+metrics use a backward as-of match to that time. The factor row may therefore be
+used only for the next bar or later, never for execution inside its own bar.
+
+```bash
+make market-factor-catalog
+FACTOR_SYMBOL=BTCUSDT FACTOR_INTERVAL=4h make market-factor-sample
+```
+
 To discover current and historical USDT Spot symbols and materialize resumable
 1h batches (still without downloading the batches):
 

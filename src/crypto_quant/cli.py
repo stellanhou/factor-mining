@@ -65,6 +65,7 @@ from .demo_platform import DemoExecutionOrchestrator, make_demo_orchestrator
 from .data_requests import DataRequestStore, build_inventory_plan, build_dynamic_top50_plan, resume_inventory_plan, run_inventory_plan, run_top50_plan
 from .futures_backfill import build_um_futures_core_plan, repair_partial_metrics, run_um_futures_core_plan, um_futures_core_status
 from .market_data import MarketDataStore
+from .factors import FactorEngine, factor_catalog
 from .reporting import run_first_study
 from .basket_trend import run_basket_trend_study
 from .basket_vol_beta import run_basket_vol_beta_study
@@ -238,6 +239,27 @@ def main() -> None:
         default="",
         help="optional comma-separated symbols for exact per-symbol coverage",
     )
+
+    subparsers.add_parser(
+        "market-factor-catalog",
+        help="show causal derived-factor definitions",
+    )
+    factor_sample = subparsers.add_parser(
+        "market-factor-sample",
+        help="build a compact local factor sample for one symbol",
+    )
+    factor_sample.add_argument("--db", type=Path, default=DEFAULT_DB)
+    factor_sample.add_argument("--symbol", required=True)
+    factor_sample.add_argument("--interval", default="1h")
+    factor_sample.add_argument(
+        "--base-market",
+        choices=("spot", "usd_m_perpetual"),
+        default="usd_m_perpetual",
+    )
+    factor_sample.add_argument("--start", default=None)
+    factor_sample.add_argument("--end", default=None)
+    factor_sample.add_argument("--warmup-days", type=int, default=30)
+    factor_sample.add_argument("--tail", type=int, default=3)
 
     status = subparsers.add_parser("status", help="show local market-data coverage")
     status.add_argument("--db", type=Path, default=DEFAULT_DB)
@@ -882,6 +904,19 @@ def main() -> None:
     elif args.command == "market-data-catalog":
         symbols = [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
         _print_json(MarketDataStore(args.db).catalog(symbols or None))
+    elif args.command == "market-factor-catalog":
+        _print_json(factor_catalog())
+    elif args.command == "market-factor-sample":
+        engine = FactorEngine(MarketDataStore(args.db))
+        frame = engine.load(
+            args.symbol,
+            interval=args.interval,
+            start=args.start,
+            end=args.end,
+            base_market=args.base_market,
+            warmup_days=args.warmup_days,
+        )
+        _print_json(engine.snapshot(frame, tail=args.tail))
     elif args.command == "update-data":
         symbols = [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
         counts = update_klines(
