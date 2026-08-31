@@ -66,6 +66,7 @@ from .data_requests import DataRequestStore, build_inventory_plan, build_dynamic
 from .futures_backfill import build_um_futures_core_plan, repair_partial_metrics, run_um_futures_core_plan, um_futures_core_status
 from .market_data import MarketDataStore
 from .factors import FactorEngine, factor_catalog
+from .factor_evaluation import DEFAULT_FACTOR_UNIVERSE, FactorEvaluationConfig, run_factor_evaluation
 from .reporting import run_first_study
 from .basket_trend import run_basket_trend_study
 from .basket_vol_beta import run_basket_vol_beta_study
@@ -260,6 +261,26 @@ def main() -> None:
     factor_sample.add_argument("--end", default=None)
     factor_sample.add_argument("--warmup-days", type=int, default=30)
     factor_sample.add_argument("--tail", type=int, default=3)
+
+    factor_evaluate = subparsers.add_parser(
+        "factor-evaluate",
+        help="run exploratory cross-sectional factor evaluation",
+    )
+    factor_evaluate.add_argument("--db", type=Path, default=DEFAULT_DB)
+    factor_evaluate.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    factor_evaluate.add_argument("--symbols", default=",".join(DEFAULT_FACTOR_UNIVERSE))
+    factor_evaluate.add_argument("--interval", default="4h")
+    factor_evaluate.add_argument("--start", default="2023-01-01")
+    factor_evaluate.add_argument("--test-start", default="2025-01-01")
+    factor_evaluate.add_argument("--end", default="2026-07-31")
+    factor_evaluate.add_argument(
+        "--base-market",
+        choices=("spot", "usd_m_perpetual"),
+        default="usd_m_perpetual",
+    )
+    factor_evaluate.add_argument("--cost-bps", type=float, default=10.0)
+    factor_evaluate.add_argument("--quantile", type=float, default=0.20)
+    factor_evaluate.add_argument("--min-cross-section", type=int, default=5)
 
     status = subparsers.add_parser("status", help="show local market-data coverage")
     status.add_argument("--db", type=Path, default=DEFAULT_DB)
@@ -917,6 +938,21 @@ def main() -> None:
             warmup_days=args.warmup_days,
         )
         _print_json(engine.snapshot(frame, tail=args.tail))
+    elif args.command == "factor-evaluate":
+        symbols = tuple(item.strip().upper() for item in args.symbols.split(",") if item.strip())
+        config = FactorEvaluationConfig(
+            symbols=symbols,
+            interval=args.interval,
+            start=args.start,
+            test_start=args.test_start,
+            end=args.end,
+            base_market=args.base_market,
+            cost_bps=args.cost_bps,
+            quantile=args.quantile,
+            min_cross_section=args.min_cross_section,
+        )
+        run_dir = run_factor_evaluation(args.db, args.output, config)
+        _print_json({"status": "complete", "run_directory": str(run_dir)})
     elif args.command == "update-data":
         symbols = [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
         counts = update_klines(
