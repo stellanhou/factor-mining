@@ -150,6 +150,10 @@ quarterly and cross-symbol stability, and an equal-weight long/short portfolio
 using next-bar open-to-close returns with turnover costs. The resulting ranking
 is a research-lead generator: because the test segment is used to rank factors,
 it cannot also serve as untouched confirmation for a strategy built from it.
+Raw base-unit open interest remains available for within-symbol time-series
+research but is excluded from cross-sectional ranking because contract units are
+not comparable across assets; data-age fields are diagnostics and are excluded
+for the same evaluation purpose.
 
 To discover current and historical USDT Spot symbols and materialize resumable
 1h batches (still without downloading the batches):
