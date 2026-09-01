@@ -16,6 +16,7 @@ experiments/data_requests/
 experiments/demo_sessions/
 experiments/download_logs/
 experiments/futures_backfill/
+experiments/futures_demo_sessions/
 experiments/runs/
 experiments/shadow_sessions/
 experiments/testnet_sessions/

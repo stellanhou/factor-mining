@@ -60,6 +60,10 @@ from .testnet import (
     TestnetSession,
 )
 from .demo import DemoClient, DemoCredentials, DemoRehearsal, DemoSession
+from .futures_demo import (
+    FuturesDemoSession,
+    make_futures_demo_orchestrator,
+)
 from .strategy_platform import MetricInputs, STRATEGY_FAMILIES, StrategyPlatform
 from .demo_platform import DemoExecutionOrchestrator, make_demo_orchestrator
 from .data_requests import DataRequestStore, build_inventory_plan, build_dynamic_top50_plan, resume_inventory_plan, run_inventory_plan, run_top50_plan
@@ -771,6 +775,52 @@ def main() -> None:
     demo_cancel.add_argument("--intent-id", required=True)
     demo_cancel.add_argument("--authorize-demo-orders", action="store_true", help="explicitly authorize Demo Mode REST cancellation")
 
+    futures_demo_init = subparsers.add_parser(
+        "futures-demo-init", help="initialize an offline USD-M Futures Demo forward session"
+    )
+    futures_demo_init.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    futures_demo_status = subparsers.add_parser(
+        "futures-demo-status", help="show an offline USD-M Futures Demo session"
+    )
+    futures_demo_status.add_argument("--session", type=Path, required=True)
+    futures_demo_reconcile = subparsers.add_parser(
+        "futures-demo-reconcile", help="reconcile USD-M Futures Demo account and positions"
+    )
+    futures_demo_reconcile.add_argument("--session", type=Path, required=True)
+    futures_demo_reconcile.add_argument("--authorize-futures-demo", action="store_true")
+    futures_demo_snapshot = subparsers.add_parser(
+        "futures-demo-snapshot", help="build the frozen current public positioning signal"
+    )
+    futures_demo_snapshot.add_argument("--session", type=Path, required=True)
+    futures_demo_snapshot.add_argument("--authorize-futures-demo", action="store_true")
+    futures_demo_test = subparsers.add_parser(
+        "futures-demo-test-order", help="validate one USD-M Demo order without placement"
+    )
+    futures_demo_test.add_argument("--session", type=Path, required=True)
+    futures_demo_test.add_argument("--symbol", default="BTCUSDT")
+    futures_demo_test.add_argument("--side", choices=["BUY", "SELL"], default="BUY")
+    futures_demo_test.add_argument("--notional", default="60")
+    futures_demo_test.add_argument("--authorize-futures-demo", action="store_true")
+    futures_demo_enable = subparsers.add_parser(
+        "futures-demo-enable", help="enable the frozen USD-M Futures Demo cycle"
+    )
+    futures_demo_enable.add_argument("--session", type=Path, required=True)
+    futures_demo_enable.add_argument("--authorize-futures-demo", action="store_true")
+    futures_demo_disable = subparsers.add_parser(
+        "futures-demo-disable", help="disable the USD-M Futures Demo cycle"
+    )
+    futures_demo_disable.add_argument("--session", type=Path, required=True)
+    futures_demo_run = subparsers.add_parser(
+        "futures-demo-run-cycle", help="run one scheduled USD-M Futures Demo rebalance cycle"
+    )
+    futures_demo_run.add_argument("--session", type=Path, required=True)
+    futures_demo_run.add_argument("--authorize-futures-demo", action="store_true")
+    futures_demo_kill = subparsers.add_parser(
+        "futures-demo-kill", help="disable USD-M Futures Demo and cancel open orders"
+    )
+    futures_demo_kill.add_argument("--session", type=Path, required=True)
+    futures_demo_kill.add_argument("--authorize-futures-demo", action="store_true")
+
     platform_init = subparsers.add_parser("platform-init", help="initialize an offline local strategy platform")
     platform_init.add_argument("--platform", type=Path, default=DEFAULT_OUTPUT / "strategy_platform")
     platform_status = subparsers.add_parser("platform-status", help="show offline strategy platform status")
@@ -1413,6 +1463,50 @@ def main() -> None:
         _print_json(session.status())
     elif args.command == "demo-status":
         _print_json(DemoSession.open(args.session).status())
+    elif args.command == "futures-demo-init":
+        session = FuturesDemoSession.initialize(args.output)
+        _print_json(session.status())
+    elif args.command == "futures-demo-status":
+        _print_json(FuturesDemoSession.open(args.session).status())
+    elif args.command in {
+        "futures-demo-reconcile",
+        "futures-demo-snapshot",
+        "futures-demo-test-order",
+        "futures-demo-enable",
+        "futures-demo-disable",
+        "futures-demo-run-cycle",
+        "futures-demo-kill",
+    }:
+        if args.command != "futures-demo-disable":
+            if not args.authorize_futures_demo:
+                parser.error(f"{args.command} requires --authorize-futures-demo")
+            if os.environ.get("AUTHORIZED_BINANCE_FUTURES_DEMO") != "1":
+                parser.error(
+                    f"{args.command} requires AUTHORIZED_BINANCE_FUTURES_DEMO=1"
+                )
+        orchestrator = make_futures_demo_orchestrator(args.session)
+        if args.command == "futures-demo-reconcile":
+            _print_json(orchestrator.reconcile())
+        elif args.command == "futures-demo-snapshot":
+            _print_json(orchestrator.snapshot())
+        elif args.command == "futures-demo-test-order":
+            from decimal import Decimal
+
+            _print_json(
+                orchestrator.test_order(
+                    symbol=args.symbol,
+                    side=args.side,
+                    notional=Decimal(str(args.notional)),
+                )
+            )
+        elif args.command == "futures-demo-enable":
+            _print_json(orchestrator.enable())
+        elif args.command == "futures-demo-disable":
+            _print_json(orchestrator.disable())
+        elif args.command == "futures-demo-run-cycle":
+            _print_json(orchestrator.run_cycle())
+        else:
+            _print_json(orchestrator.kill())
     elif args.command == "demo-kill":
         session = DemoSession.open(args.session)
         session.activate_kill_switch()

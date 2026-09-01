@@ -298,6 +298,54 @@ those network commands. BUY is limited to 10 USDT per order and 25 USDT total;
 SELL is only for reconciled free base balances. Demo client IDs use `dm_` and
 Demo sessions cannot be opened by the Testnet client.
 
+## Binance USD-M Futures Demo forward bridge
+
+The independent `futures-demo-*` commands run the frozen
+`toptrader_position_contrarian_v1` rule against Binance's documented USD-M
+non-production REST origin `https://demo-fapi.binance.com`. Signed account,
+position, leverage, test-order, and market-order requests cannot target a
+production host. Signal discovery is the only production-domain call and uses
+the unauthenticated public endpoint
+`https://fapi.binance.com/futures/data/topLongShortPositionRatio`; no production
+API key, account, or order route exists in this bridge.
+
+The forward session freezes the active intersection of the declared historical
+20-symbol universe and Demo's current USDT perpetual contracts. On 2026-09-01,
+19 were active and `MATICUSDT` was excluded. The historical study remains 1x
+gross. Demo sizing is 2x gross at 2x initial leverage because the current Demo
+`MIN_NOTIONAL` is 50 USDT and a 500 USDT slot can retain up to eight names in
+each buffered leg; the sizing difference is recorded and cannot change inside
+one session.
+The complete frozen forward contract is
+`docs/strategy_ideation/20260901_toptrader_position_contrarian_v1_demo_contract.md`.
+
+The strategy runs once daily in the first 15 minutes after 00:00 UTC. A late
+invocation returns `waiting_for_next_execution_window` without placing orders.
+Every cycle reconciles account mode, positions, open orders, exchange filters,
+and final filled positions. MARKET reductions are sent before openings. Reusing
+the same execution timestamp is idempotent. The kill command cancels open orders
+and closes the session-owned one-way positions with reduce-only MARKET orders.
+
+The existing two values in `.env.demo` are reused. Network commands additionally
+require `AUTHORIZED_BINANCE_FUTURES_DEMO=1`:
+
+```bash
+make futures-demo-init
+AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-reconcile
+AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-snapshot
+AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-test-order
+AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-enable
+AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-run-cycle
+make futures-demo-status
+make futures-demo-disable
+AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-kill
+```
+
+`futures-demo-test-order` calls Binance's `/fapi/v1/order/test`; it validates
+the signed trade request but does not place an order. Demo orders and PnL are
+forward execution observations only and do not repair the historical DSR result
+or authorize live capital.
+
 ## Strategy-platform Demo bridge (Phase 2)
 
 The `platform-demo-*` commands are a finite, externally schedulable one-cycle
