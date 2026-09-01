@@ -155,6 +155,19 @@ research but is excluded from cross-sectional ranking because contract units are
 not comparable across assets; data-age fields are diagnostics and are excluded
 for the same evaluation purpose.
 
+The first concrete strategy adapter for the selected positioning lead is frozen
+in `docs/strategy_ideation/20260901_toptrader_position_contrarian_v1_contract.md`.
+It compares the raw 4-hour factor portfolio with a 24-hour-smoothed, daily
+rebalanced, buffered long/short rule and includes exact observed funding plus
+one-way transaction costs on gross traded notional:
+
+```bash
+make positioning-contrarian-study
+```
+
+This is selection-aware development testing. Its 2025-2026 segment participated
+in factor selection and cannot be reused as untouched confirmation.
+
 To discover current and historical USDT Spot symbols and materialize resumable
 1h batches (still without downloading the batches):
 

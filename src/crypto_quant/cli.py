@@ -67,6 +67,10 @@ from .futures_backfill import build_um_futures_core_plan, repair_partial_metrics
 from .market_data import MarketDataStore
 from .factors import FactorEngine, factor_catalog
 from .factor_evaluation import DEFAULT_FACTOR_UNIVERSE, FactorEvaluationConfig, run_factor_evaluation
+from .positioning_contrarian import (
+    PositioningContrarianConfig,
+    run_positioning_contrarian_study,
+)
 from .reporting import run_first_study
 from .basket_trend import run_basket_trend_study
 from .basket_vol_beta import run_basket_vol_beta_study
@@ -281,6 +285,22 @@ def main() -> None:
     factor_evaluate.add_argument("--cost-bps", type=float, default=10.0)
     factor_evaluate.add_argument("--quantile", type=float, default=0.20)
     factor_evaluate.add_argument("--min-cross-section", type=int, default=5)
+
+    positioning_contrarian = subparsers.add_parser(
+        "positioning-contrarian-study",
+        help="run the frozen top-trader positioning contrarian V1 development study",
+    )
+    positioning_contrarian.add_argument("--db", type=Path, default=DEFAULT_DB)
+    positioning_contrarian.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    positioning_contrarian.add_argument(
+        "--symbols", default=",".join(DEFAULT_FACTOR_UNIVERSE)
+    )
+    positioning_contrarian.add_argument("--interval", default="4h")
+    positioning_contrarian.add_argument("--start", default="2023-01-01")
+    positioning_contrarian.add_argument("--test-start", default="2025-01-01")
+    positioning_contrarian.add_argument("--end", default="2026-07-31")
+    positioning_contrarian.add_argument("--cost-bps", type=float, default=10.0)
+    positioning_contrarian.add_argument("--min-cross-section", type=int, default=5)
 
     status = subparsers.add_parser("status", help="show local market-data coverage")
     status.add_argument("--db", type=Path, default=DEFAULT_DB)
@@ -952,6 +972,23 @@ def main() -> None:
             min_cross_section=args.min_cross_section,
         )
         run_dir = run_factor_evaluation(args.db, args.output, config)
+        _print_json({"status": "complete", "run_directory": str(run_dir)})
+    elif args.command == "positioning-contrarian-study":
+        symbols = tuple(
+            item.strip().upper()
+            for item in args.symbols.split(",")
+            if item.strip()
+        )
+        config = PositioningContrarianConfig(
+            symbols=symbols,
+            interval=args.interval,
+            start=args.start,
+            test_start=args.test_start,
+            end=args.end,
+            cost_bps=args.cost_bps,
+            min_cross_section=args.min_cross_section,
+        )
+        run_dir = run_positioning_contrarian_study(args.db, args.output, config)
         _print_json({"status": "complete", "run_directory": str(run_dir)})
     elif args.command == "update-data":
         symbols = [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
