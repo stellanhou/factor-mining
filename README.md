@@ -321,6 +321,9 @@ The complete frozen forward contract is
 
 The strategy runs once daily in the first 15 minutes after 00:00 UTC. A late
 invocation returns `waiting_for_next_execution_window` without placing orders.
+One new session may use `futures-demo-bootstrap-cycle` once to establish its
+initial portfolio later on the first UTC day. That operator-authorized bootstrap
+is labeled separately and records its delay; it does not relax later cycles.
 Every cycle reconciles account mode, positions, open orders, exchange filters,
 and final filled positions. MARKET reductions are sent before openings. Reusing
 the same execution timestamp is idempotent. The kill command cancels open orders
@@ -336,6 +339,7 @@ AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-snapshot
 AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-test-order
 AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-enable
 AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-run-cycle
+AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-bootstrap-cycle
 make futures-demo-status
 make futures-demo-disable
 AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-kill

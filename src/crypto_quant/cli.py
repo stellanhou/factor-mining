@@ -815,6 +815,13 @@ def main() -> None:
     )
     futures_demo_run.add_argument("--session", type=Path, required=True)
     futures_demo_run.add_argument("--authorize-futures-demo", action="store_true")
+    futures_demo_bootstrap = subparsers.add_parser(
+        "futures-demo-bootstrap-cycle",
+        help="explicitly place the first USD-M Demo portfolio after the daily window",
+    )
+    futures_demo_bootstrap.add_argument("--session", type=Path, required=True)
+    futures_demo_bootstrap.add_argument("--authorize-futures-demo", action="store_true")
+    futures_demo_bootstrap.add_argument("--authorize-initial-bootstrap", action="store_true")
     futures_demo_kill = subparsers.add_parser(
         "futures-demo-kill", help="disable USD-M Futures Demo and cancel open orders"
     )
@@ -1475,6 +1482,7 @@ def main() -> None:
         "futures-demo-enable",
         "futures-demo-disable",
         "futures-demo-run-cycle",
+        "futures-demo-bootstrap-cycle",
         "futures-demo-kill",
     }:
         if args.command != "futures-demo-disable":
@@ -1484,6 +1492,10 @@ def main() -> None:
                 parser.error(
                     f"{args.command} requires AUTHORIZED_BINANCE_FUTURES_DEMO=1"
                 )
+        if args.command == "futures-demo-bootstrap-cycle" and not args.authorize_initial_bootstrap:
+            parser.error(
+                "futures-demo-bootstrap-cycle requires --authorize-initial-bootstrap"
+            )
         orchestrator = make_futures_demo_orchestrator(args.session)
         if args.command == "futures-demo-reconcile":
             _print_json(orchestrator.reconcile())
@@ -1505,6 +1517,8 @@ def main() -> None:
             _print_json(orchestrator.disable())
         elif args.command == "futures-demo-run-cycle":
             _print_json(orchestrator.run_cycle())
+        elif args.command == "futures-demo-bootstrap-cycle":
+            _print_json(orchestrator.run_cycle(allow_initial_bootstrap=True))
         else:
             _print_json(orchestrator.kill())
     elif args.command == "demo-kill":
