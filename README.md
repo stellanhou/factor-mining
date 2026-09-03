@@ -29,7 +29,8 @@ risk review?
 - Maintenance/listing transitions may produce short partial bars and gaps;
   both are retained and reported rather than filled.
 
-This is research software, not investment advice or an execution system.
+This is research software with non-production Demo execution, not investment
+advice or a live-capital execution system.
 
 ## Repository and local data
 
@@ -316,18 +317,18 @@ gross. Demo sizing is 2x gross at 2x initial leverage because the current Demo
 `MIN_NOTIONAL` is 50 USDT and a 500 USDT slot can retain up to eight names in
 each buffered leg; the sizing difference is recorded and cannot change inside
 one session.
-The complete frozen forward contract is
-`docs/strategy_ideation/20260901_toptrader_position_contrarian_v1_demo_contract.md`.
+The active simplified forward contract is
+`docs/strategy_ideation/20260902_toptrader_position_contrarian_v1_demo_contract_v2.md`.
+The original 2026-09-01 contract remains unchanged as historical evidence.
 
-The strategy runs once daily in the first 15 minutes after 00:00 UTC. A late
-invocation returns `waiting_for_next_execution_window` without placing orders.
-One new session may use `futures-demo-bootstrap-cycle` once to establish its
-initial portfolio later on the first UTC day. That operator-authorized bootstrap
-is labeled separately and records its delay; it does not relax later cycles.
-Every cycle reconciles account mode, positions, open orders, exchange filters,
-and final filled positions. MARKET reductions are sent before openings. Reusing
-the same execution timestamp is idempotent. The kill command cancels open orders
-and closes the session-owned one-way positions with reduce-only MARKET orders.
+The daily signal is anchored at 00:00 UTC and the first scheduled invocation on
+that UTC day processes it. This keeps one daily decision without duplicating the
+external scheduler's timing gate; a delayed local task is recorded as delayed
+execution instead of silently skipping the day. Every cycle reconciles account
+mode, positions, open orders, exchange filters, and final filled positions.
+MARKET reductions are sent before openings. Reusing the same execution timestamp
+is idempotent. The kill command cancels open orders and closes session-owned
+one-way positions with reduce-only MARKET orders.
 
 The existing two values in `.env.demo` are reused. Network commands additionally
 require `AUTHORIZED_BINANCE_FUTURES_DEMO=1`:
@@ -336,19 +337,18 @@ require `AUTHORIZED_BINANCE_FUTURES_DEMO=1`:
 make futures-demo-init
 AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-reconcile
 AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-snapshot
-AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-test-order
 AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-enable
 AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-run-cycle
-AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-bootstrap-cycle
 make futures-demo-status
 make futures-demo-disable
 AUTHORIZED_BINANCE_FUTURES_DEMO=1 make futures-demo-kill
 ```
 
-`futures-demo-test-order` calls Binance's `/fapi/v1/order/test`; it validates
-the signed trade request but does not place an order. Demo orders and PnL are
-forward execution observations only and do not repair the historical DSR result
-or authorize live capital.
+The environment variable is the single network-authorization gate; the Makefile
+does not add a second flag. Session enable/disable is persistent operating state,
+not a duplicate authorization. Demo orders and PnL are forward execution
+observations only and do not repair the historical DSR result or authorize live
+capital.
 
 ## Strategy-platform Demo bridge (Phase 2)
 

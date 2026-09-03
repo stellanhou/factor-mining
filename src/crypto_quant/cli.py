@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .data import latest_snapshot, update_klines
+from .data import update_klines
 from .data_quality import run_data_quality_report
 from .agents import audit_data, run_research_agents
 from .audit import run_system_audit
@@ -24,7 +24,6 @@ from .portfolio_margin_stress import run_portfolio_margin_stress
 from .portfolio_stress import run_portfolio_stress
 from .futures import (
     BinanceFuturesClient,
-    funding_snapshot,
     update_funding_mark_prices_from_archive,
     update_funding_from_archive,
     update_funding_from_rest,
@@ -40,8 +39,6 @@ from .open_interest_study import (
 from .order_book_replay import run_order_book_replay_study
 from .positioning_study import run_positioning_extremes_event_study
 from .open_interest import (
-    open_interest_snapshot,
-    positioning_snapshot,
     update_open_interest_from_archive,
 )
 from .integrity import enable_paper_append_manifest
@@ -548,7 +545,7 @@ def main() -> None:
 
     risk_parity_v2 = subparsers.add_parser(
         "risk-parity-vol-target-v2-study",
-        help="run the frozen confirmatory 25% risk-parity volatility-target study",
+        help="run the frozen confirmatory 25%% risk-parity volatility-target study",
     )
     risk_parity_v2.add_argument("--db", type=Path, default=DEFAULT_DB)
     risk_parity_v2.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
@@ -787,25 +784,14 @@ def main() -> None:
         "futures-demo-reconcile", help="reconcile USD-M Futures Demo account and positions"
     )
     futures_demo_reconcile.add_argument("--session", type=Path, required=True)
-    futures_demo_reconcile.add_argument("--authorize-futures-demo", action="store_true")
     futures_demo_snapshot = subparsers.add_parser(
         "futures-demo-snapshot", help="build the frozen current public positioning signal"
     )
     futures_demo_snapshot.add_argument("--session", type=Path, required=True)
-    futures_demo_snapshot.add_argument("--authorize-futures-demo", action="store_true")
-    futures_demo_test = subparsers.add_parser(
-        "futures-demo-test-order", help="validate one USD-M Demo order without placement"
-    )
-    futures_demo_test.add_argument("--session", type=Path, required=True)
-    futures_demo_test.add_argument("--symbol", default="BTCUSDT")
-    futures_demo_test.add_argument("--side", choices=["BUY", "SELL"], default="BUY")
-    futures_demo_test.add_argument("--notional", default="60")
-    futures_demo_test.add_argument("--authorize-futures-demo", action="store_true")
     futures_demo_enable = subparsers.add_parser(
         "futures-demo-enable", help="enable the frozen USD-M Futures Demo cycle"
     )
     futures_demo_enable.add_argument("--session", type=Path, required=True)
-    futures_demo_enable.add_argument("--authorize-futures-demo", action="store_true")
     futures_demo_disable = subparsers.add_parser(
         "futures-demo-disable", help="disable the USD-M Futures Demo cycle"
     )
@@ -814,19 +800,10 @@ def main() -> None:
         "futures-demo-run-cycle", help="run one scheduled USD-M Futures Demo rebalance cycle"
     )
     futures_demo_run.add_argument("--session", type=Path, required=True)
-    futures_demo_run.add_argument("--authorize-futures-demo", action="store_true")
-    futures_demo_bootstrap = subparsers.add_parser(
-        "futures-demo-bootstrap-cycle",
-        help="explicitly place the first USD-M Demo portfolio after the daily window",
-    )
-    futures_demo_bootstrap.add_argument("--session", type=Path, required=True)
-    futures_demo_bootstrap.add_argument("--authorize-futures-demo", action="store_true")
-    futures_demo_bootstrap.add_argument("--authorize-initial-bootstrap", action="store_true")
     futures_demo_kill = subparsers.add_parser(
         "futures-demo-kill", help="disable USD-M Futures Demo and cancel open orders"
     )
     futures_demo_kill.add_argument("--session", type=Path, required=True)
-    futures_demo_kill.add_argument("--authorize-futures-demo", action="store_true")
 
     platform_init = subparsers.add_parser("platform-init", help="initialize an offline local strategy platform")
     platform_init.add_argument("--platform", type=Path, default=DEFAULT_OUTPUT / "strategy_platform")
@@ -1079,10 +1056,10 @@ def main() -> None:
                         "attention_required" if attention_required else "ready"
                     ),
                     "database": str(args.db),
-                    "datasets": latest_snapshot(args.db),
-                    "funding_rates": funding_snapshot(args.db),
-                    "open_interest": open_interest_snapshot(args.db),
-                    "positioning": positioning_snapshot(args.db),
+                    "datasets": data_audit["spot_datasets"],
+                    "funding_rates": data_audit["funding_datasets"],
+                    "open_interest": data_audit["open_interest_datasets"],
+                    "positioning": data_audit["positioning_datasets"],
                     "unified_market_data": data_audit["unified_market_data"],
                     "source_statuses": source_statuses,
                 }
@@ -1478,47 +1455,27 @@ def main() -> None:
     elif args.command in {
         "futures-demo-reconcile",
         "futures-demo-snapshot",
-        "futures-demo-test-order",
         "futures-demo-enable",
         "futures-demo-disable",
         "futures-demo-run-cycle",
-        "futures-demo-bootstrap-cycle",
         "futures-demo-kill",
     }:
         if args.command != "futures-demo-disable":
-            if not args.authorize_futures_demo:
-                parser.error(f"{args.command} requires --authorize-futures-demo")
             if os.environ.get("AUTHORIZED_BINANCE_FUTURES_DEMO") != "1":
                 parser.error(
                     f"{args.command} requires AUTHORIZED_BINANCE_FUTURES_DEMO=1"
                 )
-        if args.command == "futures-demo-bootstrap-cycle" and not args.authorize_initial_bootstrap:
-            parser.error(
-                "futures-demo-bootstrap-cycle requires --authorize-initial-bootstrap"
-            )
         orchestrator = make_futures_demo_orchestrator(args.session)
         if args.command == "futures-demo-reconcile":
             _print_json(orchestrator.reconcile())
         elif args.command == "futures-demo-snapshot":
             _print_json(orchestrator.snapshot())
-        elif args.command == "futures-demo-test-order":
-            from decimal import Decimal
-
-            _print_json(
-                orchestrator.test_order(
-                    symbol=args.symbol,
-                    side=args.side,
-                    notional=Decimal(str(args.notional)),
-                )
-            )
         elif args.command == "futures-demo-enable":
             _print_json(orchestrator.enable())
         elif args.command == "futures-demo-disable":
             _print_json(orchestrator.disable())
         elif args.command == "futures-demo-run-cycle":
             _print_json(orchestrator.run_cycle())
-        elif args.command == "futures-demo-bootstrap-cycle":
-            _print_json(orchestrator.run_cycle(allow_initial_bootstrap=True))
         else:
             _print_json(orchestrator.kill())
     elif args.command == "demo-kill":
