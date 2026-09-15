@@ -63,9 +63,11 @@ def write_research_report(path: Path, run_id: str, purpose: str, records: list[d
         lines += [""]
     if stage == "A":
         decisions = {}
+        proposals = []
         for record in records:
             if record["kind"] == "optimization":
                 decisions.update({d["candidate_id"]: d for d in record["data"]["decisions"]})
+                proposals.extend((record["id"], proposal) for proposal in record["data"]["proposals"])
         labels = {"optimize": "继续优化", "retain": "保留待B验证", "pause": "暂停", "discard": "淘汰"}
         questions = {"research_basis": "有研究依据", "modification_hypothesis": "有具体修改假设",
                      "verifiable_improvement": "能验证改善", "attempt_value": "还有尝试价值"}
@@ -79,6 +81,16 @@ def write_research_report(path: Path, run_id: str, purpose: str, records: list[d
             lines += ["", "依据：" + "、".join(f"[{ref}](a_records/{ref}.json)" for ref in decision["evidence_refs"]), ""]
             if decision["resume_condition"] is not None:
                 lines += ["恢复条件：" + decision["resume_condition"], ""]
+        if proposals:
+            lines += ["## 假设指导的优化建议", "",
+                      "以下三项是优化Agent提出、待配对评估的研究主张；文本完整不代表假设已获验证。", ""]
+            for record_id, proposal in proposals:
+                check = proposal["hypothesis_check"]
+                lines += [f"### {proposal['proposal_id']} → {proposal['design']['control_id']}", "",
+                          f"- 原核心假设：{check['core_hypothesis']}",
+                          f"- 公式如何表达或检验：{check['formula_alignment']}",
+                          f"- 修改无帮助的结果：{check['negative_outcome']}", "",
+                          f"[完整建议](a_records/{record_id}.json)", ""]
     for record in records:
         if record["kind"] != "evaluation":
             continue
@@ -106,7 +118,7 @@ def write_research_report(path: Path, run_id: str, purpose: str, records: list[d
             lines += [f"- {reason}" for reason in outcome["reasons"]]
             lines += ["", f"[逐项程序判定](b_records/{validation['id']}.json)。模型解释不改变此结果。", ""]
         lines += [f"完整逐期、分阶段、分组和不确定性结果见 `{stage.lower()}_records/{record['id']}.json`。", ""]
-    unsuccessful = [r for r in records if r["kind"] in {"duplicate", "experiment_scope_error"}
+    unsuccessful = [r for r in records if r["kind"] == "duplicate"
                     or (r["kind"] == "calculation" and r["data"]["status"] != "computed")]
     if unsuccessful:
         lines += ["## 失败、重复与待补充定义", ""]

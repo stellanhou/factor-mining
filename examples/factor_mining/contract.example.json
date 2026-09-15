@@ -1,9 +1,5 @@
 {
   "a_start": "2026-07-01T00:00:00Z",
-  "allowed_changes": [
-    "window",
-    "smoothing"
-  ],
   "b_start": "2026-07-05T00:00:00Z",
   "c_end": "2026-07-13T00:00:00Z",
   "c_start": "2026-07-09T00:00:00Z",

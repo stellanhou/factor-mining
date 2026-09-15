@@ -19,7 +19,7 @@ from crypto_quant.research.factor_mining.contracts import ResearchSpec, digest, 
 from crypto_quant.research.factor_mining.evaluation import build_labels, compare_experiment, correct_batch, evaluate_factor, hac_mean
 from crypto_quant.research.factor_mining.model import ApiCallError, ModelReply, OpenCodeGoModel, read_api_key
 from crypto_quant.research.factor_mining.records import AgentGateway, EvidenceIntegrityError, ContextBudgetError, ModelResponseError, RecordStore, compact_record
-from crypto_quant.research.factor_mining.workflow import CHECK_DIMENSIONS, RESEARCH_QUESTIONS, FactorMiner, _check_report, validate_modification
+from crypto_quant.research.factor_mining.workflow import CHECK_DIMENSIONS, RESEARCH_QUESTIONS, FactorMiner, _check_report
 
 
 def specification(**overrides):
@@ -33,9 +33,8 @@ def specification(**overrides):
         min_periods=26, hac_lags=23, confidence=0.95, stage_hours=48, rolling_periods=26,
         fdr_method="BY", fdr_alpha=0.05, min_abs_ic=0.02, min_directional_spread=0.0001,
         min_stage_share=0.5, rounds=2, candidates_per_round=3, max_candidates=6, max_repairs=2,
-        max_route_attempts=1, max_formula_nodes=80, max_lookback_hours=6,
-        context_tokens=2000000, output_tokens=4000,
-        allowed_changes=("window", "smoothing"))
+        max_route_attempts=1, max_formula_nodes=80, max_lookback_hours=7,
+        context_tokens=2000000, output_tokens=4000)
     values.update(overrides)
     return ResearchSpec(**values)
 
@@ -66,11 +65,17 @@ def definition(expression="div(perp_close,ts_mean(spot_close,3))", parent=None, 
 def experiment():
     return {"route_id": "window-route", "control_id": "candidate-0001",
             "evidence": "candidate-0001的A段分阶段IC与不确定性支持限定窗口诊断",
-            "question": "三小时均值是否噪声过大", "change_kind": "window", "change": "仅把均值窗口3改为6小时",
+            "question": "短期波动是否掩盖偏离所代表的拥挤", "change": "同时延长基准窗口并平滑偏离值",
             "expected": "在同币池、日期、方向和样本中观察有向IC改善", "metric": "rank_ic",
             "min_improvement": 0.01, "max_ic_loss": 0.02,
             "stop_condition": "改善上限低于0.01则停止", "pause_condition": "区间不能区分改善与恶化则暂停",
             "attempt_budget": 1, "restart_of": None, "new_evidence": None}
+
+
+def hypothesis_check():
+    return {"core_hypothesis": "价格偏离近期基准反映拥挤，未来可能反转",
+            "formula_alignment": "延长基准窗口并平滑偏离值，检验较稳定的拥挤测量是否保留该反转关系",
+            "negative_outcome": "相对原版的配对Rank IC改善不足，或有向IC损失超过预设上限"}
 
 
 def narrative():
@@ -134,8 +139,9 @@ class ScenarioModel:
                 if (self.optimizations == 1 and budget["rounds"] > 0 and budget["candidates"] > 0
                         and any(r["id"] == "candidate-0001-evaluation" for r in request["records"])):
                     proposals = [{"proposal_id": "proposal-1", "candidate": definition(
-                        "div(perp_close,ts_mean(perp_close,6))", "candidate-0001", "proposal-1",
-                        "每个历史币池成员的当前已收盘永续价格除以包含当前小时的六小时永续价格均值，无量纲"), "design": experiment()}]
+                        "ts_mean(div(perp_close,ts_mean(perp_close,6)),3)", "candidate-0001", "proposal-1",
+                        "每个历史币池成员的当前已收盘永续价格除以包含当前小时的六小时永续价格均值，再对该偏离做包含当前小时的三小时均值，无量纲"),
+                        "design": experiment(), "hypothesis_check": hypothesis_check()}]
                 record_ids = {r["id"] for r in request["records"]}
                 decisions = []
                 for cid in request["payload"]["review_candidate_ids"]:
@@ -289,7 +295,8 @@ class WorkflowTests(unittest.TestCase):
             paths = {p for note in notes for p in note["extra_fields"]}
             for path in ("/extra_note", "/result/read_records", "/result/candidates/0/extra_note",
                          "/result/checks/0/extra_note", "/result/proposals/0/design/extra_note",
-                         "/result/proposals/0/candidate/extra_note", "/result/dispositions/0/extra_note",
+                         "/result/proposals/0/candidate/extra_note", "/result/proposals/0/hypothesis_check/extra_note",
+                         "/result/dispositions/0/extra_note",
                          "/result/decisions/0/answers/research_basis/extra_note"):
                 self.assertIn(path, paths)
             for record in records:
@@ -325,6 +332,8 @@ class WorkflowTests(unittest.TestCase):
             ("calculator", lambda r: r["checks"][0].pop("matches"), "missing required fields: matches"),
             ("calculator", lambda r: r["checks"][0].update(matches="true"), "matches must be boolean"),
             ("optimizer", lambda r: r["proposals"][0]["design"].pop("expected"), "missing required fields: expected"),
+            ("optimizer", lambda r: r["proposals"][0]["hypothesis_check"].pop("negative_outcome"),
+             "missing required fields: negative_outcome"),
             ("optimizer", lambda r: r["decisions"][0]["answers"]["research_basis"].pop("reason"), "missing required fields: reason"),
         ]
         for role, mutate, error in cases:
@@ -630,15 +639,21 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(any(reason in item for item in decision["reasons"]))
                 self.assertFalse((Path(directory) / "ideas").exists())
 
-    def test_declared_modification_does_not_hide_other_changes(self):
-        base = "div(perp_close,ts_mean(perp_close,3))"
-        validate_modification(base, "div(perp_close,ts_mean(perp_close,6))", "window")
-        validate_modification(base, f"ts_mean({base},3)", "smoothing")
-        for proposed, kind in (("div(spot_close,ts_mean(perp_close,6))", "window"),
-                               ("div(perp_close,ts_mean(perp_close,3))", "window"),
-                               ("ts_mean(premium_index,3)", "smoothing")):
-            with self.subTest(proposed=proposed), self.assertRaises(ValueError):
-                validate_modification(base, proposed, kind)
+    def test_hypothesis_guided_proposal_allows_linked_formula_changes(self):
+        spec, model = specification(), ScenarioModel()
+        with tempfile.TemporaryDirectory() as directory:
+            miner = FactorMiner(spec, model, Path(directory))
+            result = miner.explore(input_panel(spec))
+            child = miner.candidates["candidate-0003"]
+            self.assertEqual(child["definition"]["expression"],
+                             "ts_mean(div(perp_close,ts_mean(perp_close,6)),3)")
+            self.assertIn("candidate-0003", result["evaluated_ids"])
+            proposal = miner.proposals["proposal-1"]
+            self.assertEqual(proposal["hypothesis_check"], hypothesis_check())
+            self.assertFalse(any(record["kind"] == "experiment_scope_error" for record in miner.store.all()))
+            report = (miner.root / "A-report.md").read_text()
+            for label in ("假设指导的优化建议", "原核心假设", "公式如何表达或检验", "修改无帮助的结果"):
+                self.assertIn(label, report)
 
     def test_predeclared_improvement_stops_continues_or_pauses(self):
         spec = specification()
