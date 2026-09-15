@@ -194,13 +194,14 @@ def correct_batch(reports: dict[str, dict[str, Any]], spec: ResearchSpec) -> dic
             "family": "two primary two-sided mean tests per frozen candidate, including unavailable tests", "tests": tests}
 
 
-def compare_experiment(report: dict[str, Any], control: dict[str, Any], design: dict[str, Any],
+def compare_experiment(report: dict[str, Any], control: dict[str, Any], plan: dict[str, Any],
                        spec: ResearchSpec) -> dict[str, Any]:
     require(report["segment"] == control["segment"] == "A", "optimization comparisons use A only")
     require(report["direction"] == control["direction"], "a controlled modification cannot flip direction")
     trial = pd.DataFrame(report["periods"]).set_index("timestamp")
     base = pd.DataFrame(control["periods"]).set_index("timestamp")
     require(trial.index.equals(base.index), "comparison must use the same calendar grid")
+    design = plan["experiment_design"]
     metric = design["metric"]
     sign = report["direction"] if metric == "rank_ic" else 1
     delta = hac_mean((trial[metric] - base[metric]) * sign, spec)
@@ -211,6 +212,6 @@ def compare_experiment(report: dict[str, Any], control: dict[str, Any], design: 
             state, reason = "stop", "upper confidence bound is below the predeclared improvement or IC-loss limit"
         elif delta["ci"][0] >= design["min_improvement"] and ic_delta["ci"][0] >= -design["max_ic_loss"]:
             state, reason = "continue", "paired lower bounds meet the predeclared improvement and IC-loss limits"
-    return {"design": design, "paired_improvement": delta, "paired_ic_change": ic_delta,
+    return {"plan": plan, "paired_improvement": delta, "paired_ic_change": ic_delta,
             "decision": state, "reason": reason,
             "scope": "adaptive A-stage diagnostic, not independent validation"}

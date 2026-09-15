@@ -3,6 +3,7 @@
 import copy
 import json
 import math
+import re
 import tempfile
 import unittest
 from dataclasses import replace
@@ -32,8 +33,7 @@ def specification(**overrides):
         label="perp_next_open_24h", sample_hours=1, groups=3, min_symbols=6,
         min_periods=26, hac_lags=23, confidence=0.95, stage_hours=48, rolling_periods=26,
         fdr_method="BY", fdr_alpha=0.05, min_abs_ic=0.02, min_directional_spread=0.0001,
-        min_stage_share=0.5, rounds=2, candidates_per_round=3, max_candidates=6, max_repairs=2,
-        max_route_attempts=1, max_formula_nodes=80, max_lookback_hours=7,
+        min_stage_share=0.5, max_repairs=2, max_formula_nodes=80, max_lookback_hours=7,
         context_tokens=2000000, output_tokens=4000)
     values.update(overrides)
     return ResearchSpec(**values)
@@ -62,20 +62,48 @@ def definition(expression="div(perp_close,ts_mean(spot_close,3))", parent=None, 
             "proposal_id": proposal, "change_reason": "依据明确计算定义检验"}
 
 
-def experiment():
-    return {"route_id": "window-route", "control_id": "candidate-0001",
-            "evidence": "candidate-0001的A段分阶段IC与不确定性支持限定窗口诊断",
-            "question": "短期波动是否掩盖偏离所代表的拥挤", "change": "同时延长基准窗口并平滑偏离值",
-            "expected": "在同币池、日期、方向和样本中观察有向IC改善", "metric": "rank_ic",
-            "min_improvement": 0.01, "max_ic_loss": 0.02,
-            "stop_condition": "改善上限低于0.01则停止", "pause_condition": "区间不能区分改善与恶化则暂停",
-            "attempt_budget": 1, "restart_of": None, "new_evidence": None}
-
-
-def hypothesis_check():
+def modification_task(change_target="将近期价格基准窗口设为6小时，并对偏离值使用3小时均值"):
     return {"core_hypothesis": "价格偏离近期基准反映拥挤，未来可能反转",
-            "formula_alignment": "延长基准窗口并平滑偏离值，检验较稳定的拥挤测量是否保留该反转关系",
-            "negative_outcome": "相对原版的配对Rank IC改善不足，或有向IC损失超过预设上限"}
+            "observed_problem": "原候选的A段分阶段IC显示短期波动可能掩盖拥挤关系",
+            "modification_hypothesis": "较稳定的近期基准可能更好表达同一反转假设",
+            "change_target": change_target,
+            "fixed_components": "价格字段、偏离比值、预测方向和24小时标签保持不变"}
+
+
+def experiment_design(question="短期波动是否掩盖偏离所代表的拥挤"):
+    return {"question": question, "metric": "rank_ic", "min_improvement": 0.01, "max_ic_loss": 0.02,
+            "expected_outcome": "在同币池、日期、方向和样本中观察有向IC改善",
+            "stop_condition": "改善上限低于0.01或有向IC损失超过上限则停止",
+            "pause_condition": "区间不能区分改善与恶化或数据不足则暂停"}
+
+
+def optimization_proposal(proposal_id="proposal-1", control="candidate-0001", route="window-route",
+                          change_target=None, question=None):
+    return {"proposal_id": proposal_id, "route_id": route, "control_id": control,
+            "evidence_refs": [f"{control}-evaluation"],
+            "modification_task": modification_task(change_target) if change_target else modification_task(),
+            "experiment_design": experiment_design(question) if question else experiment_design(),
+            "restart_of": None, "new_evidence": None}
+
+
+def experiment(**overrides):
+    proposal = optimization_proposal(**overrides)
+    proposal.pop("proposal_id")
+    return proposal
+
+
+def definition_from_task(proposal_id, proposal):
+    target = proposal["modification_task"]["change_target"]
+    windows = [int(value) for value in re.findall(r"(\d+)小时", target)]
+    window = windows[0]
+    if len(windows) > 1:
+        expression = f"ts_mean(div(perp_close,ts_mean(perp_close,{window})),{windows[1]})"
+        meaning = (f"每个历史币池成员的当前已收盘永续价格除以包含当前小时的{window}小时永续价格均值，"
+                   f"再对该偏离做包含当前小时的{windows[1]}小时均值，无量纲")
+    else:
+        expression = f"div(perp_close,ts_mean(perp_close,{window}))"
+        meaning = f"每个历史币池成员的当前已收盘永续价格除以包含当前小时的{window}小时永续价格均值，无量纲"
+    return definition(expression, proposal["control_id"], proposal_id, meaning)
 
 
 def narrative():
@@ -95,11 +123,12 @@ def research_decision(cid, disposition, continuing=False, evidence=None):
 
 class ScenarioModel:
     """No network. Responses encode known scenarios, never stand in for live LLM quality."""
-    def __init__(self, transform=None):
+    def __init__(self, transform=None, *, propose_once=True):
         self.requests = []
         self.ideations = 0
         self.optimizations = 0
         self.transform = transform
+        self.propose_once = propose_once
         self.responses = {}
 
     def complete(self, messages, *, max_output_tokens, session_id):
@@ -114,10 +143,10 @@ class ScenarioModel:
                     result = {"candidates": [definition(), definition("ts_mean(perp_close)", meaning="近期均值，窗口未定义")],
                               "dispositions": [], "analysis": "构造一个市场错误和一个定义不足的例子"}
                 else:
-                    proposed = request["payload"]["pending_proposals"]["proposal-1"]
-                    result = {"candidates": [proposed["candidate"]], "dispositions": [
-                        {"proposal_id": "proposal-1", "action": "adopt", "reason": "检验预先声明的窗口原因",
-                         "candidate_index": 0, "design": None}], "analysis": "沿用上一轮证据和检验设计"}
+                    proposal_id, proposed = next(iter(request["payload"]["pending_proposals"].items()))
+                    result = {"candidates": [definition_from_task(proposal_id, proposed)], "dispositions": [
+                        {"proposal_id": proposal_id, "action": "adopt", "reason": "检验预先声明的窗口原因",
+                         "candidate_index": 0}], "analysis": "根据修改任务首次生成公式，不改写配对判断标准"}
             elif role == "calculator":
                 payload = request["payload"]
                 expression = payload["current_expression"]
@@ -135,13 +164,9 @@ class ScenarioModel:
             elif role == "optimizer":
                 self.optimizations += 1
                 proposals = []
-                budget = request["payload"]["remaining_budget"]
-                if (self.optimizations == 1 and budget["rounds"] > 0 and budget["candidates"] > 0
+                if (self.propose_once and self.optimizations == 1
                         and any(r["id"] == "candidate-0001-evaluation" for r in request["records"])):
-                    proposals = [{"proposal_id": "proposal-1", "candidate": definition(
-                        "ts_mean(div(perp_close,ts_mean(perp_close,6)),3)", "candidate-0001", "proposal-1",
-                        "每个历史币池成员的当前已收盘永续价格除以包含当前小时的六小时永续价格均值，再对该偏离做包含当前小时的三小时均值，无量纲"),
-                        "design": experiment(), "hypothesis_check": hypothesis_check()}]
+                    proposals = [optimization_proposal()]
                 record_ids = {r["id"] for r in request["records"]}
                 decisions = []
                 for cid in request["payload"]["review_candidate_ids"]:
@@ -149,7 +174,7 @@ class ScenarioModel:
                     decisions.append(research_decision(cid, "retain" if evaluated else "pause",
                         bool(proposals) and cid == "candidate-0001",
                         f"{cid}-evaluation" if evaluated else f"{cid}-calculation"))
-                result = {"analysis": "保留完整分析，脚本场景只进行一次有预算的窗口实验", "decisions": decisions,
+                result = {"analysis": "保留完整分析，脚本场景只进行一次有依据的窗口实验", "decisions": decisions,
                           "diagnostics": ["真实有效性待研究"], "proposals": proposals}
             else:
                 raise AssertionError(role)
@@ -294,8 +319,8 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual({n["role"] for n in notes}, {"ideator", "calculator", "evaluator", "optimizer"})
             paths = {p for note in notes for p in note["extra_fields"]}
             for path in ("/extra_note", "/result/read_records", "/result/candidates/0/extra_note",
-                         "/result/checks/0/extra_note", "/result/proposals/0/design/extra_note",
-                         "/result/proposals/0/candidate/extra_note", "/result/proposals/0/hypothesis_check/extra_note",
+                         "/result/checks/0/extra_note", "/result/proposals/0/modification_task/extra_note",
+                         "/result/proposals/0/experiment_design/extra_note",
                          "/result/dispositions/0/extra_note",
                          "/result/decisions/0/answers/research_basis/extra_note"):
                 self.assertIn(path, paths)
@@ -331,9 +356,10 @@ class WorkflowTests(unittest.TestCase):
             ("ideator", lambda r: r["candidates"][0].update(direction="-1"), "direction must be integer"),
             ("calculator", lambda r: r["checks"][0].pop("matches"), "missing required fields: matches"),
             ("calculator", lambda r: r["checks"][0].update(matches="true"), "matches must be boolean"),
-            ("optimizer", lambda r: r["proposals"][0]["design"].pop("expected"), "missing required fields: expected"),
-            ("optimizer", lambda r: r["proposals"][0]["hypothesis_check"].pop("negative_outcome"),
-             "missing required fields: negative_outcome"),
+            ("optimizer", lambda r: r["proposals"][0]["experiment_design"].pop("expected_outcome"),
+             "missing required fields: expected_outcome"),
+            ("optimizer", lambda r: r["proposals"][0]["modification_task"].pop("change_target"),
+             "missing required fields: change_target"),
             ("optimizer", lambda r: r["decisions"][0]["answers"]["research_basis"].pop("reason"), "missing required fields: reason"),
         ]
         for role, mutate, error in cases:
@@ -362,7 +388,7 @@ class WorkflowTests(unittest.TestCase):
         def add_fields(request, result):
             if request["role"] == "evaluator":
                 result.update(conditions_note=None, decision="discard", extra_decision={"continue_optimization": True})
-        spec, model = specification(rounds=1), ScenarioModel(add_fields)
+        spec, model = specification(), ScenarioModel(add_fields, propose_once=False)
         with tempfile.TemporaryDirectory() as directory:
             miner = FactorMiner(spec, model, Path(directory))
             result = miner.explore(input_panel(spec))
@@ -411,7 +437,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertFalse((miner.root / "a_records/candidate-0001-report.json").exists())
 
     def test_four_destinations_control_next_round_and_freeze(self):
-        spec = specification(candidates_per_round=4, max_candidates=8)
+        spec = specification()
         model = ScenarioModel(four_destination_scenario)
         with tempfile.TemporaryDirectory() as directory:
             miner = FactorMiner(spec, model, Path(directory))
@@ -420,7 +446,7 @@ class WorkflowTests(unittest.TestCase):
             states = second["payload"]["candidate_decisions"]
             self.assertEqual([states[f"candidate-000{i}"]["disposition"] for i in range(1, 5)],
                              ["optimize", "retain", "pause", "discard"])
-            self.assertEqual({p["design"]["control_id"] for p in second["payload"]["pending_proposals"].values()},
+            self.assertEqual({p["control_id"] for p in second["payload"]["pending_proposals"].values()},
                              {"candidate-0001"})
             second_review = [r for r in model.requests if r["role"] == "optimizer"][1]
             self.assertEqual(second_review["payload"]["review_candidate_ids"], ["candidate-0005", "candidate-0001"])
@@ -456,13 +482,13 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(result["routes"]["window-route"]["decision"], "stop")
             self.assertIn("candidate-0001", result["retained_ids"])
 
-    def test_no_authorized_optimization_ends_loop_without_spending_more_rounds(self):
+    def test_no_authorized_optimization_ends_loop_naturally(self):
         def pause_all(request, result):
             if request["role"] == "optimizer":
                 result["proposals"] = []
                 for d in result["decisions"]:
                     d.update(disposition="pause", continue_optimization=False, resume_condition="补充样本和诊断")
-        spec, model = specification(rounds=5), ScenarioModel(pause_all)
+        spec, model = specification(), ScenarioModel(pause_all)
         with tempfile.TemporaryDirectory() as directory:
             miner = FactorMiner(spec, model, Path(directory))
             result = miner.explore(input_panel(spec))
@@ -485,6 +511,8 @@ class WorkflowTests(unittest.TestCase):
             (lambda r: r["decisions"][1].update(disposition="discard", resume_condition=None), "failure alone cannot discard"),
             (lambda r: r["decisions"][0].update(continue_optimization=False), "proposal is not authorized"),
             (lambda r: r.update(proposals=[]), "requires an experiment proposal"),
+            (lambda r: r["proposals"][0].update(evidence_refs=["invented-evidence"]), "existing records"),
+            (lambda r: r["proposals"][0].update(evidence_refs=["candidate-0001-report"]), "control evaluation"),
         ]
         for mutate, error in cases:
             def transform(request, result):
@@ -510,18 +538,39 @@ class WorkflowTests(unittest.TestCase):
                 miner.explore(input_panel(spec))
             self.assertFalse(any(r["payload"].get("candidate_id") == "candidate-0004" for r in model.requests))
 
-    def test_run_budget_cannot_be_overridden_by_optimizer(self):
-        def keep_optimizing(request, result):
-            if request["role"] == "optimizer":
-                result["decisions"][0] = research_decision("candidate-0001", "optimize", True)
-        for override, error in (({"rounds": 1}, "no exploration budget"),
-                                ({"max_candidates": 2}, "no exploration budget")):
-            with self.subTest(override=override), tempfile.TemporaryDirectory() as directory:
-                spec, model = specification(**override), ScenarioModel(keep_optimizing)
-                miner = FactorMiner(spec, model, Path(directory))
-                with self.assertRaisesRegex(ValueError, error):
-                    miner.explore(input_panel(spec))
-                self.assertEqual(model.ideations, 1)
+    def test_natural_loop_can_exceed_previous_round_and_candidate_caps(self):
+        model = None
+        def continue_five_times(request, result):
+            if request["role"] != "optimizer":
+                return
+            records = {record["id"] for record in request["records"]}
+            if model.optimizations <= 5:
+                control = request["payload"]["round_candidate_ids"][0]
+                proposal_id = f"proposal-{model.optimizations}"
+                window = 3 + model.optimizations
+                result["proposals"] = [optimization_proposal(
+                    proposal_id, control, f"route-{model.optimizations}",
+                    f"将近期价格基准窗口改为{window}小时，其他部分不变",
+                    f"{window}小时窗口是否带来新的可验证信息")]
+                result["decisions"] = [research_decision(
+                    cid, "optimize" if cid == control else "retain" if f"{cid}-evaluation" in records else "pause",
+                    cid == control, f"{cid}-evaluation" if f"{cid}-evaluation" in records else f"{cid}-calculation")
+                    for cid in request["payload"]["review_candidate_ids"]]
+            else:
+                result["proposals"] = []
+                result["decisions"] = [research_decision(
+                    cid, "retain" if f"{cid}-evaluation" in records else "pause", False,
+                    f"{cid}-evaluation" if f"{cid}-evaluation" in records else f"{cid}-calculation")
+                    for cid in request["payload"]["review_candidate_ids"]]
+        spec = specification()
+        model = ScenarioModel(continue_five_times)
+        with tempfile.TemporaryDirectory() as directory:
+            miner = FactorMiner(spec, model, Path(directory))
+            result = miner.explore(input_panel(spec))
+            self.assertEqual(result["completed_rounds"], 6)
+            self.assertEqual(len(result["candidate_ids"]), 7)
+            self.assertEqual((model.ideations, model.optimizations), (6, 6))
+            self.assertEqual(result["stop_reason"], "optimizer returned no authorized optimization proposals")
 
     def test_optimization_continues_after_many_prior_model_calls(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -532,9 +581,10 @@ class WorkflowTests(unittest.TestCase):
             result = miner.explore(input_panel(spec))
             self.assertEqual(result["completed_rounds"], 2)
             self.assertEqual(len(model.requests), 45)
-            self.assertNotIn("max_model_calls", spec.as_dict())
+            for field in ("rounds", "max_candidates", "candidates_per_round", "max_route_attempts", "max_model_calls"):
+                self.assertNotIn(field, spec.as_dict())
             decision_request = next(r for r in model.requests if r["role"] == "optimizer")
-            self.assertEqual(set(decision_request["payload"]["remaining_budget"]), {"rounds", "candidates"})
+            self.assertNotIn("remaining_budget", decision_request["payload"])
 
     def test_semantic_review_cannot_be_attached_to_another_candidate(self):
         spec, model = specification(), Mock()
@@ -558,7 +608,7 @@ class WorkflowTests(unittest.TestCase):
                         self.assertNotIn("decision", request["output_schema"]["properties"])
                         result["decision"] = legacy
                 with self.subTest(legacy=legacy, p=p_value), tempfile.TemporaryDirectory() as directory:
-                    spec, model = specification(rounds=1, purpose="research"), ScenarioModel(old_verdict)
+                    spec, model = specification(purpose="research"), ScenarioModel(old_verdict, propose_once=False)
                     miner = FactorMiner(spec, model, Path(directory))
                     miner.explore(input_panel(spec))
                     b_panel = input_panel(spec, "B")
@@ -616,7 +666,7 @@ class WorkflowTests(unittest.TestCase):
         ]
         for purpose, overrides, reason, status in cases:
             with self.subTest(reason=reason, overrides=overrides), tempfile.TemporaryDirectory() as directory:
-                spec, model = specification(rounds=1, purpose=purpose), ScenarioModel()
+                spec, model = specification(purpose=purpose), ScenarioModel(propose_once=False)
                 miner = FactorMiner(spec, model, Path(directory))
                 miner.explore(input_panel(spec))
                 panel = input_panel(spec, "B")
@@ -639,7 +689,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(any(reason in item for item in decision["reasons"]))
                 self.assertFalse((Path(directory) / "ideas").exists())
 
-    def test_hypothesis_guided_proposal_allows_linked_formula_changes(self):
+    def test_optimizer_task_is_materialized_as_a_linked_formula_only_by_ideator(self):
         spec, model = specification(), ScenarioModel()
         with tempfile.TemporaryDirectory() as directory:
             miner = FactorMiner(spec, model, Path(directory))
@@ -649,11 +699,36 @@ class WorkflowTests(unittest.TestCase):
                              "ts_mean(div(perp_close,ts_mean(perp_close,6)),3)")
             self.assertIn("candidate-0003", result["evaluated_ids"])
             proposal = miner.proposals["proposal-1"]
-            self.assertEqual(proposal["hypothesis_check"], hypothesis_check())
+            self.assertNotIn("candidate", proposal)
+            self.assertNotIn("expression", dumps(proposal))
+            self.assertEqual(proposal["modification_task"], modification_task())
+            self.assertEqual(proposal["experiment_design"], experiment_design())
+            child_review = next(request for request in model.requests
+                                if request["role"] == "calculator"
+                                and request["payload"]["candidate_id"] == "candidate-0003")
+            self.assertEqual(child_review["payload"]["modification_plan"], experiment())
             self.assertFalse(any(record["kind"] == "experiment_scope_error" for record in miner.store.all()))
             report = (miner.root / "A-report.md").read_text()
-            for label in ("假设指导的优化建议", "原核心假设", "公式如何表达或检验", "修改无帮助的结果"):
+            for label in ("修改任务与配对检验合同", "原核心假设", "改动目标", "判断标准"):
                 self.assertIn(label, report)
+
+    def test_old_optimizer_candidate_field_is_excluded_before_ideator(self):
+        leaked = definition("div(perp_close,ts_mean(perp_close,7))", "candidate-0001", "proposal-1")
+        def add_old_candidate(request, result):
+            if request["role"] == "optimizer" and result["proposals"]:
+                result["proposals"][0]["candidate"] = leaked
+        spec, model = specification(), ScenarioModel(add_old_candidate)
+        with tempfile.TemporaryDirectory() as directory:
+            miner = FactorMiner(spec, model, Path(directory))
+            miner.explore(input_panel(spec))
+            second = [request for request in model.requests if request["role"] == "ideator"][1]
+            pending = second["payload"]["pending_proposals"]["proposal-1"]
+            self.assertNotIn("candidate", pending)
+            self.assertNotIn(leaked["expression"], dumps(pending))
+            self.assertNotEqual(miner.candidates["candidate-0003"]["definition"]["expression"], leaked["expression"])
+            note = next(record for record in miner.store.all()
+                        if record["kind"] == "format_deviation" and record["data"]["role"] == "optimizer")
+            self.assertIn("/result/proposals/0/candidate", note["data"]["extra_fields"])
 
     def test_predeclared_improvement_stops_continues_or_pauses(self):
         spec = specification()
@@ -687,7 +762,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(miner.store.all()[0]["data"]["status"], "returned_to_ideator")
 
     def test_frozen_membership_cannot_be_changed_before_B(self):
-        spec, model = specification(rounds=1), ScenarioModel()
+        spec, model = specification(), ScenarioModel(propose_once=False)
         with tempfile.TemporaryDirectory() as directory:
             miner = FactorMiner(spec, model, Path(directory))
             miner.explore(input_panel(spec))
@@ -764,7 +839,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue((miner.root / "exploration-stopped.json").exists())
 
     def test_research_parameters_fail_before_running(self):
-        for kwargs in ({"hac_lags": 0}, {"sample_hours": 5}, {"max_route_attempts": 0},
+        for kwargs in ({"hac_lags": 0}, {"sample_hours": 5},
                        {"groups": 4, "min_symbols": 6}, {"label": "next_bar"}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 specification(**kwargs)
@@ -1026,8 +1101,9 @@ class ApiRetryTests(unittest.TestCase):
                     self.failed_stages.add(stage)
                     return ModelReply("", {"completion_tokens": 100}, "empty-fixture")
                 return scripted.complete(messages, **kwargs)
-        spec = specification(rounds=1)
+        spec = specification()
         with tempfile.TemporaryDirectory() as directory:
+            scripted.propose_once = False
             miner = FactorMiner(spec, EmptyOnce(), Path(directory))
             result = miner.explore(input_panel(spec))
             self.assertEqual(result["completed_rounds"], 1)
@@ -1175,7 +1251,8 @@ class ResponseRecoveryTests(unittest.TestCase):
                     return ModelReply("", {}, "empty-fixture")
                 return scripted.complete(messages, **kwargs)
         with tempfile.TemporaryDirectory() as directory:
-            miner = FactorMiner(specification(rounds=1), EmptyFirstReport(), Path(directory))
+            scripted.propose_once = False
+            miner = FactorMiner(specification(), EmptyFirstReport(), Path(directory))
             result = miner.explore(input_panel(miner.spec))
             self.assertEqual(len(empty_calls), 6)
             self.assertEqual(sleep.call_count, 5)
@@ -1209,7 +1286,7 @@ class ResponseRecoveryTests(unittest.TestCase):
                 if request["role"] == role and request["payload"]["candidate_id"] == "candidate-0001":
                     result.pop("candidate_id" if role == "calculator" else "limitations")
             with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
-                miner = FactorMiner(specification(rounds=1), ScenarioModel(transform), Path(directory))
+                miner = FactorMiner(specification(), ScenarioModel(transform, propose_once=False), Path(directory))
                 result = miner.explore(input_panel(miner.spec))
                 self.assertIn("candidate-0002", result["evaluated_ids"])
                 self.assertTrue((miner.root / "a_records/candidate-0002-report.json").exists())
@@ -1222,7 +1299,8 @@ class ResponseRecoveryTests(unittest.TestCase):
             if request["role"] == "evaluator": result.pop("limitations")
         with tempfile.TemporaryDirectory() as directory:
             model = ScenarioModel(bad_report)
-            miner = FactorMiner(specification(rounds=1), model, Path(directory))
+            model.propose_once = False
+            miner = FactorMiner(specification(), model, Path(directory))
             done = miner.explore(input_panel(miner.spec))
             panel_b = input_panel(miner.spec, "B")
             with self.assertRaisesRegex(ValueError, "complete.*report"):
@@ -1248,7 +1326,8 @@ class ResponseRecoveryTests(unittest.TestCase):
             if request["role"] == "ideator":
                 result["candidates"] = [definition(f"div(perp_close,ts_mean(perp_close,{window}))") for window in (3, 2)]
         model = ScenarioModel(two_candidates)
-        miner = FactorMiner(specification(rounds=1), model, Path(directory))
+        model.propose_once = False
+        miner = FactorMiner(specification(), model, Path(directory))
         completed = miner.explore(input_panel(miner.spec))
         panel = input_panel(miner.spec, "B")
         miner.freeze(completed["retained_ids"], panel.universe)

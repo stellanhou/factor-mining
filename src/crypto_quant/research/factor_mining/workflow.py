@@ -20,7 +20,7 @@ import pandas as pd
 
 from crypto_quant.features.factor_expressions import compile_expression, evaluate_expression
 from crypto_quant.features.factor_inputs import FactorInputPanel, INPUT_COLUMNS, validate_universe
-from .contracts import ResearchSpec, candidate, design, digest, identifier, require, text
+from .contracts import ResearchSpec, candidate, digest, identifier, modification_plan, require, text
 from .evaluation import build_labels, compare_experiment, correct_batch, evaluate_factor, finite
 from .model import ApiCallError, JsonModel
 from .records import AgentGateway, ContextBudgetError, ModelResponseError, RecordStore, write_json
@@ -46,34 +46,42 @@ def _nullable(schema: dict[str, Any]) -> dict[str, Any]:
 CANDIDATE_SCHEMA = _object_schema({
     **{name: _text_schema(description) for name, description in {
         "name": "因子名称", "expression": "白名单公式", "meaning": "字段、单位、窗口、顺序、当前期与截面范围",
-        "hypothesis": "待检验的金融解释", "change_reason": "生成或修改理由"}.items()},
+        "hypothesis": "待检验的金融解释",
+        "change_reason": "生成理由；采用修改任务时说明公式如何实现change_target并遵守fixed_components"}.items()},
     "direction": {"type": "integer", "enum": [-1, 1], "description": "预先固定预测方向"},
     "parent_id": _nullable(_text_schema("原候选ID；无父候选时为null")),
     "proposal_id": _nullable(_text_schema("采用的优化建议ID；自主构想时为null")),
 })
-DESIGN_SCHEMA = _object_schema({
-    **{name: _text_schema(description) for name, description in {
-        "route_id": "新路线或已有继续路线的英文ID", "control_id": "已评估的原候选ID",
-        "evidence": "引用原候选ID及具体指标、阶段和本地证据", "question": "本次检验的问题",
-        "change": "在同一核心假设下的具体公式修改", "expected": "预期出现的变化",
-        "stop_condition": "解释预定改善或IC损失区间上限不足时的停止条件",
-        "pause_condition": "解释证据不精确、缺数据或预算用尽时的暂停条件"}.items()},
+MODIFICATION_TASK_SCHEMA = _object_schema({
+    "core_hypothesis": _text_schema("原候选的核心金融假设"),
+    "observed_problem": _text_schema("引用已有证据说明当前版本的具体问题"),
+    "modification_hypothesis": _text_schema("为什么指定改动可能改善或更好检验核心假设"),
+    "change_target": _text_schema("允许Ideator实现的语义改动目标；不得包含最终可执行公式"),
+    "fixed_components": _text_schema("除被检验改动外必须保持不变的定义部分"),
+})
+EXPERIMENT_DESIGN_SCHEMA = _object_schema({
+    "question": _text_schema("新候选与原候选的配对检验问题"),
     "metric": {"type": "string", "enum": ["rank_ic", "directional_spread"]},
     "min_improvement": {"type": "number", "exclusiveMinimum": 0, "description": "配对改善最低要求"},
     "max_ic_loss": {"type": "number", "minimum": 0, "description": "允许的有向IC损失"},
-    "attempt_budget": {"type": "integer", "minimum": 1, "description": "不超过合同max_route_attempts"},
+    "expected_outcome": _text_schema("修改假设得到支持时预期出现的可观测变化"),
+    "stop_condition": _text_schema("预定改善或IC损失区间上限不足时的停止条件"),
+    "pause_condition": _text_schema("证据不精确或缺数据时的暂停条件"),
+})
+PROPOSAL_SCHEMA = _object_schema({
+    "proposal_id": _text_schema("唯一英文ID"),
+    "route_id": _text_schema("新路线或已有继续路线的英文ID"),
+    "control_id": _text_schema("已评估的原候选ID"),
+    "evidence_refs": _array_schema(_text_schema("已有records中的精确记录ID"), minItems=1),
+    "modification_task": MODIFICATION_TASK_SCHEMA,
+    "experiment_design": EXPERIMENT_DESIGN_SCHEMA,
     "restart_of": _nullable(_text_schema("重启的已停止/暂停路线ID，否则null")),
     "new_evidence": _nullable(_text_schema("重启所依赖的新增依据及原记录位置，否则null")),
 })
-HYPOTHESIS_CHECK_SCHEMA = _object_schema({
-    "core_hypothesis": _text_schema("原候选的核心金融假设"),
-    "formula_alignment": _text_schema("本次公式修改如何更好表达或检验该假设"),
-    "negative_outcome": _text_schema("什么配对结果表明这次修改没有帮助"),
-})
-PROPOSAL_SCHEMA = _object_schema({
-    "proposal_id": _text_schema("唯一英文ID"), "candidate": CANDIDATE_SCHEMA,
-    "design": DESIGN_SCHEMA, "hypothesis_check": HYPOTHESIS_CHECK_SCHEMA,
-})
+MODIFICATION_PLAN_FIELDS = (
+    "route_id", "control_id", "evidence_refs", "modification_task", "experiment_design",
+    "restart_of", "new_evidence",
+)
 REPORT_SCHEMA = _object_schema({
     "analysis": _text_schema("完整解释并引用具体证据"), "mechanism": _text_schema("待检验经济机制"),
     **{name: _array_schema(_text_schema(description), minItems=1) for name, description in {
@@ -86,7 +94,7 @@ RESEARCH_QUESTIONS = {
     "research_basis": "已有结果中什么现象支持继续？引用证据，区分观察与推测，不限定现象类型。",
     "modification_hypothesis": "准备改什么，为什么可能改善？",
     "verifiable_improvement": "与谁比较，预期什么变化，什么结果使修改路线停止？",
-    "attempt_value": "是否重复失败尝试？剩余数据、轮数和候选预算是否足够？",
+    "attempt_value": "是否属于无新增信息的重复失败尝试？继续能否带来新的可验证信息？",
 }
 DECISION_SCHEMA = _object_schema({
     "candidate_id": _text_schema("本次需要决策的候选ID"),
@@ -97,8 +105,8 @@ DECISION_SCHEMA = _object_schema({
         "supported": {"type": "boolean"}, "reason": _text_schema(question)}), "description": question}
         for key, question in RESEARCH_QUESTIONS.items()}),
     "evidence_refs": _array_schema(_text_schema("已有records中的精确记录ID，至少包含当前候选的程序结果"), minItems=1),
-    "reason": _text_schema("解释当前版本的保留价值、证据是否充分及去向；不能把预算用尽或单个不显著结果当作无效"),
-    "resume_condition": _nullable(_text_schema("pause时写明恢复研究所需的新数据、诊断或预算；其他去向为null")),
+    "reason": _text_schema("解释当前版本的保留价值、证据是否充分及去向；不能把单个不显著结果当作无效"),
+    "resume_condition": _nullable(_text_schema("pause时写明恢复研究所需的新数据或诊断；其他去向为null")),
 })
 
 
@@ -223,10 +231,12 @@ class FactorMiner:
             try:
                 review = self.gateway.ask("calculator",
                     "逐项核对原始meaning与程序实际步骤，不能按预测效果改写meaning。定义不足则退回构想。"
+                    "modification_plan不为null时，还须在definition维度核对候选定义和实际步骤是否落实"
+                    "modification_task.change_target并遵守fixed_components；不得改写任务或配对判断标准。"
                     "只有原始含义明确时才给出修复公式，修复后程序会再次检查。检查维度必须完整。",
                     {"candidate_id": cid, "original_definition": definition, "current_expression": expression,
                      "program_error": error, "actual_steps": compiled.calculation_steps() if compiled else None,
-                     "catalog_record_id": "inputs"},
+                     "modification_plan": item.get("experiment"), "catalog_record_id": "inputs"},
                     _object_schema({"candidate_id": {"type": "string", "const": cid},
                         "status": {"type": "string", "enum": ["consistent", "inconsistent", "insufficient_definition"]},
                         "checks": _array_schema(_object_schema({
@@ -317,31 +327,31 @@ class FactorMiner:
     def _explore_rounds(self, panel: FactorInputPanel, labels: pd.DataFrame) -> dict[str, Any]:
         seen: dict[tuple[str, int], str] = {}
         completed_rounds = 0
-        for round_no in range(1, self.spec.rounds + 1):
-            capacity = min(self.spec.candidates_per_round, self.spec.max_candidates - len(self.candidates))
-            if capacity == 0:
-                break
+        round_no = 0
+        while True:
+            round_no += 1
             pending = {pid: p for pid, p in self.proposals.items() if p["status"] == "pending"}
             response = self.gateway.ask("ideator",
-                "构造可证伪的候选公式，写清计算含义。阅读全部历史及优化建议，逐条记录沿用/调整/放弃。"
-                "沿用必须保持建议定义与检验设计一致；调整时在计算前提供更新后的完整设计。"
-                "采用或调整建议前，必须核对候选公式是否与建议的核心假设及公式一致性说明相符，"
-                "并在disposition.reason简要说明这项核对。该核对是你的研究判断，不能把三个文本字段当作已验证结论。"
+                "构造当前有研究依据的一组可证伪候选公式，写清计算含义，不为凑数量生成候选。"
+                "阅读全部历史及优化任务，逐条记录采用或放弃。"
+                "Optimizer只给出修改任务和配对检验合同；最终候选定义和可执行公式必须由你首次生成。"
+                "采用任务时，候选parent_id必须引用control_id，proposal_id必须引用当前任务，"
+                "预测方向保持不变；change_reason须具体说明公式如何实现change_target并遵守fixed_components。"
+                "不得改写Optimizer预先声明的修改任务或判断标准；无法一致实现时放弃，由Optimizer另立新任务。"
                 "遵守candidate_decisions：暂停或淘汰的候选不自动重启；保留但未获准优化的版本不修改。"
                 "不可重复已停止路线且不给新增依据。",
-                {"catalog_record_id": "inputs", "candidate_capacity": capacity, "pending_proposals": pending,
+                {"catalog_record_id": "inputs", "pending_proposals": pending,
                  "candidate_decisions": self.decisions},
-                _object_schema({"candidates": _array_schema(CANDIDATE_SCHEMA, maxItems=capacity),
+                _object_schema({"candidates": _array_schema(CANDIDATE_SCHEMA),
                     "dispositions": _array_schema(_object_schema({
                         "proposal_id": _text_schema("每条pending建议的ID"),
-                        "action": {"type": "string", "enum": ["adopt", "adjust", "abandon"]},
-                        "reason": _text_schema("理由"),
-                        "candidate_index": _nullable({"type": "integer", "minimum": 0}),
-                        "design": {**_nullable(DESIGN_SCHEMA), "description": "adjust时提供完整设计，否则null"}}),
+                        "action": {"type": "string", "enum": ["adopt", "abandon"]},
+                        "reason": _text_schema("采用时说明候选如何落实任务；放弃时说明不能一致实现的原因"),
+                        "candidate_index": _nullable({"type": "integer", "minimum": 0})}),
                         minItems=len(pending), maxItems=len(pending)),
                     "analysis": _text_schema("本轮构想依据")}),
-                validate=lambda response: self._check_ideation(response, capacity, pending))
-            definitions, experiments, self.routes, self.proposals = self._check_ideation(response, capacity, pending)
+                validate=lambda response: self._check_ideation(response, pending))
+            definitions, experiments, self.routes, self.proposals = self._check_ideation(response, pending)
             self.store.append(f"round-{round_no:03d}-ideation", "ideation", response)
             round_ids = []
             for index, definition in enumerate(definitions):
@@ -382,8 +392,6 @@ class FactorMiner:
                     item["model_report"] = narrative
             review_ids = list(dict.fromkeys(round_ids + [cid for cid, decision in self.decisions.items()
                                                         if decision["continue_optimization"]]))
-            remaining = {"rounds": self.spec.rounds - round_no,
-                         "candidates": self.spec.max_candidates - len(self.candidates)}
             optimization = self.gateway.ask("optimizer",
                 "先阅读本轮所有候选、失败及完整评估，再判断哪里有值得继续的具体依据。"
                 "评估Agent只提供证据解释，不作候选去向决定；由你独立综合证据回答四问并决定去向。"
@@ -391,23 +399,25 @@ class FactorMiner:
                 "研究依据由你根据证据分析，不限于预设现象；引用真实record ID并说明观察与推测。"
                 "区分当前版本与修改路线：retain可同时优化；修改路线停止不自动淘汰原版。"
                 "保留须解释A证据为何值得固定版本送B，A阶段不宣称通过独立验证；"
-                "证据不足或预算不够则pause并写恢复条件，有充分否定证据或无增量的重复才discard。"
-                "不得仅因低分、不显著、预算用尽而淘汰。continue_optimization为true须四个回答均获支持，"
-                "并为该候选提供至少一条proposal；false时禁止proposal。没有下一轮或候选预算时不得继续。"
-                "依据不足先给diagnostics，不强行生成新公式。每条建议必须写原核心假设、公式修改如何更好表达"
-                "或检验该假设、以及何种配对结果表示修改没有帮助；这三项是待检验的研究主张，不能声称已被文本证明。"
-                "同一假设下可联动修改多个公式位置，不按窗口、平滑等类别或单一语法差异限制。"
-                "negative_outcome须与design.metric、最低改善、允许IC损失和停止条件一致。"
-                "仍须给出对照、最低改善、允许IC损失、停止/暂停条件和预算。evidence必须引用control_id。"
+                "证据不足则pause并写恢复条件，有充分否定证据或无增量的重复才discard。"
+                "不得仅因低分或不显著而淘汰。continue_optimization为true须四个回答均获支持，"
+                "并为该候选提供至少一条proposal；false时禁止proposal。"
+                "依据不足先给diagnostics，不强行生成修改任务。不得输出新候选定义、名称、最终公式、"
+                "公式含义或方向；这些由下一轮Ideator首次生成。"
+                "每条proposal只输出：精确证据引用、原核心假设、已观察问题、修改假设、语义改动目标和固定部分；"
+                "以及与原候选的配对检验问题、主指标、最低改善、允许IC损失、预期、停止和暂停条件。"
+                "同一假设下可在change_target中指定多个相互关联的语义改动，但不写可执行表达式。"
+                "判断条件须与experiment_design.metric、最低改善和允许IC损失一致。"
+                "control_id必须是获准继续的已评估候选；evidence_refs必须包含该候选的评估记录。"
                 "程序配对比较的决定不能覆盖；已停止路线若重新启动必须使用新路线并说明新增依据及旧路线。",
                 {"round_candidate_ids": round_ids, "review_candidate_ids": review_ids,
-                 "candidate_decisions": self.decisions, "route_states": self.routes, "remaining_budget": remaining},
+                 "candidate_decisions": self.decisions, "route_states": self.routes},
                 _object_schema({"analysis": _text_schema("完整研究反馈"),
                     "decisions": _array_schema(DECISION_SCHEMA, minItems=len(review_ids), maxItems=len(review_ids)),
                     "diagnostics": _array_schema(_text_schema("证据缺口和所需诊断")),
-                    "proposals": _array_schema(PROPOSAL_SCHEMA, maxItems=self.spec.candidates_per_round)}),
-                validate=lambda response: self._check_optimization(response, review_ids, remaining))
-            decisions, self.routes, self.proposals = self._check_optimization(optimization, review_ids, remaining)
+                    "proposals": _array_schema(PROPOSAL_SCHEMA)}),
+                validate=lambda response: self._check_optimization(response, review_ids))
+            decisions, self.routes, self.proposals = self._check_optimization(optimization, review_ids)
             self.decisions.update(decisions)
             self.store.append(f"round-{round_no:03d}-optimization", "optimization", {**optimization, "route_states": self.routes})
             completed_rounds = round_no
@@ -420,15 +430,15 @@ class FactorMiner:
                                              if "evaluation" in item and "model_report" not in item],
                       "candidate_decisions": self.decisions,
                       "routes": self.routes, "proposals": self.proposals,
-                      "stop_reason": "no authorized optimization remains within the exploration budget"}
+                      "stop_reason": "optimizer returned no authorized optimization proposals"}
         write_research_report(self.root / "A-report.md", self.spec.run_id, self.spec.purpose, self.store.all(), "A")
         write_json(self.root / "a-complete.json", completion)
         return completion
 
-    def _check_ideation(self, response: dict[str, Any], capacity: int, pending: dict[str, Any]):
+    def _check_ideation(self, response: dict[str, Any], pending: dict[str, Any]):
         require(set(response) == {"candidates", "dispositions", "analysis"}, "invalid ideation schema")
         text(response["analysis"], "ideation analysis")
-        require(isinstance(response["candidates"], list) and len(response["candidates"]) <= capacity, "candidate budget exceeded")
+        require(isinstance(response["candidates"], list), "candidates must be a list")
         definitions = [candidate(value) for value in response["candidates"]]
         dispositions = response["dispositions"]
         require(isinstance(dispositions, list) and len(dispositions) == len(pending)
@@ -436,27 +446,25 @@ class FactorMiner:
         experiments: dict[int, dict[str, Any]] = {}
         routes, proposals = copy.deepcopy(self.routes), copy.deepcopy(self.proposals)
         for disposition in dispositions:
-            require(set(disposition) == {"proposal_id", "action", "reason", "candidate_index", "design"}, "invalid disposition")
+            require(set(disposition) == {"proposal_id", "action", "reason", "candidate_index"}, "invalid disposition")
             text(disposition["reason"], "disposition reason")
             action, index = disposition["action"], disposition["candidate_index"]
-            require(action in {"adopt", "adjust", "abandon"}, "unknown disposition")
+            require(action in {"adopt", "abandon"}, "unknown disposition")
             proposal = pending[disposition["proposal_id"]]
-            require(self.decisions[proposal["design"]["control_id"]]["continue_optimization"],
+            require(self.decisions[proposal["control_id"]]["continue_optimization"],
                     "candidate decision does not authorize optimization")
             if action == "abandon":
-                require(index is None and disposition["design"] is None, "abandon has no candidate/design")
+                require(index is None, "abandon has no candidate")
             else:
                 require(type(index) is int and 0 <= index < len(definitions) and index not in experiments, "invalid adopted candidate index")
                 definition = definitions[index]
                 require(definition["proposal_id"] == disposition["proposal_id"], "candidate/proposal linkage differs")
-                plan = proposal["design"] if action == "adopt" else design(disposition["design"], self.spec)
-                if action == "adopt":
-                    require(definition == proposal["candidate"] and disposition["design"] is None, "adoption changed the proposed definition")
+                plan = self._proposal_plan(proposal)
                 require(definition["parent_id"] == plan["control_id"], "experiment must reference its control")
                 require(definition["direction"] == self.candidates[plan["control_id"]]["definition"]["direction"], "controlled modifications keep direction fixed")
                 self._register_route(plan, routes)
                 route = routes[plan["route_id"]]
-                require(route["decision"] == "continue" and route["attempts"] < plan["attempt_budget"], "route stopped or budget exhausted")
+                require(route["decision"] == "continue", "route is stopped or paused")
                 route["attempts"] += 1
                 experiments[index] = plan
             proposals[disposition["proposal_id"]]["status"] = action
@@ -471,44 +479,35 @@ class FactorMiner:
             require(definition["proposal_id"] is None or index in experiments, "proposal has no adopted experiment")
         return definitions, experiments, routes, proposals
 
-    def _check_optimization(self, optimization: dict[str, Any], review_ids: list[str], remaining: dict[str, int]):
+    def _check_optimization(self, optimization: dict[str, Any], review_ids: list[str]):
         require(set(optimization) == {"analysis", "decisions", "diagnostics", "proposals"}, "invalid optimizer schema")
         text(optimization["analysis"], "optimization analysis")
         require(isinstance(optimization["diagnostics"], list) and isinstance(optimization["proposals"], list), "optimizer lists are required")
         for diagnostic in optimization["diagnostics"]:
             text(diagnostic, "diagnostic")
-        require(len(optimization["proposals"]) <= self.spec.candidates_per_round, "optimization proposal budget exceeded")
-        decisions = self._check_decisions(optimization["decisions"], review_ids, remaining)
+        decisions = self._check_decisions(optimization["decisions"], review_ids)
         proposal_controls = set()
         routes, proposals = copy.deepcopy(self.routes), copy.deepcopy(self.proposals)
         for proposal in optimization["proposals"]:
-            require(set(proposal) == {"proposal_id", "candidate", "design", "hypothesis_check"}, "invalid optimization proposal")
+            require(set(proposal) == set(PROPOSAL_SCHEMA["properties"]), "invalid optimization proposal")
             pid = identifier(proposal["proposal_id"])
             require(pid not in proposals, "proposal IDs must be unique")
-            proposed = candidate(proposal["candidate"])
-            plan = design(proposal["design"], self.spec)
-            self._check_hypothesis_check(proposal["hypothesis_check"])
+            plan = self._proposal_plan(proposal)
             require(plan["control_id"] in decisions and decisions[plan["control_id"]]["continue_optimization"],
                     "proposal is not authorized by the candidate decision")
             proposal_controls.add(plan["control_id"])
-            require(proposed["parent_id"] == plan["control_id"] and proposed["proposal_id"] == pid, "invalid proposal version links")
             self._register_route(plan, routes)
             require(routes[plan["route_id"]]["decision"] == "continue", "cannot propose on a stopped/paused route without new evidence")
             proposals[pid] = {**proposal, "status": "pending"}
         require(proposal_controls == {cid for cid, decision in decisions.items() if decision["continue_optimization"]},
                 "every continuing candidate requires an experiment proposal")
-        require(len(optimization["proposals"]) <= remaining["candidates"], "proposals exceed remaining candidate budget")
         return decisions, routes, proposals
 
     @staticmethod
-    def _check_hypothesis_check(value: Any) -> None:
-        require(isinstance(value, dict) and set(value) == {
-            "core_hypothesis", "formula_alignment", "negative_outcome"},
-            "hypothesis check must answer all three questions")
-        for name in ("core_hypothesis", "formula_alignment", "negative_outcome"):
-            text(value[name], f"hypothesis check {name}")
+    def _proposal_plan(value: dict[str, Any]) -> dict[str, Any]:
+        return modification_plan({name: value[name] for name in MODIFICATION_PLAN_FIELDS})
 
-    def _check_decisions(self, values: Any, review_ids: list[str], remaining: dict[str, int]) -> dict[str, dict[str, Any]]:
+    def _check_decisions(self, values: Any, review_ids: list[str]) -> dict[str, dict[str, Any]]:
         require(isinstance(values, list) and len(values) == len(review_ids), "every reviewed candidate needs one decision")
         records = {record["id"]: record for record in self.store.all()}
         decisions = {}
@@ -542,7 +541,6 @@ class FactorMiner:
                         "calculation failure alone cannot discard a candidate; pause for diagnosis")
             if continuing:
                 require(all(answer["supported"] for answer in answers.values()), "optimization requires support for all four questions")
-                require(remaining["rounds"] > 0 and remaining["candidates"] > 0, "no exploration budget for optimization")
             if disposition == "pause":
                 text(value["resume_condition"], "pause resume condition")
             else:
@@ -551,23 +549,26 @@ class FactorMiner:
         return decisions
 
     def _register_route(self, plan: dict[str, Any], routes: dict[str, Any]) -> None:
-        plan = design(plan, self.spec)
+        plan = modification_plan(plan)
         control = plan["control_id"]
         require(control in self.candidates and "evaluation" in self.candidates[control], "experiment control must have A evidence")
-        require(control in plan["evidence"], "experiment evidence must identify its control candidate")
+        records = {record["id"] for record in self.store.all()}
+        require(all(ref in records for ref in plan["evidence_refs"]), "modification evidence must reference existing records")
+        require(f"{control}-evaluation" in plan["evidence_refs"],
+                "modification evidence must reference its control evaluation")
         rid = plan["route_id"]
         if rid in routes:
-            require(routes[rid]["design"] == plan, "cannot rewrite an existing route's success criteria")
+            require(routes[rid]["plan"] == plan, "cannot rewrite an existing route's success criteria")
         else:
             if plan["restart_of"] is not None:
                 require(plan["restart_of"] in routes, "restarted route must link an existing route")
                 require(routes[plan["restart_of"]]["decision"] != "continue", "only stopped or paused routes can restart")
-            routes[rid] = {"design": plan, "attempts": 0, "decision": "continue"}
+            routes[rid] = {"plan": plan, "attempts": 0, "decision": "continue"}
 
     def _finish_uncomputed_route(self, item: dict[str, Any]) -> None:
         if item["experiment"]:
             route = self.routes[item["experiment"]["route_id"]]
-            route["decision"] = "pause_budget" if route["attempts"] >= route["design"]["attempt_budget"] else "pause_insufficient"
+            route["decision"] = "pause_insufficient"
 
     def _compare(self, cid: str, values: pd.Series, panel: FactorInputPanel, labels: pd.DataFrame) -> None:
         item = self.candidates[cid]
@@ -584,10 +585,6 @@ class FactorMiner:
         comparison["control_on_common_assets"] = base
         route = self.routes[plan["route_id"]]
         route["decision"] = comparison["decision"]
-        if route["attempts"] >= plan["attempt_budget"] and route["decision"] == "pause_insufficient":
-            route["decision"] = "pause_budget"
-        elif route["attempts"] >= plan["attempt_budget"] and route["decision"] == "continue":
-            route["decision"] = "complete_supported"
         comparison["route_decision"] = route["decision"]
         item["comparison"] = comparison
         self.store.append(f"{cid}-comparison", "experiment_result", {"candidate_id": cid, **comparison})

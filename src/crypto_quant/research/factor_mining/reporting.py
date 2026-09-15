@@ -82,14 +82,24 @@ def write_research_report(path: Path, run_id: str, purpose: str, records: list[d
             if decision["resume_condition"] is not None:
                 lines += ["恢复条件：" + decision["resume_condition"], ""]
         if proposals:
-            lines += ["## 假设指导的优化建议", "",
-                      "以下三项是优化Agent提出、待配对评估的研究主张；文本完整不代表假设已获验证。", ""]
+            lines += ["## 修改任务与配对检验合同", "",
+                      "Optimizer只声明修改目标和判断规则；最终候选定义及公式由下一轮Ideator生成。", ""]
             for record_id, proposal in proposals:
-                check = proposal["hypothesis_check"]
-                lines += [f"### {proposal['proposal_id']} → {proposal['design']['control_id']}", "",
-                          f"- 原核心假设：{check['core_hypothesis']}",
-                          f"- 公式如何表达或检验：{check['formula_alignment']}",
-                          f"- 修改无帮助的结果：{check['negative_outcome']}", "",
+                task, design = proposal["modification_task"], proposal["experiment_design"]
+                refs = "、".join(f"[{ref}](a_records/{ref}.json)" for ref in proposal["evidence_refs"])
+                lines += [f"### {proposal['proposal_id']} → {proposal['control_id']}", "",
+                          f"- 原核心假设：{task['core_hypothesis']}",
+                          f"- 已观察问题：{task['observed_problem']}",
+                          f"- 修改假设：{task['modification_hypothesis']}",
+                          f"- 改动目标：{task['change_target']}",
+                          f"- 固定部分：{task['fixed_components']}",
+                          f"- 配对问题：{design['question']}",
+                          f"- 判断标准：{design['metric']}最低改善{design['min_improvement']}，"
+                          f"允许有向IC损失{design['max_ic_loss']}",
+                          f"- 预期结果：{design['expected_outcome']}",
+                          f"- 停止条件：{design['stop_condition']}",
+                          f"- 暂停条件：{design['pause_condition']}",
+                          f"- 依据：{refs}", "",
                           f"[完整建议](a_records/{record_id}.json)", ""]
     for record in records:
         if record["kind"] != "evaluation":
