@@ -4,7 +4,7 @@
   "c_end": "2026-07-13T00:00:00Z",
   "c_start": "2026-07-09T00:00:00Z",
   "confidence": 0.95,
-  "context_tokens": 1000000,
+  "context_tokens": 800000,
   "data_usage_review": "Short July 2026 engineering sample; dates already used for debugging, no independent validation claim",
   "fdr_alpha": 0.05,
   "fdr_method": "BY",
@@ -23,7 +23,7 @@
   "output_tokens": null,
   "purpose": "engineering_check",
   "rolling_periods": 26,
-  "run_id": "go_deepseek_v41_flash_example",
+  "run_id": "codex_sdk_example",
   "sample_hours": 1,
   "stage_hours": 48,
   "universe_provenance": "Fixed six-asset engineering sample; not a reconstructed historical universe"

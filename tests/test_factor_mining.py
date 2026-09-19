@@ -838,6 +838,27 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue((miner.root / "model_calls/00001-response.json").exists())
             self.assertTrue((miner.root / "exploration-stopped.json").exists())
 
+    def test_inherited_model_failure_id_does_not_block_a_new_correction(self):
+        spec = specification(run_id="successor-run")
+        good = dumps({"result": {"ok": True}, "read_records": []})
+        model = Mock()
+        model.complete.side_effect = [ModelReply("not json", {}, "fixture"),
+                                      ModelReply(good, {}, "fixture")]
+        with tempfile.TemporaryDirectory() as directory:
+            store = RecordStore(Path(directory) / "records")
+            store.append("model-00001-invalid", "invalid_model_response", {"inherited": True})
+            gateway = AgentGateway(model, spec, store, Path(directory) / "calls")
+
+            self.assertEqual(gateway.ask("evaluator", "check", {}, {}), {"ok": True})
+
+            failures = [record for record in store.all()
+                        if record["kind"] == "invalid_model_response"]
+            self.assertEqual(len(failures), 2)
+            self.assertTrue(any(record["id"].startswith("model-00001-")
+                                and record["id"].endswith("-invalid")
+                                and record["id"] != "model-00001-invalid"
+                                for record in failures))
+
     def test_research_parameters_fail_before_running(self):
         for kwargs in ({"hac_lags": 0}, {"sample_hours": 5},
                        {"groups": 4, "min_symbols": 6}, {"label": "next_bar"}):
@@ -870,6 +891,59 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(first["context_mode"], "numeric_tables_paged")
             second_messages = model.complete.call_args_list[1].args[0]
             self.assertEqual(json.loads(second_messages[-1]["content"])["requested_original_evidence"][0]["data"]["items"][-1], {"value": 999})
+
+    def test_context_pages_stage_rows_as_numeric_evidence(self):
+        record = {"id": "evaluation", "kind": "evaluation", "data": {
+            "summary": {"mean": .2},
+            "stages": [{"stage": number, "rank_ic": number / 10} for number in range(20)],
+        }}
+        compacted = compact_record(record)
+        self.assertEqual(compacted["data"]["stages"], {
+            "record_id": "evaluation", "pointer": "/stages", "rows": 20,
+            "read_records": "request an explicit offset and limit to read original rows",
+        })
+
+    def test_context_pages_numeric_rows_nested_in_goal_cycle_records(self):
+        spec = specification(context_tokens=7000, output_tokens=1000)
+        with tempfile.TemporaryDirectory() as directory:
+            store = RecordStore(Path(directory) / "records")
+            store.append("cycle-00000001", "research_cycle", {"records": [{
+                "id": "candidate-0001-evaluation", "kind": "evaluation",
+                "data": {"summary": {"mean": .2}, "periods": [{"value": i} for i in range(1000)]},
+            }]})
+            pointer = "/records/0/data/periods"
+            model = Mock()
+            model.complete.side_effect = [
+                ModelReply(dumps({"result": None, "read_records": [{
+                    "record_id": "cycle-00000001", "pointer": pointer, "offset": 998, "limit": 2,
+                }]}), {}, "fixture"),
+                ModelReply(dumps({"result": {"checked": True}, "read_records": []}), {}, "fixture"),
+            ]
+            gateway = AgentGateway(model, spec, store, Path(directory) / "calls")
+            self.assertTrue(gateway.ask("optimizer", "核对Goal历史", {}, {})["checked"])
+            first = json.loads((Path(directory) / "calls/00001-request.json").read_text())
+            request = json.loads(first["messages"][1]["content"])
+            paged = request["records"][0]["data"]["records"][0]["data"]["periods"]
+            self.assertEqual(paged["record_id"], "cycle-00000001")
+            self.assertEqual(paged["pointer"], pointer)
+            last_messages = model.complete.call_args_list[-1].args[0]
+            rows = json.loads(last_messages[-1]["content"])["requested_original_evidence"][0]["data"]
+            self.assertEqual(rows["items"], [{"value": 998}, {"value": 999}])
+
+    def test_context_uses_saved_goal_cycle_handoff_before_nested_raw_records(self):
+        record = {"id": "cycle-00000001", "kind": "research_cycle", "data": {
+            "run_id": "prior-run",
+            "records": [{"id": "candidate-0001-evaluation", "kind": "evaluation",
+                         "data": {"periods": [{"value": i} for i in range(1000)]}}],
+            "context": {"source_record_id": "cycle-00000001", "run_id": "prior-run",
+                        "candidates": [{"candidate_ref": "prior-run/candidate-0001"}],
+                        "previous_expressions": []},
+        }}
+        compacted = compact_record(record)
+        self.assertEqual(compacted["data"]["records"]["record_id"], "cycle-00000001")
+        self.assertEqual(compacted["data"]["records"]["pointer"], "/records")
+        self.assertEqual(compacted["data"]["records"]["rows"], 1)
+        self.assertEqual(compacted["data"]["context"]["run_id"], "prior-run")
 
     def test_context_overflow_does_not_make_a_request(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1120,6 +1194,90 @@ class ApiRetryTests(unittest.TestCase):
             self.assertEqual(len(list((miner.root / "model_calls").glob("*-error.json"))), 2)
 
 class ResponseRecoveryTests(unittest.TestCase):
+    def test_ideator_prompt_requires_statistical_only_oi_conditioning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = ScenarioModel()
+            miner = FactorMiner(specification(), model, Path(directory))
+            miner.explore(input_panel(miner.spec))
+
+            task = next(request["task"] for request in model.requests
+                        if request["role"] == "ideator")
+            self.assertIn("可证伪统计条件关联", task)
+            self.assertIn("无法写成纯统计假设时必须不生成该候选", task)
+            self.assertIn("纠错时必须删除全部越界机制", task)
+
+    def test_ideator_rejects_reversed_shifted_correlation_orientation(self):
+        rejected = []
+        def transform(request, result):
+            if request["role"] == "ideator" and not rejected:
+                rejected.append(True)
+                result["candidates"] = [definition(
+                    "cross_rank(ts_corr(spot_log_return_1bar,ts_delay(perp_log_return_1bar,1),24))",
+                    meaning="现货当期收益与永续上一小时收益的相关表示现货对下一小时永续的领先")]
+                result["candidates"][0].update(
+                    name="spot_lead_perp_lag_corr",
+                    hypothesis="现货领先永续的强度可能预测未来收益",
+                )
+        with tempfile.TemporaryDirectory() as directory:
+            miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
+            result = miner.explore(input_panel(miner.spec))
+            self.assertEqual(result["completed_rounds"], 2)
+            failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
+            self.assertEqual(len(failures), 1)
+            self.assertIn("corr(current x, delay(y, n)) means y leads x", failures[0]["data"]["error"])
+
+    def test_ideator_accepts_correct_shifted_correlation_orientation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            miner = FactorMiner(specification(), ScenarioModel(), Path(directory))
+            value = definition(
+                "cross_rank(ts_corr(spot_log_return_1bar,ts_delay(perp_log_return_1bar,1),24))",
+                meaning="现货当期收益与永续上一小时收益的相关，即永续领先现货")
+            value.update(name="perp_lead_spot_lag_corr", hypothesis="永续领先现货的强度可能预测未来收益")
+            definitions, _, _, _ = miner._check_ideation(
+                {"candidates": [value], "dispositions": [], "analysis": "测试时间对齐"}, {})
+            self.assertEqual(definitions[0]["name"], "perp_lead_spot_lag_corr")
+
+    def test_ideator_rejects_misstated_maximum_lookback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            miner = FactorMiner(specification(max_lookback_hours=168), ScenarioModel(), Path(directory))
+            expression = "cross_rank(ts_corr(perp_log_return_1bar,ts_delay(spot_log_return_1bar,1),24))"
+            value = definition(expression, meaning="24小时窗口与1小时滞后；最大回看24小时")
+            value.update(name="spot_lead_perp_lag_corr", hypothesis="现货领先永续的强度可能预测未来收益")
+            response = {"candidates": [value], "dispositions": [], "analysis": "测试回看口径"}
+            with self.assertRaisesRegex(ValueError, "claimed=\\[24\\], actual=25"):
+                miner._check_ideation(response, {})
+            value["meaning"] = "24小时窗口与1小时滞后；最大回看25小时"
+            definitions, _, _, _ = miner._check_ideation(response, {})
+            self.assertEqual(definitions[0]["meaning"], value["meaning"])
+
+            # Test precalculated feature lookback: funding_7d_sum accepts both 0 and 168 hours
+            funding_expr = "mul(cross_rank(basis_trade_spot), neg(cross_zscore(funding_7d_sum)))"
+            funding_val = definition(funding_expr, meaning="永续基差与7天资金费率状态；最大回看168小时")
+            funding_val.update(name="basis_funding_state", hypothesis="基差与7天资金费率交互可能预测未来收益")
+            res_funding = {"candidates": [funding_val], "dispositions": [], "analysis": "测试预计算特征回看"}
+            defs, _, _, _ = miner._check_ideation(res_funding, {})
+            self.assertEqual(defs[0]["name"], "basis_funding_state")
+
+            funding_val["meaning"] = "永续基差与7天资金费率状态；最大回看0小时"
+            defs, _, _, _ = miner._check_ideation(res_funding, {})
+            self.assertEqual(defs[0]["name"], "basis_funding_state")
+
+            funding_val["meaning"] = "永续基差与7天资金费率状态；最大回看50小时"
+            with self.assertRaisesRegex(ValueError, "claimed=\\[50\\], actual=0"):
+                miner._check_ideation(res_funding, {})
+
+    def test_evaluator_and_optimizer_prompts_do_not_invite_oi_denial_lists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = ScenarioModel()
+            miner = FactorMiner(specification(), model, Path(directory))
+            miner.explore(input_panel(miner.spec))
+
+            tasks = {request["role"]: request["task"] for request in model.requests
+                     if request["role"] in {"evaluator", "optimizer"}}
+            for role in ("evaluator", "optimizer"):
+                self.assertIn("聚合OI数量/名义价值变化的统计条件关联", tasks[role])
+                self.assertIn("不列举被排除的解释，即便是否定句", tasks[role])
+
     def test_each_role_corrects_once_before_research_state_is_committed(self):
         mutations = {
             "ideator": lambda r: r["candidates"][0].update(direction="-1"),
@@ -1176,6 +1334,113 @@ class ResponseRecoveryTests(unittest.TestCase):
             self.assertEqual(result["completed_rounds"], 2)
             self.assertEqual(miner.routes["window-route"]["attempts"], 1)
             self.assertEqual(len(miner.candidates), 3)
+
+    def test_optimizer_cannot_request_unsupported_residualization(self):
+        rejected = []
+        def transform(request, result):
+            if request["role"] == "optimizer" and result["proposals"] and not rejected:
+                rejected.append(True)
+                result["proposals"][0]["modification_task"]["change_target"] = "对候选做截面正交化"
+        with tempfile.TemporaryDirectory() as directory:
+            miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
+            result = miner.explore(input_panel(miner.spec))
+            self.assertEqual(result["completed_rounds"], 2)
+            failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
+            self.assertEqual(len(failures), 1)
+            self.assertIn("no regression/residualization operator", failures[0]["data"]["error"])
+
+    def test_optimizer_cannot_infer_leverage_change_from_open_interest(self):
+        rejected = []
+        def transform(request, result):
+            if request["role"] == "optimizer" and result["proposals"] and not rejected:
+                rejected.append(True)
+                result["proposals"][0]["modification_task"].update(
+                    modification_hypothesis="open_interest_base 上升说明大户加杠杆",
+                    change_target="用 OI 变化识别新杠杆头寸",
+                )
+        with tempfile.TemporaryDirectory() as directory:
+            miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
+            result = miner.explore(input_panel(miner.spec))
+            self.assertEqual(result["completed_rounds"], 2)
+            failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
+            self.assertEqual(len(failures), 1)
+            self.assertIn("does not identify leverage ratios", failures[0]["data"]["error"])
+
+    def test_ideator_cannot_label_fixed_arithmetic_as_residualization(self):
+        rejected = []
+        def transform(request, result):
+            if request["role"] == "ideator" and request["payload"]["pending_proposals"] and not rejected:
+                rejected.append(True)
+                result["candidates"][0]["name"] = "orthogonalized_price_deviation"
+                result["candidates"][0]["change_reason"] = "用固定系数的 rank 加减实现正交化"
+        with tempfile.TemporaryDirectory() as directory:
+            miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
+            result = miner.explore(input_panel(miner.spec))
+            self.assertEqual(result["completed_rounds"], 2)
+            failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
+            self.assertEqual(len(failures), 1)
+            self.assertIn("no regression/residualization operator", failures[0]["data"]["error"])
+
+    def test_evaluator_cannot_claim_unsupported_residualization_in_any_report_field(self):
+        for field in ("analysis", "mechanism", "conditions", "falsifiers", "limitations", "next_steps"):
+            rejected = []
+            def transform(request, result):
+                if request["role"] == "evaluator" and not rejected:
+                    rejected.append(True)
+                    claim = "对控制变量做正交化并报告残差 rank_ic"
+                    if isinstance(result[field], list):
+                        result[field].append(claim)
+                    else:
+                        result[field] += claim
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
+                result = miner.explore(input_panel(miner.spec))
+                self.assertEqual(result["completed_rounds"], 2)
+                failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
+                self.assertEqual(len(failures), 1)
+                self.assertIn("no regression/residualization operator", failures[0]["data"]["error"])
+
+    def test_evaluator_can_record_unavailable_residualization_as_a_limitation(self):
+        noted = []
+        def transform(request, result):
+            if request["role"] == "evaluator" and not noted:
+                noted.append(True)
+                result["limitations"].append(
+                    "当前表达式白名单没有回归或残差算子，未执行正交化或残差化。")
+        with tempfile.TemporaryDirectory() as directory:
+            miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
+            result = miner.explore(input_panel(miner.spec))
+            self.assertEqual(result["completed_rounds"], 2)
+            failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
+            self.assertEqual(failures, [])
+
+    def test_evaluator_cannot_infer_leverage_change_from_open_interest(self):
+        rejected = []
+        def transform(request, result):
+            if request["role"] == "evaluator" and not rejected:
+                rejected.append(True)
+                result["mechanism"] = "open_interest_base 上升说明大户继续加杠杆"
+        with tempfile.TemporaryDirectory() as directory:
+            miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
+            result = miner.explore(input_panel(miner.spec))
+            self.assertEqual(result["completed_rounds"], 2)
+            failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
+            self.assertEqual(len(failures), 1)
+            self.assertIn("does not identify leverage ratios", failures[0]["data"]["error"])
+
+    def test_evaluator_cannot_infer_position_building_from_open_interest(self):
+        rejected = []
+        def transform(request, result):
+            if request["role"] == "evaluator" and not rejected:
+                rejected.append(True)
+                result["mechanism"] = "open_interest_base 上升表示方向性头寸建立阶段"
+        with tempfile.TemporaryDirectory() as directory:
+            miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
+            result = miner.explore(input_panel(miner.spec))
+            self.assertEqual(result["completed_rounds"], 2)
+            failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
+            self.assertEqual(len(failures), 1)
+            self.assertIn("open/close and long/short position direction", failures[0]["data"]["error"])
 
     def test_truncated_and_fenced_json_are_corrected_without_accepting_invalid_output(self):
         good = dumps({"result": {"ok": True}, "read_records": []})
@@ -1431,7 +1696,7 @@ class ResponseRecoveryTests(unittest.TestCase):
         from crypto_quant.research.factor_mining.cli import add_arguments, execute
         parser = argparse.ArgumentParser(); add_arguments(parser)
         args = parser.parse_args(["complete-reports", "--run-dir", "saved-run", "--stage", "B",
-                                  "--model", "fixture", "--protocol", "chat"])
+                                  "--model", "fixture"])
         with patch("crypto_quant.research.factor_mining.cli.FactorMiner.open") as opened, patch(
                 "crypto_quant.research.factor_mining.cli.load_stage") as loader:
             execute(args)

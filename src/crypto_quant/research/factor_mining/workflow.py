@@ -10,6 +10,7 @@ import ast
 import copy
 import hashlib
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -125,6 +126,154 @@ def _panel_fingerprint(panel: FactorInputPanel) -> dict[str, Any]:
             "dtypes": {k: str(v) for k, v in panel.values.dtypes.items()}}
 
 
+def _reject_unsupported_oi_cost_basis(field_references: str, *claims: str) -> None:
+    """Keep aggregate OI quantity/value within the meanings exposed by the catalog."""
+    oi_fields = ("open_interest_value", "open_interest_base")
+    referenced = tuple(field for field in oi_fields if field in field_references)
+    if not referenced:
+        return
+    description = " ".join(claims).casefold()
+    if len(referenced) == 2:
+        unsupported_cost = (
+            "平均持仓", "平均开仓", "平均入场", "入场价", "平均名义价格",
+            "持仓成本", "开仓成本", "浮盈", "浮亏",
+            "average entry", "entry price", "entry level", "average position price",
+            "average notional price", "cost basis", "break-even", "breakeven",
+            "unrealized pnl", "unrealized profit", "unrealized loss",
+        )
+        require(not any(term in description for term in unsupported_cost),
+                "open_interest_value/open_interest_base is current aggregate notional per base unit; "
+                "it does not provide entry price, cost basis, or unrealized PnL")
+    unsupported_position_inference = (
+        "加杠杆", "去杠杆", "提高杠杆", "降低杠杆", "杠杆率", "杠杆倍数", "杠杆头寸",
+        "新建头寸", "新增头寸", "新头寸", "头寸建立", "头寸的建立", "头寸加速建立",
+        "方向性头寸建立", "建仓", "开仓方向", "平仓方向", "头寸平仓",
+        "lever up", "levering up", "deleverag", "leverage ratio", "higher leverage", "lower leverage",
+        "new position", "position building", "position establishment", "open position", "close position",
+    )
+    negations = (
+        "不表示", "不代表", "不推断", "不用于推断", "不能推断", "不可推断", "无法推断",
+        "不能据此推断", "不能解释", "不解释", "不应", "不得", "禁止",
+        "does not", "do not", "cannot", "can't", "must not", "not infer", "no evidence",
+    )
+    for term in unsupported_position_inference:
+        for match in re.finditer(re.escape(term), description):
+            context = description[max(0, match.start() - 48):match.end() + 24]
+            require(any(negation in context for negation in negations),
+                    "open interest is an aggregate current quantity/value; its change does not identify "
+                    "leverage ratios, participant identity, or open/close and long/short position direction")
+
+
+def _reject_unsupported_residualization(*claims: str) -> None:
+    """Do not label fixed arithmetic as regression-based residualization."""
+    description = " ".join(claims).casefold()
+    unsupported = (
+        "正交化", "中性化", "残差化", "回归残差", "剔除共线", "去除共线",
+        "orthogonal", "neutraliz", "residualiz", "regression residual", "de-correlat",
+    )
+    negations = (
+        "没有", "不支持", "不使用", "未使用", "未执行", "未提供", "不得", "不能", "不可", "无法", "禁止",
+        "不引入", "不涉及", "不做", "不作", "未做", "未作", "不包含", "未包含", "不进行", "未进行", "并非", "排除", "不存在", "无需", "不需要",
+        "no ", "not ", "without ", "cannot", "can't", "must not", "unsupported", "does not",
+        "did not", "never ", "neither", "nor ",
+    )
+    for term in unsupported:
+        for match in re.finditer(re.escape(term), description):
+            context = description[max(0, match.start() - 48):match.end() + 24]
+            require(any(negation in context for negation in negations),
+                    "the expression catalog has no regression/residualization operator; fixed-coefficient "
+                    "rank or z-score arithmetic cannot be described as orthogonalization, neutralization, "
+                    "residualization, or removal of collinearity")
+
+
+def _hourly_return_market(node: ast.AST) -> str | None:
+    """Recognize the catalog's one-hour close-to-close return expansion."""
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "log" and len(node.args) == 1):
+        return None
+    ratio = node.args[0]
+    if not (isinstance(ratio, ast.Call) and isinstance(ratio.func, ast.Name)
+            and ratio.func.id == "div" and len(ratio.args) == 2):
+        return None
+    current, delayed = ratio.args
+    if not (isinstance(current, ast.Name)
+            and isinstance(delayed, ast.Call) and isinstance(delayed.func, ast.Name)
+            and delayed.func.id == "ts_delay" and len(delayed.args) == 2
+            and isinstance(delayed.args[0], ast.Name)
+            and isinstance(delayed.args[1], ast.Constant) and delayed.args[1].value == 1
+            and current.id == delayed.args[0].id):
+        return None
+    return {"spot_close": "spot", "perp_close": "perp"}.get(current.id)
+
+
+def _lead_lag_orientation(node: ast.AST) -> str | None:
+    """Return the leading market in corr(current_x, delay(return_y, n))."""
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "ts_corr" and len(node.args) == 3):
+        return None
+    current = _hourly_return_market(node.args[0])
+    delayed = node.args[1]
+    if not (current and isinstance(delayed, ast.Call) and isinstance(delayed.func, ast.Name)
+            and delayed.func.id == "ts_delay" and len(delayed.args) == 2
+            and isinstance(delayed.args[1], ast.Constant)
+            and type(delayed.args[1].value) is int and delayed.args[1].value > 0):
+        return None
+    previous = _hourly_return_market(delayed.args[0])
+    if previous is None or previous == current:
+        return None
+    return f"{previous}_leads_{current}"
+
+
+def _reject_reversed_lead_lag_semantics(expression: str, *claims: str) -> None:
+    """Reject the observed reversal of leader/follower labels in shifted correlations."""
+    try:
+        tree = compile_expression(expression).tree
+    except ValueError:
+        return  # Formula errors are diagnosed by the calculator with program evidence.
+    pair = next(((_lead_lag_orientation(node.args[0]), _lead_lag_orientation(node.args[1]))
+                 for node in ast.walk(tree)
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                 and node.func.id == "sub" and len(node.args) == 2
+                 and _lead_lag_orientation(node.args[0]) and _lead_lag_orientation(node.args[1])), None)
+    orientations = [value for value in (_lead_lag_orientation(node) for node in ast.walk(tree)) if value]
+    if not orientations:
+        return
+    name = claims[0].casefold().replace("-", "_") if claims else ""
+    description = " ".join(claims).casefold()
+    expected = pair[0] if pair else orientations[0]
+    wrong = "spot_leads_perp" if expected == "perp_leads_spot" else "perp_leads_spot"
+    expected_token = "spot_lead" if expected == "spot_leads_perp" else "perp_lead"
+    wrong_token = "spot_lead" if wrong == "spot_leads_perp" else "perp_lead"
+    name_order_is_reversed = wrong_token in name and (
+        expected_token not in name or name.index(wrong_token) < name.index(expected_token))
+    chinese_reversal = (
+        expected == "perp_leads_spot" and (
+            "现货领先项为现货当期" in description or "现货对下一小时永续的领先" in description)
+        or expected == "spot_leads_perp" and (
+            "永续领先项为永续当期" in description or "永续对下一小时现货的领先" in description)
+    )
+    require(not (name_order_is_reversed or chinese_reversal),
+            "lead-lag orientation is reversed: corr(current x, delay(y, n)) means y leads x; "
+            f"the first shifted correlation in this expression is {expected}")
+
+
+def _reject_misstated_lookback(expression: str, meaning: str) -> None:
+    """Keep an explicitly claimed maximum lookback equal to the executable tree."""
+    try:
+        compiled = compile_expression(expression)
+        actual = compiled.lookback_hours
+    except ValueError:
+        return  # Formula errors are diagnosed by the calculator with program evidence.
+    claimed = [int(value) for value in re.findall(r"最大(?:显式)?回看(?:为)?\s*(\d+)\s*小时", meaning)]
+    if not claimed:
+        return
+    feature_horizons = {"funding_7d_sum": 168, "funding_24h_sum": 24}
+    inherent = max([feature_horizons[f] for f in compiled.fields if f in feature_horizons] or [0])
+    valid_lookbacks = {actual, actual + inherent} if inherent else {actual}
+    require(all(value in valid_lookbacks for value in claimed),
+            f"stated maximum lookback differs from executable expression: claimed={claimed}, actual={actual}")
+
+
 def _check_report(value: dict[str, Any]) -> dict[str, Any]:
     required = REPORT_SCHEMA["properties"]
     missing = sorted(set(required) - set(value))
@@ -135,6 +284,14 @@ def _check_report(value: dict[str, Any]) -> dict[str, Any]:
         require(isinstance(value[name], list) and bool(value[name]), f"{name} must be a nonempty list")
         for item in value[name]:
             text(item, name)
+    _reject_unsupported_residualization(
+        value["analysis"], value["mechanism"],
+        *value["conditions"], *value["falsifiers"],
+        *value["limitations"], *value["next_steps"])
+    report_text = " ".join((value["analysis"], value["mechanism"],
+                            *value["conditions"], *value["falsifiers"],
+                            *value["limitations"], *value["next_steps"]))
+    _reject_unsupported_oi_cost_basis(report_text, report_text)
     return {name: value[name] for name in required}
 
 
@@ -159,6 +316,17 @@ def _check_review(review: dict[str, Any], cid: str, compiled: Any, error: str | 
         require(not all(c["matches"] for c in review["checks"]) or error is not None,
                 "inconsistent verdict must identify a discrepancy")
         text(review["repair_expression"], "repair_expression")
+
+
+def validate_panel(panel: FactorInputPanel, spec: ResearchSpec, stage: str) -> None:
+    start, end = spec.bounds(stage)
+    members = validate_universe(panel.universe)
+    require(members.index.equals(panel.values.index) and members.equals(panel.universe), "panel must have canonical explicit membership")
+    hours = members.index.get_level_values("timestamp")
+    require(hours.min() <= start - pd.Timedelta(hours=spec.max_lookback_hours), "panel is missing declared expression warm-up hours")
+    require(hours.max() == end - pd.Timedelta(hours=1), "panel must stop at the end of its allowed data segment")
+    require("perp_open" in panel.values, "24h target requires perpetual opening prices")
+    require(set(panel.values.columns) == set(INPUT_COLUMNS), "mining uses exactly the shared input-field contract")
 
 
 class FactorMiner:
@@ -189,14 +357,7 @@ class FactorMiner:
         self.decisions: dict[str, dict[str, Any]] = {}
 
     def _validate_panel(self, panel: FactorInputPanel, stage: str) -> None:
-        start, end = self.spec.bounds(stage)
-        members = validate_universe(panel.universe)
-        require(members.index.equals(panel.values.index) and members.equals(panel.universe), "panel must have canonical explicit membership")
-        hours = members.index.get_level_values("timestamp")
-        require(hours.min() <= start - pd.Timedelta(hours=self.spec.max_lookback_hours), "panel is missing declared expression warm-up hours")
-        require(hours.max() == end - pd.Timedelta(hours=1), "panel must stop at the end of its allowed data segment")
-        require("perp_open" in panel.values, "24h target requires perpetual opening prices")
-        require(set(panel.values.columns) == set(INPUT_COLUMNS), "mining uses exactly the shared input-field contract")
+        validate_panel(panel, self.spec, stage)
 
     def _compile(self, expression: str):
         require(len(expression) <= self.spec.max_formula_nodes * 100, "formula exceeds complexity budget")
@@ -278,8 +439,12 @@ class FactorMiner:
             calculation["cross_section_counts"] = finite(result.cross_section_counts.reset_index().to_dict("records"))
             path = self.root / "factor_values" / f"{cid}-A.csv"
             path.parent.mkdir(exist_ok=True)
-            with path.open("x") as handle:
-                result.values.to_csv(handle)
+            csv = result.values.to_csv()
+            if path.exists():
+                require(path.read_text() == csv, "saved factor values differ during checkpoint recovery")
+            else:
+                with path.open("x") as handle:
+                    handle.write(csv)
             calculation["values_artifact"] = str(path.relative_to(self.root))
         item["calculation"] = calculation
         self.store.append(f"{cid}-calculation", "calculation", {"candidate_id": cid, **calculation})
@@ -292,6 +457,10 @@ class FactorMiner:
             "A段候选去向由优化Agent回答四问后决定；B段通过与交付资格由程序按冻结规则计算，"
             "B段解释须参考validation_result记录，不能用模型意见覆盖程序结论。"
             "不能凭综合分数或单个p值判断有效或无效；同时覆盖失败、证据不足和失效条件。"
+            "候选涉及OI时，各报告字段只用‘聚合OI数量/名义价值变化的统计条件关联’"
+            "这一中性语义；不讨论交易行为或身份机制，也不列举被排除的解释，即便是否定句。"
+            "当前表达式白名单没有回归或残差算子；不得建议正交化、中性化、残差化、"
+            "剔除共线或报告残差统计量。"
             "如数值表分页，按需要读取原文并在limitations中说明实际检查覆盖。",
             {"candidate_id": cid}, REPORT_SCHEMA, validate=_check_report)
 
@@ -310,34 +479,75 @@ class FactorMiner:
         gateway.store.append(f"{cid}-report", "model_report", {"candidate_id": cid, **narrative})
         return narrative
 
-    def explore(self, panel: FactorInputPanel) -> dict[str, Any]:
+    def explore(self, panel: FactorInputPanel, *, goal_context: dict[str, Any] | None = None) -> dict[str, Any]:
         require(not self.store.all() and not (self.root / "frozen_batch.json").exists(), "exploration can start only in a new research run")
         self._validate_panel(panel, "A")
-        with (self.root / "A-universe.csv").open("x") as handle:
-            panel.universe.rename("eligible").to_csv(handle)
+        universe_path = self.root / "A-universe.csv"
+        csv = panel.universe.rename("eligible").to_csv()
+        if universe_path.exists():
+            require(universe_path.read_text() == csv, "saved A universe differs during initialization recovery")
+        else:
+            with universe_path.open("x") as handle:
+                handle.write(csv)
         self.store.append("inputs", "data_provenance", {"fingerprint": _panel_fingerprint(panel), "catalog": panel.ideation_context()})
+        if goal_context is not None:
+            self.store.append("goal-context", "goal_context", goal_context)
+        return self._run_exploration(panel)
+
+    def resume_explore(self, panel: FactorInputPanel) -> dict[str, Any]:
+        """Replay committed A checkpoints; never reopen a run after B was frozen."""
+        require(not (self.root / "frozen_batch.json").exists(), "cannot resume A after freezing B")
+        self._validate_panel(panel, "A")
+        records = {r["id"]: r for r in self.store.all()}
+        require("inputs" in records and records["inputs"]["data"]["fingerprint"] == _panel_fingerprint(panel),
+                "A inputs changed; cannot resume the saved research run")
+        self.candidates, self.decisions, self.routes, self.proposals = {}, {}, {}, {}
+        return self._run_exploration(panel)
+
+    def _run_exploration(self, panel: FactorInputPanel) -> dict[str, Any]:
         labels = build_labels(panel, self.spec, "A")
         try:
             return self._explore_rounds(panel, labels)
         except Exception as exc:
             # API retries happen inside the gateway. An exhausted or invalid run stops here.
-            write_json(self.root / "exploration-stopped.json", {"error_type": type(exc).__name__, "reason": str(exc)})
+            path = self.root / "exploration-stopped.json"
+            if not path.exists():
+                write_json(path, {"error_type": type(exc).__name__, "reason": str(exc)})
             raise
 
     def _explore_rounds(self, panel: FactorInputPanel, labels: pd.DataFrame) -> dict[str, Any]:
-        seen: dict[tuple[str, int], str] = {}
+        saved = {r["id"]: r["data"] for r in self.store.all()}
+        context = saved.get("goal-context", {})
+        seen: dict[tuple[str, int], str] = {
+            (item["expression"], item["direction"]): item["candidate_ref"]
+            for item in context.get("previous_expressions", [])}
         completed_rounds = 0
         round_no = 0
         while True:
             round_no += 1
             pending = {pid: p for pid, p in self.proposals.items() if p["status"] == "pending"}
-            response = self.gateway.ask("ideator",
+            ideation_id = f"round-{round_no:03d}-ideation"
+            response = saved[ideation_id] if ideation_id in saved else self.gateway.ask("ideator",
                 "构造当前有研究依据的一组可证伪候选公式，写清计算含义，不为凑数量生成候选。"
                 "阅读全部历史及优化任务，逐条记录采用或放弃。"
+                "严格按inputs字段目录解释数据；open_interest_value/open_interest_base只是"
+                "当前聚合名义价值与基础币数量之比，不得将其称为平均名义价格，也不得推断"
+                "历史开仓成本、平均入场价、平均持仓价或浮动盈亏。OI变化只能表示当前"
+                "聚合未平仓数量/名义价值变化，不能推断杠杆率、加杠杆/去杠杆、"
+                "开平仓或多空方向，也不能推断由哪类参与者造成。"
+                "若使用OI状态，hypothesis和meaning只能陈述交互项的可证伪统计条件关联，"
+                "不得补造建仓、平仓、杠杆或参与者机制；无法写成纯统计假设时必须不生成该候选。"
+                "纠错时必须删除全部越界机制，不得只在其他字段追加否定句。"
                 "Optimizer只给出修改任务和配对检验合同；最终候选定义和可执行公式必须由你首次生成。"
                 "采用任务时，候选parent_id必须引用control_id，proposal_id必须引用当前任务，"
                 "预测方向保持不变；change_reason须具体说明公式如何实现change_target并遵守fixed_components。"
                 "不得改写Optimizer预先声明的修改任务或判断标准；无法一致实现时放弃，由Optimizer另立新任务。"
+                "领先-滞后公式中，corr(当期x, delay(y,n))表示y领先x；候选名称、meaning、"
+                "hypothesis与做差顺序必须与这一时间对齐一致。"
+                "meaning若声明最大回看小时数，必须累加底层收益、外层delay与滚动窗口的"
+                "完整依赖，并与程序可执行表达式一致（funding_7d_sum等底座预计算字段的算子回看为0，声明0或168均可接受）。"
+                "当前白名单没有回归或残差算子；不得把固定系数的rank/z-score加减称为正交化、"
+                "中性化、残差化或剔除共线。修改任务需要这些操作时必须abandon。"
                 "遵守candidate_decisions：暂停或淘汰的候选不自动重启；保留但未获准优化的版本不修改。"
                 "不可重复已停止路线且不给新增依据。",
                 {"catalog_record_id": "inputs", "pending_proposals": pending,
@@ -352,7 +562,8 @@ class FactorMiner:
                     "analysis": _text_schema("本轮构想依据")}),
                 validate=lambda response: self._check_ideation(response, pending))
             definitions, experiments, self.routes, self.proposals = self._check_ideation(response, pending)
-            self.store.append(f"round-{round_no:03d}-ideation", "ideation", response)
+            if ideation_id not in saved:
+                self.store.append(ideation_id, "ideation", response)
             round_ids = []
             for index, definition in enumerate(definitions):
                 cid = f"candidate-{len(self.candidates) + 1:04d}"
@@ -360,53 +571,84 @@ class FactorMiner:
                                        "experiment": experiments.get(index)}
                 self.candidates[cid] = item
                 round_ids.append(cid)
-                self.store.append(f"{cid}-definition", "candidate", item)
+                if f"{cid}-definition" in saved:
+                    require(saved[f"{cid}-definition"] == item, "saved candidate differs from accepted ideation")
+                else:
+                    self.store.append(f"{cid}-definition", "candidate", item)
                 try:
                     key = (self._compile(definition["expression"]).expanded_expression, definition["direction"])
                 except ValueError:
                     key = None  # Invalid formulas still enter semantic diagnosis and repair.
                 if key in seen:
                     item["duplicate_of"] = seen[key]
-                    self.store.append(f"{cid}-duplicate", "duplicate", {"candidate_id": cid, "duplicate_of": seen[key]})
+                    if f"{cid}-duplicate" not in saved:
+                        self.store.append(f"{cid}-duplicate", "duplicate", {"candidate_id": cid, "duplicate_of": seen[key]})
                     self._finish_uncomputed_route(item)
                     continue
-                values = self._calculate(cid, panel)
+                if f"{cid}-calculation" in saved:
+                    item["calculation"] = saved[f"{cid}-calculation"]
+                    executed = item["calculation"]["executed_expression"]
+                    values = evaluate_expression(executed["expression"], panel).values if executed else None
+                else:
+                    values = self._calculate(cid, panel)
                 if values is None:
                     self._finish_uncomputed_route(item)
                     continue
                 expression = item["calculation"]["executed_expression"]["expanded_expression"]
                 if (expression, definition["direction"]) in seen:
                     item["duplicate_of"] = seen[(expression, definition["direction"])]
-                    self.store.append(f"{cid}-duplicate", "duplicate", {"candidate_id": cid, "duplicate_of": item["duplicate_of"]})
+                    if f"{cid}-duplicate" not in saved:
+                        self.store.append(f"{cid}-duplicate", "duplicate", {"candidate_id": cid, "duplicate_of": item["duplicate_of"]})
                     self._finish_uncomputed_route(item)
                     continue
                 seen[(expression, definition["direction"])] = cid
-                report = evaluate_factor(values, labels, self.spec, "A", definition["direction"])
+                report = (saved[f"{cid}-evaluation"] if f"{cid}-evaluation" in saved else
+                          evaluate_factor(values, labels, self.spec, "A", definition["direction"]))
                 item["evaluation"] = report
-                self.store.append(f"{cid}-evaluation", "evaluation", {"candidate_id": cid, **report})
-                write_group_plot(self.root / "plots" / f"{cid}-A.svg", report)
+                if f"{cid}-evaluation" not in saved:
+                    self.store.append(f"{cid}-evaluation", "evaluation", {"candidate_id": cid, **report})
+                plot = self.root / "plots" / f"{cid}-A.svg"
+                if not plot.exists():
+                    write_group_plot(plot, report)
                 if item["experiment"]:
-                    self._compare(cid, values, panel, labels)
-                narrative = self._try_report(cid, self.gateway)
+                    if f"{cid}-comparison" in saved:
+                        item["comparison"] = saved[f"{cid}-comparison"]
+                        self.routes[item["experiment"]["route_id"]]["decision"] = item["comparison"]["route_decision"]
+                    else:
+                        self._compare(cid, values, panel, labels)
+                narrative = saved[f"{cid}-report"] if f"{cid}-report" in saved else self._try_report(cid, self.gateway)
                 if narrative is not None:
                     item["model_report"] = narrative
             review_ids = list(dict.fromkeys(round_ids + [cid for cid, decision in self.decisions.items()
                                                         if decision["continue_optimization"]]))
-            optimization = self.gateway.ask("optimizer",
+            optimization_id = f"round-{round_no:03d}-optimization"
+            optimization = ({k: v for k, v in saved[optimization_id].items() if k != "route_states"}
+                            if optimization_id in saved else self.gateway.ask("optimizer",
                 "先阅读本轮所有候选、失败及完整评估，再判断哪里有值得继续的具体依据。"
                 "评估Agent只提供证据解释，不作候选去向决定；由你独立综合证据回答四问并决定去向。"
                 "先逐个review_candidate_ids回答四个研究问题并决定去向，decisions必须完整且不重复。"
                 "研究依据由你根据证据分析，不限于预设现象；引用真实record ID并说明观察与推测。"
                 "区分当前版本与修改路线：retain可同时优化；修改路线停止不自动淘汰原版。"
-                "保留须解释A证据为何值得固定版本送B，A阶段不宣称通过独立验证；"
-                "证据不足则pause并写恢复条件，有充分否定证据或无增量的重复才discard。"
-                "不得仅因低分或不显著而淘汰。continue_optimization为true须四个回答均获支持，"
+                "去向决策准则：全批次BY FDR多重校正与样本外独立检验是B段程序的专职职责，"
+                "不得将‘A段未做全批次FDR、未做正交化或A段非独立样本’作为拒绝送B的理由。"
+                "当候选在A段呈现出与假设一致的方向、Rank IC具有统计显著性（如点估计|IC|>=0.02且p<0.05）"
+                "或分组收益呈现合理单调趋势时，应当积极判定为retain保留送B，交由B段冻结批次接受客观检验。"
+                "若认为当前候选仍有改进空间，支持在判定retain的同时将continue_optimization设为true继续优化。"
+                "证据不足、IC接近零或修改路线受阻缺乏明确方向时pause并写恢复条件；"
+                "有充分否定证据或无增量的重复才discard；不得仅因单一统计量未达完美而淘汰。"
+                "continue_optimization为true须四个回答均获支持，"
                 "并为该候选提供至少一条proposal；false时禁止proposal。"
                 "依据不足先给diagnostics，不强行生成修改任务。不得输出新候选定义、名称、最终公式、"
                 "公式含义或方向；这些由下一轮Ideator首次生成。"
                 "每条proposal只输出：精确证据引用、原核心假设、已观察问题、修改假设、语义改动目标和固定部分；"
                 "以及与原候选的配对检验问题、主指标、最低改善、允许IC损失、预期、停止和暂停条件。"
                 "同一假设下可在change_target中指定多个相互关联的语义改动，但不写可执行表达式。"
+                "候选涉及OI时，所有决策、diagnostics和proposal只用‘聚合OI数量/"
+                "名义价值变化的统计条件关联’这一中性语义；不讨论交易行为或身份机制，"
+                "也不列举被排除的解释，即便是否定句。"
+                "当前表达式白名单没有回归或残差算子；不得提议正交化、中性化、残差化、"
+                "剔除共线或其他无法由当前白名单真实执行的统计操作；"
+                "固定系数的rank/z-score加减不属于上述操作。需要时应pause并记录恢复条件。"
                 "判断条件须与experiment_design.metric、最低改善和允许IC损失一致。"
                 "control_id必须是获准继续的已评估候选；evidence_refs必须包含该候选的评估记录。"
                 "程序配对比较的决定不能覆盖；已停止路线若重新启动必须使用新路线并说明新增依据及旧路线。",
@@ -416,10 +658,11 @@ class FactorMiner:
                     "decisions": _array_schema(DECISION_SCHEMA, minItems=len(review_ids), maxItems=len(review_ids)),
                     "diagnostics": _array_schema(_text_schema("证据缺口和所需诊断")),
                     "proposals": _array_schema(PROPOSAL_SCHEMA)}),
-                validate=lambda response: self._check_optimization(response, review_ids))
+                validate=lambda response: self._check_optimization(response, review_ids)))
             decisions, self.routes, self.proposals = self._check_optimization(optimization, review_ids)
             self.decisions.update(decisions)
-            self.store.append(f"round-{round_no:03d}-optimization", "optimization", {**optimization, "route_states": self.routes})
+            if optimization_id not in saved:
+                self.store.append(optimization_id, "optimization", {**optimization, "route_states": self.routes})
             completed_rounds = round_no
             if not optimization["proposals"]:
                 break
@@ -431,8 +674,12 @@ class FactorMiner:
                       "candidate_decisions": self.decisions,
                       "routes": self.routes, "proposals": self.proposals,
                       "stop_reason": "optimizer returned no authorized optimization proposals"}
-        write_research_report(self.root / "A-report.md", self.spec.run_id, self.spec.purpose, self.store.all(), "A")
-        write_json(self.root / "a-complete.json", completion)
+        write_research_report(self.root / "A-report.md", self.spec.run_id, self.spec.purpose, self.store.all(), "A", replace=True)
+        path = self.root / "a-complete.json"
+        if path.exists():
+            require(json.loads(path.read_text()) == completion, "completed A checkpoint differs from saved evidence")
+        else:
+            write_json(path, completion)
         return completion
 
     def _check_ideation(self, response: dict[str, Any], pending: dict[str, Any]):
@@ -440,6 +687,17 @@ class FactorMiner:
         text(response["analysis"], "ideation analysis")
         require(isinstance(response["candidates"], list), "candidates must be a list")
         definitions = [candidate(value) for value in response["candidates"]]
+        for definition in definitions:
+            _reject_reversed_lead_lag_semantics(
+                definition["expression"], definition["name"], definition["hypothesis"],
+                definition["meaning"], definition["change_reason"])
+            _reject_misstated_lookback(definition["expression"], definition["meaning"])
+            _reject_unsupported_oi_cost_basis(
+                definition["expression"], definition["name"], definition["hypothesis"],
+                definition["meaning"], definition["change_reason"])
+            _reject_unsupported_residualization(
+                definition["name"], definition["hypothesis"],
+                definition["meaning"], definition["change_reason"])
         dispositions = response["dispositions"]
         require(isinstance(dispositions, list) and len(dispositions) == len(pending)
                 and {d["proposal_id"] for d in dispositions} == set(pending), "every pending proposal needs one disposition")
@@ -493,6 +751,12 @@ class FactorMiner:
             pid = identifier(proposal["proposal_id"])
             require(pid not in proposals, "proposal IDs must be unique")
             plan = self._proposal_plan(proposal)
+            task = plan["modification_task"]
+            _reject_unsupported_oi_cost_basis(
+                f"{task['modification_hypothesis']} {task['change_target']}",
+                task["modification_hypothesis"], task["change_target"])
+            _reject_unsupported_residualization(
+                task["modification_hypothesis"], task["change_target"])
             require(plan["control_id"] in decisions and decisions[plan["control_id"]]["continue_optimization"],
                     "proposal is not authorized by the candidate decision")
             proposal_controls.add(plan["control_id"])

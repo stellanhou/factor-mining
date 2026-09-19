@@ -12,14 +12,16 @@ import pandas as pd
 from crypto_quant.data_access.market_data import MarketDataStore
 from crypto_quant.features.factor_inputs import load_factor_inputs, validate_universe
 from .contracts import ResearchSpec, dumps, require
-from .model import OpenCodeGoModel, available_go_models
+from .goal import GoalRunner, GoalSpec
+from .codex_model import CodexModel, PROVIDER, add_model_arguments, model_from_args
 from .records import write_json
 from .workflow import FactorMiner
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     actions = parser.add_subparsers(dest="mining_action", required=True)
-    actions.add_parser("models", help="查询OpenCode Go公开模型清单，不使用密钥")
+    models = actions.add_parser("models", help="查询当前ChatGPT订阅可用的Codex模型")
+    add_model_arguments(models)
     explore = actions.add_parser("explore", help="仅在A段运行因子挖掘")
     explore.add_argument("--contract", type=Path, required=True)
     explore.add_argument("--output-root", type=Path, default=Path("experiments/factor_mining"))
@@ -34,17 +36,22 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     reports.add_argument("--run-dir", type=Path, required=True)
     reports.add_argument("--stage", choices=("A", "B"), required=True)
     reports.add_argument("--idea-pool", type=Path, default=Path("experiments/idea_pool"))
-    for action in (explore, validate):
+    goal = actions.add_parser("goal-start", help="优化Agent负责成果目标，持续研究直至完成；Ctrl+C暂停")
+    goal.add_argument("--goal", type=Path, required=True, help="goal_id、objective、target_ideas的JSON文件")
+    goal.add_argument("--contract", type=Path, required=True)
+    goal.add_argument("--output-root", type=Path, default=Path("experiments/factor_mining/goals"))
+    goal.add_argument("--idea-pool", type=Path, default=Path("experiments/idea_pool"))
+    goal.add_argument("--poll-seconds", type=float, default=60, help="等待缺失A数据时的检查间隔")
+    resume = actions.add_parser("goal-resume", help="按保存的目标、输入路径和模型设置恢复Goal")
+    resume.add_argument("--goal-dir", type=Path, required=True)
+    status = actions.add_parser("goal-status", help="读取Goal进度，不调用模型或行情")
+    status.add_argument("--goal-dir", type=Path, required=True)
+    for action in (explore, validate, goal):
         action.add_argument("--db", type=Path, default=Path("market_data/crypto_quant.sqlite"))
         action.add_argument("--universe", type=Path, required=True, help="timestamp,symbol,eligible的完整小时CSV")
         action.add_argument("--include-liquidations", action="store_true")
-    for action in (explore, validate, reports):
-        action.add_argument("--model", required=True, help="Go裸模型ID，例如kimi-k2.6")
-        action.add_argument("--protocol", choices=("chat", "messages"), required=True)
-        action.add_argument("--reasoning-effort", choices=("low", "high", "max"),
-                            help="显式推理强度，仅用于支持该参数的chat模型；省略则使用提供商默认值")
-        action.add_argument("--api-key-env", default="OPENCODE_GO_API_KEY")
-        action.add_argument("--timeout-seconds", type=int, default=180)
+    for action in (explore, validate, reports, goal):
+        add_model_arguments(action)
 
 
 def load_membership(universe_path: Path, spec: ResearchSpec, stage: str) -> pd.Series:
@@ -71,15 +78,34 @@ def load_stage(db: Path, universe_path: Path, spec: ResearchSpec, stage: str, *,
 
 def execute(args: argparse.Namespace) -> dict[str, Any]:
     if args.mining_action == "models":
-        return available_go_models()
+        return model_from_args(args).available_models()
+    if args.mining_action == "goal-status":
+        return GoalRunner.status(args.goal_dir)
+    if args.mining_action == "goal-resume":
+        # Read and validate the saved contract before constructing a provider client.
+        runner = GoalRunner(args.goal_dir, model=None)
+        settings = runner.model_settings
+        require(settings["provider"] == PROVIDER,
+                "old Goal uses another provider; create a new Codex Goal without rewriting historical evidence")
+        runner.model = CodexModel(settings["model"], reasoning_effort=settings["reasoning_effort"],
+                                  timeout_seconds=settings["timeout_seconds"])
+        require(runner.model.settings() == settings, "Codex SDK/runtime changed; create a new Goal")
+        return _run_goal(runner)
     if args.mining_action == "freeze":
         # Freezing is deterministic and needs neither a model selection nor a key.
         miner = FactorMiner.open(args.run_dir, model=None)
         return miner.freeze(args.candidate_ids.split(","), load_membership(args.universe, miner.spec, "B"))
-    model = OpenCodeGoModel(args.model, args.protocol, api_key_env=args.api_key_env, timeout_seconds=args.timeout_seconds,
-                            reasoning_effort=args.reasoning_effort)
-    model_settings = {"provider": "opencode-go", "model": args.model, "protocol": args.protocol,
-                      "reasoning_effort": args.reasoning_effort, "timeout_seconds": args.timeout_seconds}
+    model = model_from_args(args)
+    model_settings = model.settings()
+    if args.mining_action == "goal-start":
+        goal = GoalSpec(**json.loads(args.goal.read_text(encoding="utf-8")))
+        spec = ResearchSpec.from_dict(json.loads(args.contract.read_text(encoding="utf-8")))
+        require(args.poll_seconds > 0, "poll_seconds must be positive")
+        runner = GoalRunner.create(goal, spec, model, args.output_root, model_settings=model_settings, inputs={
+            "db": str(args.db.resolve()), "universe": str(args.universe.resolve()),
+            "idea_pool": str(args.idea_pool.resolve()), "include_liquidations": args.include_liquidations,
+            "poll_seconds": args.poll_seconds})
+        return _run_goal(runner)
     if args.mining_action == "explore":
         spec = ResearchSpec.from_dict(json.loads(args.contract.read_text(encoding="utf-8")))
         panel = load_stage(args.db, args.universe, spec, "A", include_liquidations=args.include_liquidations)
@@ -92,6 +118,17 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     write_json(miner.root / "validation-model-settings.json", model_settings)
     return miner.validate(lambda: load_stage(args.db, args.universe, miner.spec, "B",
                                             include_liquidations=args.include_liquidations), args.idea_pool)
+
+
+def _run_goal(runner: GoalRunner) -> dict[str, Any]:
+    inputs, spec = runner.inputs, runner.spec
+    db, universe = Path(inputs["db"]), Path(inputs["universe"])
+    def stage(name):
+        return load_stage(db, universe, spec, name, include_liquidations=inputs["include_liquidations"])
+    result = runner.run(lambda: stage("A"), lambda: stage("B"),
+                        lambda: load_membership(universe, spec, "B"), Path(inputs["idea_pool"]),
+                        poll_seconds=inputs["poll_seconds"])
+    return {"goal_directory": str(runner.root), **result}
 
 
 def main() -> None:
