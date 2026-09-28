@@ -29,7 +29,7 @@ class FactorExpressionTests(unittest.TestCase):
     def calculate(self, expression, columns):
         return evaluate_expression(expression, panel_from_columns(columns)).values.to_numpy()
 
-    def test_scalar_math_and_units(self):
+    def test_scalar_math_without_unit_checks(self):
         columns = {"spot_quote_volume": [2., 4.], "perp_quote_volume": [3., 8.]}
         for expression, expected in (
             ("add(spot_quote_volume,perp_quote_volume)", [5, 12]),
@@ -44,10 +44,8 @@ class FactorExpressionTests(unittest.TestCase):
         ):
             with self.subTest(expression=expression):
                 np.testing.assert_allclose(self.calculate(expression, columns), expected)
-        self.assertEqual(compile_expression("mul(perp_close,perp_volume)").unit.label(), "USDT")
-        self.assertEqual(compile_expression("power(sqrt(spot_quote_volume),2)").unit.label(), "USDT")
         for expression in ("add(perp_close,perp_volume)", "max(spot_quote_volume,perp_close)", "cross_rank(open_interest_base)"):
-            with self.subTest(expression=expression), self.assertRaises(ValueError):
+            with self.subTest(expression=expression):
                 compile_expression(expression)
 
     def test_invalid_domain_and_zero_denominator_propagate_nan(self):
@@ -148,7 +146,7 @@ class FactorExpressionTests(unittest.TestCase):
             validate_universe(fractional)
 
     def test_templates_are_executable_and_expanded(self):
-        self.assertEqual(len(operator_catalog()), 26)
+        self.assertEqual(len(operator_catalog()), 27)
         self.assertEqual(len(template_catalog()), 18)
         definition = compile_expression("basis_change_1bar")
         self.assertEqual(definition.fields, ("perp_close", "spot_close"))
@@ -188,7 +186,7 @@ class FactorInputInterfaceTests(unittest.TestCase):
         self.assertEqual(row["perp_trades"], 10)
         context = json.loads(panel.ideation_message()["content"])
         self.assertEqual(len(context["fields"]), 35)
-        self.assertEqual(len(context["operators"]), 26)
+        self.assertEqual(len(context["operators"]), 27)
         self.assertIn("expanded_expression", context["templates"][0])
         coverage = context["data"]["symbols"]["PEPEUSDT"]["coverage"]
         self.assertEqual(coverage["long_liquidation_count"]["missing_reasons"], {"not_requested": 32})

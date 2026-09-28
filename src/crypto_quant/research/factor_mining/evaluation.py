@@ -1,4 +1,4 @@
-"""24-hour labels and deterministic evidence, isolated from LLM interpretation."""
+"""Forward-return labels and deterministic evidence, isolated from LLM interpretation."""
 
 from __future__ import annotations
 
@@ -49,9 +49,12 @@ def hac_mean(series: pd.Series, spec: ResearchSpec) -> dict[str, Any]:
         result["status"] = "degenerate_variance"
         return result
     scores = np.where(good, x - mean, 0.0)
-    total = float(scores @ scores)
+    # Elementwise products avoid platform BLAS overflow warnings observed for
+    # bounded IC/spread arrays while preserving the same Bartlett estimator.
+    total = float(np.sum(scores * scores, dtype=np.float64))
     for lag in range(1, min(spec.hac_lags, len(scores) - 1) + 1):
-        total += 2 * (1 - lag / (spec.hac_lags + 1)) * float(scores[lag:] @ scores[:-lag])
+        cross_product = float(np.sum(scores[lag:] * scores[:-lag], dtype=np.float64))
+        total += 2 * (1 - lag / (spec.hac_lags + 1)) * cross_product
     variance = total / (n * n) * n / (n - 1)
     if variance <= 0:
         result["status"] = "degenerate_variance"
@@ -63,7 +66,11 @@ def hac_mean(series: pd.Series, spec: ResearchSpec) -> dict[str, Any]:
     return finite(result)
 
 
-def build_labels(panel: FactorInputPanel, spec: ResearchSpec, stage: str) -> pd.DataFrame:
+def build_labels(panel: FactorInputPanel, spec: ResearchSpec, stage: str, *, horizon_hours: int = 24,
+                 allow_nonprimary_horizon: bool = False) -> pd.DataFrame:
+    require(horizon_hours in (1, 4, 24), "supported horizons: 1, 4, 24 hours")
+    require(stage == "A" or horizon_hours == 24 or allow_nonprimary_horizon,
+            "B retains the frozen 24h target unless a separate horizon contract is frozen")
     start, end = spec.bounds(stage)
     membership = validate_universe(panel.universe)
     require(panel.values.index.equals(membership.index), "input/universe indices differ")
@@ -71,11 +78,11 @@ def build_labels(panel: FactorInputPanel, spec: ResearchSpec, stage: str) -> pd.
     require(hours.max() < end, "input panel includes a later protected data segment")
     prices = panel.values["perp_open"].unstack("symbol")
     # An hour t input is available at t+1h-1ms. First executable opening is t+1h.
-    entry, exit_price = prices.shift(-1), prices.shift(-25)
+    entry, exit_price = prices.shift(-1), prices.shift(-(horizon_hours + 1))
     returns = (exit_price / entry - 1).where((entry > 0) & (exit_price > 0))
     output = pd.DataFrame(index=membership.index)
     output["label_start"] = hours + pd.Timedelta(hours=1)
-    output["label_end"] = hours + pd.Timedelta(hours=25)
+    output["label_end"] = hours + pd.Timedelta(hours=horizon_hours + 1)
     output["signal_available_at"] = hours + pd.Timedelta(hours=1) - pd.Timedelta(milliseconds=1)
     output["in_segment"] = (hours >= start) & (hours < end)
     # Exact end-boundary quotes belong to the following half-open segment.
@@ -98,7 +105,11 @@ def _summary(frame: pd.DataFrame, spec: ResearchSpec, direction: int) -> dict[st
 
 
 def evaluate_factor(values: pd.Series, labels: pd.DataFrame, spec: ResearchSpec, stage: str,
-                    direction: int) -> dict[str, Any]:
+                    direction: int, *, horizon_hours: int = 24,
+                    allow_nonprimary_horizon: bool = False) -> dict[str, Any]:
+    require(horizon_hours in (1, 4, 24), "supported horizons: 1, 4, 24 hours")
+    require(stage == "A" or horizon_hours == 24 or allow_nonprimary_horizon,
+            "B retains the frozen 24h target unless a separate horizon contract is frozen")
     require(direction in {-1, 1}, "direction must be frozen before evaluation")
     require(values.index.equals(labels.index), "factor and label indices differ")
     start, end = spec.bounds(stage)
@@ -158,8 +169,8 @@ def evaluate_factor(values: pd.Series, labels: pd.DataFrame, spec: ResearchSpec,
         valid = part.loc[part["eligible"] & ~part["purged"], ["factor", "forward_return"]].dropna()
         per_symbol.append({"symbol": symbol, "n": len(valid), "mean_forward_return": valid["forward_return"].mean(),
                            "factor_mean": valid["factor"].mean()})
-    return finite({"segment": stage, "direction": direction, "horizon_hours": 24,
-                   "label": spec.label, "sample_hours": spec.sample_hours,
+    return finite({"segment": stage, "direction": direction, "horizon_hours": horizon_hours,
+                   "label": f"perp_next_open_{horizon_hours}h", "sample_hours": spec.sample_hours,
                    "grouping": "equal-weight rank quantiles; average ties kept together",
                    "summary": summary, "periods": periods.reset_index().to_dict("records"),
                    "stages": stages, "per_symbol": per_symbol,
@@ -170,16 +181,36 @@ def evaluate_factor(values: pd.Series, labels: pd.DataFrame, spec: ResearchSpec,
                    "interpretation": "A is adaptive development evidence; B is a fixed-batch check. No strategy PnL or composite score."})
 
 
+def evaluate_horizon_comparison(values: pd.Series, labels_by_horizon: dict[int, pd.DataFrame],
+                                spec: ResearchSpec, direction: int, *, stage: str = "A",
+                                allow_nonprimary_horizon: bool = False) -> dict[str, Any]:
+    """Compare a fixed factor on identical observations; retain the contract's HAC bandwidth."""
+    common = np.isfinite(values)
+    for labels in labels_by_horizon.values():
+        common = common & labels["eligible"] & np.isfinite(labels["forward_return"])
+    reports = {}
+    for horizon in (1, 4, 24):
+        labels = labels_by_horizon[horizon].copy()
+        # Use the same boundary and asset mask so all three rank sorts are identical.
+        labels["purged"] = labels_by_horizon[24]["purged"]
+        reports[str(horizon)] = evaluate_factor(
+            values.where(common), labels, spec, stage, direction, horizon_hours=horizon,
+            allow_nonprimary_horizon=allow_nonprimary_horizon)
+    return {"interpretation": f"{stage}-stage horizon comparison on common finite observations and the 24h boundary; "
+            "same formula, direction, groups and HAC bandwidth. Unadjusted exploratory p-values; "
+            "batch admission is computed separately. Returns exclude trading costs and funding.",
+            "horizons": reports}
+
+
 def correct_batch(reports: dict[str, dict[str, Any]], spec: ResearchSpec) -> dict[str, Any]:
-    """Both primary tests of EVERY frozen candidate form one correction family.
+    """Rank IC tests of EVERY frozen candidate form one correction family.
 
     Unavailable tests stay in the family (p=1 for adjustment, raw p remains null).
     """
     tests = []
     for candidate_id, report in reports.items():
-        for metric in ("rank_ic", "directional_spread"):
-            raw = report["summary"][metric]["p_value"]
-            tests.append({"candidate_id": candidate_id, "metric": metric, "raw_p": raw})
+        raw = report["summary"]["rank_ic"]["p_value"]
+        tests.append({"candidate_id": candidate_id, "metric": "rank_ic", "raw_p": raw})
     require(bool(tests), "empty validation batch")
     p = np.array([1.0 if t["raw_p"] is None else t["raw_p"] for t in tests])
     order = np.argsort(p, kind="stable")
@@ -191,7 +222,7 @@ def correct_batch(reports: dict[str, dict[str, Any]], spec: ResearchSpec) -> dic
     for item, value in zip(tests, q):
         item.update(adjusted_p=float(value), rejected=bool(item["raw_p"] is not None and value <= spec.fdr_alpha))
     return {"method": spec.fdr_method, "alpha": spec.fdr_alpha, "family_size": m,
-            "family": "two primary two-sided mean tests per frozen candidate, including unavailable tests", "tests": tests}
+            "family": "one two-sided Rank IC mean test per frozen candidate, including unavailable tests", "tests": tests}
 
 
 def compare_experiment(report: dict[str, Any], control: dict[str, Any], plan: dict[str, Any],

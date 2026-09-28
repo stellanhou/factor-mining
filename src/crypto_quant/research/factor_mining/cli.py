@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from crypto_quant.research.data_policy import factor_usage
+
 import argparse
 import json
 from pathlib import Path
@@ -10,17 +12,18 @@ from typing import Any
 import pandas as pd
 
 from crypto_quant.data_access.market_data import MarketDataStore
-from crypto_quant.features.factor_inputs import load_factor_inputs, validate_universe
+from crypto_quant.features.factor_inputs import FactorInputPanel, load_factor_inputs, validate_universe
+from crypto_quant.research.progress import ProgressLog
 from .contracts import ResearchSpec, dumps, require
 from .goal import GoalRunner, GoalSpec
-from .codex_model import CodexModel, PROVIDER, add_model_arguments, model_from_args
+from .model_config import add_model_arguments, model_from_args, model_from_settings
 from .records import write_json
 from .workflow import FactorMiner
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     actions = parser.add_subparsers(dest="mining_action", required=True)
-    models = actions.add_parser("models", help="查询当前ChatGPT订阅可用的Codex模型")
+    models = actions.add_parser("models", help="查询所选接口的可用模型")
     add_model_arguments(models)
     explore = actions.add_parser("explore", help="仅在A段运行因子挖掘")
     explore.add_argument("--contract", type=Path, required=True)
@@ -55,6 +58,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def load_membership(universe_path: Path, spec: ResearchSpec, stage: str) -> pd.Series:
+    factor_usage(spec, stage)  # Validate purpose/dates before reading even membership.
     start, end = spec.bounds(stage)
     rows = pd.read_csv(universe_path, dtype={"symbol": str, "eligible": str})
     require(set(rows.columns) == {"timestamp", "symbol", "eligible"}, "universe CSV requires timestamp,symbol,eligible")
@@ -72,8 +76,11 @@ def load_membership(universe_path: Path, spec: ResearchSpec, stage: str) -> pd.S
 
 
 def load_stage(db: Path, universe_path: Path, spec: ResearchSpec, stage: str, *, include_liquidations: bool):
-    return load_factor_inputs(MarketDataStore(db), load_membership(universe_path, spec, stage),
-                             include_liquidations=include_liquidations)
+    usage = {**factor_usage(spec, stage), "source_database": str(db.resolve())}
+    panel = load_factor_inputs(MarketDataStore(db), load_membership(universe_path, spec, stage),
+                               include_liquidations=include_liquidations)
+    panel.diagnostics["data_usage"] = usage
+    return panel
 
 
 def execute(args: argparse.Namespace) -> dict[str, Any]:
@@ -85,16 +92,13 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         # Read and validate the saved contract before constructing a provider client.
         runner = GoalRunner(args.goal_dir, model=None)
         settings = runner.model_settings
-        require(settings["provider"] == PROVIDER,
-                "old Goal uses another provider; create a new Codex Goal without rewriting historical evidence")
-        runner.model = CodexModel(settings["model"], reasoning_effort=settings["reasoning_effort"],
-                                  timeout_seconds=settings["timeout_seconds"])
-        require(runner.model.settings() == settings, "Codex SDK/runtime changed; create a new Goal")
+        runner.model = model_from_settings(settings)
         return _run_goal(runner)
     if args.mining_action == "freeze":
         # Freezing is deterministic and needs neither a model selection nor a key.
-        miner = FactorMiner.open(args.run_dir, model=None)
-        return miner.freeze(args.candidate_ids.split(","), load_membership(args.universe, miner.spec, "B"))
+        with ProgressLog.for_run(args.run_dir).span("factor.B.freeze", heartbeat=True):
+            miner = FactorMiner.open(args.run_dir, model=None)
+            return miner.freeze(args.candidate_ids.split(","), load_membership(args.universe, miner.spec, "B"))
     model = model_from_args(args)
     model_settings = model.settings()
     if args.mining_action == "goal-start":
@@ -108,24 +112,40 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         return _run_goal(runner)
     if args.mining_action == "explore":
         spec = ResearchSpec.from_dict(json.loads(args.contract.read_text(encoding="utf-8")))
-        panel = load_stage(args.db, args.universe, spec, "A", include_liquidations=args.include_liquidations)
+        with ProgressLog.for_run(args.output_root / spec.run_id).span("factor.A.load_data", heartbeat=True):
+            panel = load_stage(args.db, args.universe, spec, "A", include_liquidations=args.include_liquidations)
         miner = FactorMiner(spec, model, args.output_root)
         write_json(miner.root / "model-settings.json", model_settings)
-        return {"run_directory": str(miner.root), **miner.explore(panel)}
+        with miner.progress.span("factor.A.explore"):
+            return {"run_directory": str(miner.root), **miner.explore(panel)}
     miner = FactorMiner.open(args.run_dir, model)
     if args.mining_action == "complete-reports":
-        return miner.complete_reports(args.stage, args.idea_pool)
+        with miner.progress.span(f"factor.{args.stage}.complete_reports", heartbeat=True):
+            return miner.complete_reports(args.stage, args.idea_pool)
     write_json(miner.root / "validation-model-settings.json", model_settings)
-    return miner.validate(lambda: load_stage(args.db, args.universe, miner.spec, "B",
-                                            include_liquidations=args.include_liquidations), args.idea_pool)
+    with miner.progress.span("factor.B.validate", heartbeat=True):
+        return miner.validate(lambda: load_stage(args.db, args.universe, miner.spec, "B",
+                                                include_liquidations=args.include_liquidations), args.idea_pool)
 
 
 def _run_goal(runner: GoalRunner) -> dict[str, Any]:
     inputs, spec = runner.inputs, runner.spec
     db, universe = Path(inputs["db"]), Path(inputs["universe"])
+    a_cache: tuple[tuple[int, int, int, int], FactorInputPanel] | None = None
+
+    def load_a() -> FactorInputPanel:
+        nonlocal a_cache
+        db_stat, universe_stat = db.stat(), universe.stat()
+        signature = (db_stat.st_mtime_ns, db_stat.st_size,
+                     universe_stat.st_mtime_ns, universe_stat.st_size)
+        if a_cache is None or a_cache[0] != signature:
+            a_cache = (signature, load_stage(db, universe, spec, "A",
+                                             include_liquidations=inputs["include_liquidations"]))
+        return a_cache[1]
+
     def stage(name):
         return load_stage(db, universe, spec, name, include_liquidations=inputs["include_liquidations"])
-    result = runner.run(lambda: stage("A"), lambda: stage("B"),
+    result = runner.run(load_a, lambda: stage("B"),
                         lambda: load_membership(universe, spec, "B"), Path(inputs["idea_pool"]),
                         poll_seconds=inputs["poll_seconds"])
     return {"goal_directory": str(runner.root), **result}

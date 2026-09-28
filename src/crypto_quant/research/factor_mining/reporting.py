@@ -114,6 +114,30 @@ def write_research_report(path: Path, run_id: str, purpose: str, records: list[d
                   f"| 有效 IC 期数 | {summary['rank_ic']['n']} |",
                   f"| 跨段排除小时数 | {data['coverage']['purged_hours']} |", "",
                   f"![各组未来24小时平均收益](plots/{cid}-{stage}.svg)", ""]
+        if "horizon_comparison" in data:
+            horizons = data["horizon_comparison"]["horizons"]
+            summaries = [horizons[str(h)]["summary"] for h in (1, 4, 24)]
+            lines += ["### 同一因子的预测期限对照（A段）", "",
+                      "三列使用相同因子值、方向、共同有效时点与币种，统一按24h边界排除跨段样本。"
+                      "各组等权；收益未扣交易成本和资金费。", "",
+                      "| 指标 | 未来1h | 未来4h | 未来24h |", "|---|---|---|---|"]
+            rows = [
+                ("平均 Rank IC", [s["rank_ic"]["mean"] for s in summaries]),
+                ("ICIR（未年化）", [s["rank_ic"]["mean_std_ratio"] for s in summaries]),
+                ("有向高低组收益差", [s["directional_spread"]["mean"] for s in summaries]),
+                ("IC方向一致期占比", [s["ic_direction_share"] for s in summaries]),
+                ("正向阶段占比", [s["positive_stage_share"] for s in summaries]),
+                ("有效阶段数", [s["valid_stages"] for s in summaries]),
+                ("有效 IC 期数", [s["rank_ic"]["n"] for s in summaries]),
+            ]
+            rows += [(f"第{group}组平均收益", [s["group_means"][group] for s in summaries])
+                     for group in summaries[0]["group_means"]]
+            for label, values in rows:
+                lines.append("| " + label + " | " + " | ".join(
+                    "N/A" if value is None else f"{value:.6g}" for value in values) + " |")
+            lines += ["", "三列沿用合同的同一HAC带宽，完整记录保留各期限的不确定性、滚动及分阶段结果。"
+                      "这是开发段诊断；不自动选择最好期限，不改变24h主评估及B验证规则。"
+                      "若共同有效样本减少，对照的24h列可能与上方主评估不同。", ""]
         if cid in reports:
             model = reports[cid]
             lines += ["### 模型解释", "", model["analysis"], "", "适用及失效条件：", ""]

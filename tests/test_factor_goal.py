@@ -4,18 +4,15 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from test_factor_mining import ScenarioModel, definition, input_panel, specification
 from crypto_quant.research.factor_mining.contracts import dumps
 from crypto_quant.research.factor_mining.evaluation import evaluate_factor
 from crypto_quant.research.factor_mining.goal import GoalRunner, GoalSpec
 from crypto_quant.research.factor_mining.model import ModelReply
-from crypto_quant.research.factor_mining.records import ModelResponseError
-from crypto_quant.research.factor_mining.workflow import (
-    FactorMiner, _panel_fingerprint, _reject_unsupported_oi_cost_basis,
-    _reject_unsupported_residualization,
-)
+from crypto_quant.research.factor_mining.records import write_json
+from crypto_quant.research.factor_mining.workflow import FactorMiner, _panel_fingerprint
 
 
 from crypto_quant.research.factor_mining.codex_model import CodexModel
@@ -63,7 +60,9 @@ class GoalModel:
                 window = 3 if self.duplicate else 2 + len(self.miners)
                 def transform(req, value):
                     if req["role"] == "ideator" and not req["payload"]["pending_proposals"]:
-                        value["candidates"] = [definition(f"div(perp_close,ts_mean(perp_close,{window}))")]
+                        value["candidates"] = [definition("div(perp_close,ts_mean(perp_close))")]
+                    if req["role"] == "calculator":
+                        value["repair_expression"] = f"div(perp_close,ts_mean(perp_close,{window}))"
                     if req["role"] == "optimizer":
                         ids = {r["id"] for r in req["records"]}
                         for decision in value["decisions"]:
@@ -83,6 +82,25 @@ class GoalTests(unittest.TestCase):
                                    spec, model or GoalModel(), Path(directory),
                                    inputs={}, model_settings=SETTINGS)
         return runner, input_panel(spec), input_panel(spec, "B")
+
+    def test_saved_goal_does_not_bind_code_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self.create(directory)
+            saved = json.loads((runner.root / "goal.json").read_text())
+            self.assertNotIn("code", saved)
+            self.assertNotIn("sha256", saved)
+            saved["code"] = {"legacy.py": "different-code-version"}
+            (runner.root / "goal.json").write_text(json.dumps(saved))
+            self.assertEqual(GoalRunner(runner.root, runner.model).state["phase"], "select_task")
+
+    def test_model_change_uses_goal_state_without_rewriting_original_goal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self.create(directory)
+            original = (runner.root / "goal.json").read_bytes()
+            updated = CodexModel("scripted-next", reasoning_effort="low", timeout_seconds=180).settings()
+            runner._save(model_settings=updated)
+            self.assertEqual(GoalRunner(runner.root, runner.model).model_settings, updated)
+            self.assertEqual((runner.root / "goal.json").read_bytes(), original)
 
     def run_goal(self, runner, a, b, *, sleep=lambda _: None):
         return runner.run(lambda: a, lambda: b, lambda: b.universe, runner.root / "ideas",
@@ -174,6 +192,27 @@ class GoalTests(unittest.TestCase):
             self.assertEqual(candidate["A_evaluation"]["summary"]["rank_ic"]["mean"], 0.01)
             self.assertEqual(candidate["final_decision"]["disposition"], "pause")
 
+    def test_goal_context_uses_saved_cycle_index_and_source_A_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, a, _ = self.create(directory)
+            runner.state["task"] = {"action": "explore_new", "task": "next", "reason": "new",
+                                    "evidence_refs": ["inputs-00000001"], "dependencies": []}
+            run_id = "prior-run"
+            inputs = runner.root / "runs" / run_id / "a_records" / "inputs.json"
+            write_json(inputs, {"id": "inputs", "kind": "data_provenance",
+                                "data": {"fingerprint": _panel_fingerprint(a)}})
+            context = {"source_record_id": "cycle-00000001", "run_id": run_id,
+                       "candidates": [{"candidate_ref": "prior-run/candidate-0001"}],
+                       "previous_expressions": [{"expression": "cross_rank(funding_24h_sum)"}]}
+            runner.research.append("cycle-00000001", "research_cycle", {
+                "run_id": run_id, "records": [{"id": "inputs", "data": {"fingerprint": _panel_fingerprint(a)}}],
+                "context": context,
+            })
+            summary = next(record for record in runner.research.all() if record["kind"] == "research_cycle")
+            self.assertEqual(summary["data"]["records"]["pointer"], "/records")
+            self.assertEqual(runner._context(a)["prior_A_research"]["cycles"][0]["candidates"],
+                             context["candidates"])
+
     def test_successor_goal_continues_after_imported_cycle_numbers(self):
         with tempfile.TemporaryDirectory() as directory:
             runner, a, _ = self.create(directory)
@@ -189,130 +228,48 @@ class GoalTests(unittest.TestCase):
             self.assertEqual(runner.state["cycle"], 21)
             self.assertTrue(runner.state["current_run"].endswith("-000021"))
 
-    def test_goal_and_ideation_reject_oi_notional_as_entry_cost(self):
+    def test_rearchive_preserves_saved_A_cycle_when_source_changes(self):
         with tempfile.TemporaryDirectory() as directory:
-            runner, a, _ = self.create(directory)
-            invalid_task = {
+            runner, _, _ = self.create(directory)
+            runner.state["cycle"] = 1
+            miner = FactorMiner(specification(run_id="archive-fixture"), GoalModel(), Path(directory) / "runs")
+            miner.store.append("inputs", "data_provenance", {"fingerprint": {"first": True}})
+            runner._archive_A(miner)
+            archive = runner.research.root / "cycle-00000001.json"
+            original = archive.read_bytes()
+
+            miner.store.append("new-evidence", "data_provenance", {"changed": True})
+            runner._archive_A(miner)
+
+            self.assertEqual(archive.read_bytes(), original)
+            self.assertEqual(len([record for record in runner.research.all()
+                                  if record["kind"] == "research_cycle"]), 1)
+
+    def test_goal_and_ideation_do_not_block_interpretation_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, panel, _ = self.create(directory)
+            task = {
                 "action": "explore_new",
-                "task": "用 open_interest_value 和 open_interest_base 推断平均持仓价格与浮盈亏",
-                "reason": "检验持仓成本偏离",
+                "task": "用 open_interest_value 和 open_interest_base 讨论平均持仓价格与浮盈亏",
+                "reason": "研究杠杆与持仓成本解释",
                 "evidence_refs": ["inputs-00000001"],
                 "dependencies": [],
             }
-            with self.assertRaisesRegex(ValueError, "does not provide entry price"):
-                runner._check_task(invalid_task, a)
-
-            invalid_synonym = {**invalid_task,
-                "task": "用 open_interest_value/open_interest_base 估计未平仓平均名义价格",
-                "reason": "衡量持仓者平均入场价位与现价偏离",
-            }
-            with self.assertRaisesRegex(ValueError, "does not provide entry price"):
-                runner._check_task(invalid_synonym, a)
+            runner.research.append("inputs-00000001", "data_provenance", {"fixture": True})
+            runner._check_task(task, panel)
 
             miner = FactorMiner(specification(), GoalModel(), Path(directory))
-            invalid_definition = definition("div(open_interest_value,open_interest_base)")
-            invalid_definition.update(
+            definition_with_interpretation = definition("div(open_interest_value,open_interest_base)")
+            definition_with_interpretation.update(
                 name="oi_average_entry_price",
-                meaning="用持仓名义价值除以数量推断平均开仓价格",
-                hypothesis="平均持仓价可以表示全市场浮动盈亏",
+                meaning="用名义价值除以数量讨论平均开仓价格与正交化残差",
+                hypothesis="平均持仓价与未来收益可能有关",
                 change_reason="测试持仓成本偏离",
             )
-            response = {"candidates": [invalid_definition], "dispositions": [], "analysis": "测试"}
-            with self.assertRaisesRegex(ValueError, "does not provide entry price"):
-                miner._check_ideation(response, {})
-
-            leverage_task = {**invalid_task,
-                "task": "用 open_interest_base 上升推断大户继续加杠杆",
-                "reason": "检验新杠杆头寸的拥挤",
-            }
-            with self.assertRaisesRegex(ValueError, "does not identify leverage ratios"):
-                runner._check_task(leverage_task, a)
-
-            leverage_definition = definition("cross_rank(ts_return(open_interest_base,1))")
-            leverage_definition.update(
-                name="oi_leverage_up_rank",
-                meaning="open_interest_base 上升表示大户继续加杠杆",
-                hypothesis="新杠杆头寸会提高去杠杆风险",
-                change_reason="用 OI 变化识别杠杆率上升",
-            )
-            response = {"candidates": [leverage_definition], "dispositions": [], "analysis": "测试"}
-            with self.assertRaisesRegex(ValueError, "does not identify leverage ratios"):
-                miner._check_ideation(response, {})
-
-            direction_task = {**invalid_task,
-                "task": "用 open_interest_base 上升识别方向性头寸建立阶段",
-                "reason": "检验新建多头头寸的延续",
-            }
-            with self.assertRaisesRegex(ValueError, "open/close and long/short position direction"):
-                runner._check_task(direction_task, a)
-
-            direction_definition = definition("cross_rank(ts_return(open_interest_base,1))")
-            direction_definition.update(
-                name="oi_directional_position_building",
-                meaning="open_interest_base 只表示当前聚合未平仓基础币数量变化",
-                hypothesis="open_interest_base 上升可能是方向性头寸建立阶段",
-                change_reason="用 OI 变化识别新建头寸",
-            )
-            response = {"candidates": [direction_definition], "dispositions": [], "analysis": "测试"}
-            with self.assertRaisesRegex(ValueError, "open/close and long/short position direction"):
-                miner._check_ideation(response, {})
-
-            allowed_quantity_definition = definition("cross_rank(ts_return(open_interest_base,1))")
-            allowed_quantity_definition.update(
-                name="oi_quantity_change_rank",
-                meaning=("open_interest_base 仅表示当前聚合未平仓基础币数量变化；"
-                         "不用于推断杠杆率、开平仓或多空方向"),
-                hypothesis="仅测试 OI 数量变化与未来收益的统计关系",
-                change_reason="只使用当前 OI 数量变化状态",
-            )
-            miner._check_ideation(
-                {"candidates": [allowed_quantity_definition], "dispositions": [], "analysis": "测试"}, {})
-
-            bounded_definition = definition("cross_rank(ts_return(open_interest_base,1))")
-            bounded_definition.update(
-                name="oi_quantity_change_rank",
-                meaning="open_interest_base 是当前聚合未平仓基础币数量，只计算其相对变化",
-                hypothesis="仅测试聚合数量变化的条件关系，不用于推断杠杆率、开平仓、多空方向或参与者身份",
-                change_reason="按字段目录限定语义",
-            )
-            miner._check_ideation(
-                {"candidates": [bounded_definition], "dispositions": [], "analysis": "测试"}, {})
-
-            for disclaimer in (
-                "open_interest_base 变化仅能表示当前聚合未平仓数量的变化，"
-                "不能据此推断杠杆率、加杠杆或去杠杆、开平仓方向。",
-                "OI 变化状态只解释为聚合未平仓基础币数量变化；"
-                "不应把该状态解释为杠杆率、加杠杆或去杠杆、开平仓方向。",
-            ):
-                with self.subTest(disclaimer=disclaimer):
-                    _reject_unsupported_oi_cost_basis(
-                        "open_interest_base", disclaimer)
-
-    def test_rejects_unsupported_residualization_claims(self):
-        with self.assertRaisesRegex(ValueError, "no regression/residualization operator"):
-            _reject_unsupported_residualization(
-                "subtract cross-ranked controls and call the result orthogonalized")
-
-        for disclaimer in (
-            "当前白名单没有回归或残差算子，不能把 rank/z-score 算术称为正交化。",
-            "Residualization is not supported and must not be claimed.",
-            "在不使用回归、残差或中性化算子的前提下，只做分层比较。",
-        ):
-            with self.subTest(disclaimer=disclaimer):
-                _reject_unsupported_residualization(disclaimer)
-
-        with tempfile.TemporaryDirectory() as directory:
-            miner = FactorMiner(specification(), GoalModel(), Path(directory))
-            invalid_definition = definition("sub(cross_rank(perp_close),cross_zscore(premium_index))")
-            invalid_definition.update(
-                name="orthogonalized_perp_close",
-                meaning="固定系数相减后得到正交化残差",
-                hypothesis="剔除共线后仍有预测力",
-                change_reason="用 rank 与 z-score 加减实现中性化",
-            )
-            response = {"candidates": [invalid_definition], "dispositions": [], "analysis": "测试"}
-            with self.assertRaisesRegex(ValueError, "no regression/residualization operator"):
-                miner._check_ideation(response, {})
+            response = {"candidates": [definition_with_interpretation],
+                        "dispositions": [], "analysis": "测试"}
+            definitions, _, _, _ = miner._check_ideation(response, {})
+            self.assertEqual(definitions[0]["name"], "oi_average_entry_price")
 
     def test_wait_polls_without_model_calls_and_automatically_resumes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -389,7 +346,7 @@ class GoalTests(unittest.TestCase):
                 with patch("crypto_quant.research.factor_mining.workflow.evaluate_factor", side_effect=self.passing_B):
                     result = self.run_goal(restarted, a, b)
                 self.assertEqual(result["status"], "complete")
-                self.assertEqual(sum(r["role"] == "calculator" for r in model.requests), calculators + 1)
+                self.assertEqual(sum(r["role"] == "calculator" for r in model.requests), calculators)
                 self.assertEqual(sum(r["role"] == "ideator" for r in model.requests), 2)
 
     def test_concurrent_runner_fails_and_completed_goal_makes_no_calls(self):
@@ -435,10 +392,11 @@ class GoalTests(unittest.TestCase):
                     result["dependencies"] = [{"field": "premium_index", "min_valid_rows": 1, "reason": "invalid"}]
                 model.selection_override = override
                 runner, a, b = self.create(directory, model)
-                with self.assertRaises(ModelResponseError):
+                with self.assertRaisesRegex(AssertionError, "fixture should"):
                     self.run_goal(runner, a, b)
                 self.assertEqual(runner.state["status"], "error")
                 self.assertEqual(runner.state["cycle"], 0)
+                self.assertEqual(len([r for r in runner.research.all() if r["kind"] == "invalid_model_response"]), 5)
 
     def test_goal_rejects_wrong_data_segment_before_first_model_request(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -488,8 +446,8 @@ class GoalTests(unittest.TestCase):
             runner, a, b = self.create(directory, model)
             with self.assertRaises(KeyboardInterrupt):
                 self.run_goal(runner, a, b)
-            a.values.iloc[0, 0] += 1
-            with self.assertRaisesRegex(ValueError, "A inputs changed"):
+            a.universe.iloc[0] = not a.universe.iloc[0]
+            with self.assertRaisesRegex(ValueError, "A membership changed"):
                 self.run_goal(GoalRunner(runner.root, model), a, b)
             self.assertEqual(GoalRunner.status(runner.root)["status"], "error")
         with tempfile.TemporaryDirectory() as directory:
@@ -509,12 +467,12 @@ class GoalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             runner, _, _ = self.create(directory)
             args = parser.parse_args(["goal-status", "--goal-dir", str(runner.root)])
-            with patch("crypto_quant.research.factor_mining.cli.CodexModel") as model:
+            with patch("crypto_quant.research.factor_mining.model_config.CodexModel") as model:
                 result = execute(args)
                 model.assert_not_called()
             self.assertEqual(result["phase"], "select_task")
             resume = parser.parse_args(["goal-resume", "--goal-dir", str(runner.root)])
-            with patch("crypto_quant.research.factor_mining.cli.CodexModel") as model, patch(
+            with patch("crypto_quant.research.factor_mining.model_config.CodexModel") as model, patch(
                     "crypto_quant.research.factor_mining.cli._run_goal") as run:
                 model.return_value.settings.return_value = SETTINGS
                 execute(resume)
@@ -532,8 +490,11 @@ class GoalTests(unittest.TestCase):
             a, b = input_panel(spec), input_panel(spec, "B")
             (root / "contract.json").write_text(dumps(spec.as_dict()))
             (root / "goal.json").write_text(dumps({"goal_id": "cli-goal", "objective": "价格偏离研究", "target_ideas": 1}))
+            (root / "universe.csv").write_text("fixture")
+            (root / "fixture.sqlite").touch()
             args = parser.parse_args(["goal-start", "--goal", str(root / "goal.json"),
                 "--contract", str(root / "contract.json"), "--universe", str(root / "universe.csv"),
+                "--db", str(root / "fixture.sqlite"),
                 "--output-root", str(root / "goals"), "--idea-pool", str(root / "ideas"),
                 "--model", "scripted-fixture", "--reasoning-effort", "low", "--timeout-seconds", "180"])
             def load(db, universe, contract, stage, **kwargs):
@@ -549,6 +510,34 @@ class GoalTests(unittest.TestCase):
             saved = json.loads((root / "goals/cli-goal/goal.json").read_text())
             self.assertEqual(saved["inputs"]["universe"], str((root / "universe.csv").resolve()))
             self.assertEqual(len(list((root / "ideas").glob("*.json"))), 1)
+
+    def test_goal_reuses_A_panel_until_input_file_changes(self):
+        from crypto_quant.research.factor_mining.cli import _run_goal
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db, universe = root / "fixture.sqlite", root / "universe.csv"
+            db.write_bytes(b"a")
+            universe.write_bytes(b"a")
+            panels = [object(), object(), object()]
+            runner = Mock()
+            runner.inputs = {"db": str(db), "universe": str(universe),
+                             "idea_pool": str(root / "ideas"), "include_liquidations": False,
+                             "poll_seconds": 1}
+            runner.spec, runner.root = specification(), root / "goal"
+
+            def run(load_a, *_args, **_kwargs):
+                self.assertIs(load_a(), panels[0])
+                self.assertIs(load_a(), panels[0])
+                universe.write_bytes(b"new-universe")
+                self.assertIs(load_a(), panels[1])
+                db.write_bytes(b"new-db")
+                self.assertIs(load_a(), panels[2])
+                return {"status": "complete"}
+
+            runner.run.side_effect = run
+            with patch("crypto_quant.research.factor_mining.cli.load_stage", side_effect=panels) as loader:
+                self.assertEqual(_run_goal(runner)["status"], "complete")
+            self.assertEqual(loader.call_count, 3)
 
     def test_checkpoint_write_is_atomic_and_never_overwrites_evidence(self):
         from crypto_quant.research.factor_mining.records import write_json

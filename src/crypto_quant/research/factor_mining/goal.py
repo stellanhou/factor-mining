@@ -15,12 +15,13 @@ from typing import Any, Callable
 import pandas as pd
 
 from crypto_quant.features.factor_inputs import FactorInputPanel, INPUT_COLUMNS
-from .contracts import ResearchSpec, digest, identifier, require, text
+from crypto_quant.research.progress import ProgressLog
+from .contracts import ResearchSpec, digest, identifier, require, text, _array_schema, _object_schema, _text_schema
+from .runtime import GRAPH_CONFIG
+from langgraph.graph import StateGraph, START, END
 from .model import JsonModel
-from .records import AgentGateway, RecordStore, write_json
-from .workflow import (FactorMiner, _array_schema, _code_fingerprint, _object_schema,
-                       _panel_fingerprint, _reject_unsupported_oi_cost_basis,
-                       _text_schema, validate_panel)
+from .records import AgentGateway, RecordStore, compact_record, write_json
+from .workflow import FactorMiner, _panel_fingerprint, validate_panel
 
 
 @dataclass(frozen=True)
@@ -60,21 +61,51 @@ def _read(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+class GoalResearchStore(RecordStore):
+    """Read saved cycle handoffs without loading their archived numeric records."""
+
+    def __init__(self, root: Path):
+        super().__init__(root)
+        self.index = self.root / "context_index"
+
+    def append(self, record_id: str, kind: str, data: Any) -> str:
+        result = super().append(record_id, kind, data)
+        if kind == "research_cycle":
+            record = {"id": record_id, "kind": kind, "data": data, "sha256": digest(data)}
+            write_json(self.index / f"{record_id}.json", compact_record(record))
+        return result
+
+    def all(self) -> list[dict[str, Any]]:
+        records = []
+        for path in sorted(self.root.glob("*.json")):
+            if path.name.startswith("cycle-"):
+                summary = self.index / path.name
+                require(summary.is_file(), f"missing saved cycle context index: {summary}")
+                records.append(self._load(summary))
+            else:
+                records.append(self._load(path))
+        return records
+
+    def read(self, record_id: str, pointer: str, offset: int, limit: int) -> Any:
+        if record_id.startswith("cycle-") and pointer.startswith("/context"):
+            return RecordStore(self.index).read(record_id, pointer, offset, limit)
+        return super().read(record_id, pointer, offset, limit)
+
+
 class GoalRunner:
     def __init__(self, root: Path, model: JsonModel):
         self.root, self.model = Path(root), model
         saved = _read(self.root / "goal.json")
-        expected = saved.pop("sha256")
-        require(digest(saved) == expected, "goal contract changed")
+        saved.pop("sha256", None)
         self.goal = GoalSpec(**saved["goal"])
         self.spec = ResearchSpec.from_dict(saved["research"])
         self.inputs = saved["inputs"]
-        self.model_settings = saved["model_settings"]
-        require(saved["code"] == _code_fingerprint(), "goal code changed; inspect before resuming")
         self.events = RecordStore(self.root / "events")
-        self.research = RecordStore(self.root / "research_records")
+        self.research = GoalResearchStore(self.root / "research_records")
         self.receipts = RecordStore(self.root / "completion_records")
         self.state = self.status(self.root)
+        self.model_settings = self.state.get("model_settings", saved["model_settings"])
+        self.progress = ProgressLog.for_run(self.root)
 
     @classmethod
     def create(cls, goal: GoalSpec, spec: ResearchSpec, model: JsonModel, output_root: Path,
@@ -82,8 +113,8 @@ class GoalRunner:
         root = Path(output_root) / goal.goal_id
         root.mkdir(parents=True, exist_ok=False)
         contract = {"goal": asdict(goal), "research": spec.as_dict(), "inputs": inputs,
-                    "model_settings": model_settings, "code": _code_fingerprint()}
-        write_json(root / "goal.json", {**contract, "sha256": digest(contract)})
+                    "model_settings": model_settings}
+        write_json(root / "goal.json", contract)
         RecordStore(root / "events").append("event-00000001", "goal_state", {
             "goal_id": goal.goal_id, "status": "active", "phase": "select_task", "cycle": 0,
             "current_run": None, "task": None, "qualified_ideas": [], "error": None})
@@ -104,7 +135,7 @@ class GoalRunner:
 
     def _gateway(self, store: RecordStore) -> AgentGateway:
         return AgentGateway(self.model, replace(self.spec, run_id=self.goal.goal_id),
-                            store, self.root / "model_calls")
+                            store, self.root / "model_calls", progress=self.progress)
 
     def _counts(self, panel: FactorInputPanel) -> dict[str, int]:
         validate_panel(panel, self.spec, "A")
@@ -121,8 +152,6 @@ class GoalRunner:
         require(value["action"] in {"explore_new", "wait_data"}, "unknown goal action")
         for key in ("task", "reason"):
             text(value[key], key)
-        _reject_unsupported_oi_cost_basis(
-            f"{value['task']} {value['reason']}", value["task"], value["reason"])
         refs = value["evidence_refs"]
         records = {r["id"] for r in self.research.all()}
         require(bool(refs) and len(refs) == len(set(refs)) and all(r in records for r in refs),
@@ -148,11 +177,12 @@ class GoalRunner:
                     "explore_new requires dependencies=[]; do not list fields that are already available")
 
     def _select(self, panel: FactorInputPanel) -> None:
-        index = len(self.research.all()) + 1
+        records = self.research.all()
+        index = len(records) + 1
         catalog = {
             "fingerprint": _panel_fingerprint(panel), "catalog": panel.ideation_context(),
             "valid_A_rows": self._counts(panel)}
-        matching = [record for record in self.research.all()
+        matching = [record for record in records
                     if record["kind"] == "data_provenance"
                     and record["data"]["fingerprint"] == catalog["fingerprint"]]
         if matching:
@@ -167,12 +197,6 @@ class GoalRunner:
             "不代表Goal完成。尚未想到新方向时继续梳理未回答问题，不能输出结束或完成。"
             "explore_new须说明新增研究价值，不重复已经检验的相同公式；不输出候选定义或最终公式，"
             "交给构想Agent生成。新数据可以支持重查旧问题，但需说明新增依据。"
-            "领先-滞后研究必须保持时间对齐语义：corr(当期x, delay(y,n))表示y领先x，"
-            "不得把当期x称为领先变量。"
-            "严格按catalog字段口径提出研究问题；open_interest_value是当前未平仓名义价值，"
-            "与open_interest_base的比值只是当前聚合名义价值与基础币数量之比；不得称为平均名义价格，"
-            "也不提供平均开仓成本、平均入场价、持仓成本或浮动盈亏。OI变化只能表示当前聚合未平仓"
-            "数量/名义价值变化，不能推断杠杆率、加杠杆/去杠杆、开平仓方向或由哪类参与者造成。"
             "只有缺少具体A段字段观测且无法推进其他方向时才wait_data，列出字段、最低有效观测数及依据。"
             "action=explore_new时dependencies必须严格为空数组[]，不得列出已有或覆盖充足的字段；"
             "dependencies只在action=wait_data且字段当前确实不足时填写。"
@@ -180,14 +204,14 @@ class GoalRunner:
             "research_cycle内部的candidate、evaluation、calculation或round记录ID不能直接放入evidence_refs。"
             "不要将单个候选暂停当成整个Goal必须等待。B验收规则由程序执行，不能修改或请求B/C结果。",
             {"goal_phase": "select_task", "goal": asdict(self.goal), "catalog_record_id": catalog_id,
-             "allowed_evidence_refs": sorted(r["id"] for r in self.research.all())},
+             "allowed_evidence_refs": sorted({r["id"] for r in records} | {catalog_id})},
             TASK_SCHEMA, validate=lambda value: self._check_task(value, panel))
         self.research.append(f"task-{index:08d}", "goal_task", decision)
         if decision["action"] == "wait_data":
             self._save(status="waiting", phase="wait_data", task=decision)
         else:
             archived_cycles = []
-            for record in self.research.all():
+            for record in records:
                 if record["kind"] != "research_cycle":
                     continue
                 prefix, separator, sequence = record["id"].partition("-")
@@ -252,11 +276,20 @@ class GoalRunner:
             if record["kind"] != "research_cycle":
                 continue
             data = record["data"]
-            source = {r["id"]: r for r in data["records"]}
             # With changed A evidence, a new run may re-examine the same formula.
-            if source["inputs"]["data"]["fingerprint"] != fingerprint:
+            if isinstance(data["records"], list):
+                source = {r["id"]: r for r in data["records"]}
+                prior_fingerprint = source["inputs"]["data"]["fingerprint"]
+                context = data.get("context") or self._cycle_context(record["id"], data)
+            else:
+                run_id = identifier(data["run_id"])
+                matches = list(self.root.parent.glob(f"*/runs/{run_id}/a_records/inputs.json"))
+                require(len(matches) == 1, f"saved A inputs missing or ambiguous for {run_id}")
+                inputs = _read(matches[0])
+                prior_fingerprint = inputs["data"]["fingerprint"]
+                context = data["context"]
+            if prior_fingerprint != fingerprint:
                 continue
-            context = data.get("context") or self._cycle_context(record["id"], data)
             previous.extend(context["previous_expressions"])
             cycles.append({key: value for key, value in context.items() if key != "previous_expressions"})
         tasks = [{"source_record_id": record["id"], **record["data"]}
@@ -273,14 +306,12 @@ class GoalRunner:
 
     def _archive_A(self, miner: FactorMiner) -> None:
         record_id = f"cycle-{self.state['cycle']:08d}"
+        if record_id in {record["id"] for record in self.research.all()}:
+            return
         data = {"run_id": miner.spec.run_id,
                 "records": [r for r in miner.store.all() if r["kind"] != "goal_context"]}
         data["context"] = self._cycle_context(record_id, data)
-        existing = {r["id"]: r["data"] for r in self.research.all()}
-        if record_id in existing:
-            require(existing[record_id] == data, "archived A evidence changed")
-        else:
-            self.research.append(record_id, "research_cycle", data)
+        self.research.append(record_id, "research_cycle", data)
 
     def _review_completion(self, miner: FactorMiner, validation: dict[str, Any]) -> None:
         ideas = []
@@ -329,17 +360,17 @@ class GoalRunner:
                                       [m["idea_id"] for m in result["matches"] if m["matches_goal"]]))
         self._save(qualified_ideas=qualified)
 
-    def _step(self, load_A: Callable[[], FactorInputPanel], load_B: Callable[[], FactorInputPanel],
-              load_B_membership: Callable[[], pd.Series], idea_pool: Path) -> None:
-        phase = self.state["phase"]
-        if phase == "select_task":
+    def _phase_actions(self, load_A, load_B, load_B_membership, idea_pool):
+        def select_task():
             self._select(load_A())
             return
-        if phase == "wait_data":
+
+        def wait_data():
             if self._ready(self.state["task"]["dependencies"], load_A()):
                 self._save(status="active", phase="select_task")
             return
-        if phase == "explore":
+
+        def explore():
             panel = load_A()
             run_dir = self.root / "runs" / self.state["current_run"]
             if not run_dir.exists():
@@ -353,16 +384,16 @@ class GoalRunner:
                     records = {r["id"] for r in miner.store.all()}
                     if "goal-context" not in records:
                         require(records == {"inputs"}, "partial Goal run is missing its research instructions")
-                        require(miner.store.read("inputs", "/fingerprint", 0, 1) == _panel_fingerprint(panel),
-                                "A inputs changed during Goal initialization")
+                        require((miner.root / "A-universe.csv").read_text() == panel.universe.rename("eligible").to_csv(),
+                                "A membership changed during Goal initialization")
                         miner.store.append("goal-context", "goal_context", self._context(panel))
                     miner.resume_explore(panel)
                 else:
                     miner.explore(panel, goal_context=self._context(panel))
             self._save(phase="prepare_validation")
             return
-        miner = self._miner()
-        if phase == "prepare_validation":
+        def prepare_validation():
+            miner = self._miner()
             completion = _read(miner.root / "a-complete.json")
             if not completion["retained_ids"]:
                 self._save(phase="finish_cycle")
@@ -376,7 +407,9 @@ class GoalRunner:
                             "retained A reports remain pending; resume after the reporting error is resolved")
                 miner.freeze(completion["retained_ids"], load_B_membership())
             self._save(phase="validate")
-        elif phase == "validate":
+
+        def validate():
+            miner = self._miner()
             if (miner.root / "b-numerical-complete.json").exists():
                 validation = miner.complete_reports("B", idea_pool)
             else:
@@ -385,7 +418,9 @@ class GoalRunner:
                 validation = miner.validate(load_B, idea_pool)
             require(validation["status"] == "complete", "B reports remain pending; resume to complete saved reports")
             self._save(phase="finish_cycle")
-        elif phase == "finish_cycle":
+
+        def finish_cycle():
+            miner = self._miner()
             self._archive_A(miner)
             if (miner.root / "validation.json").exists():
                 # Recheck frozen evidence and card contents before issuing receipts.
@@ -395,8 +430,12 @@ class GoalRunner:
                 self._save(status="complete", phase="complete", error=None)
             else:
                 self._save(status="active", phase="select_task", current_run=None, error=None)
-        else:
-            raise ValueError(f"unknown goal phase: {phase}")
+
+        return {"select_task": select_task, "wait_data": wait_data, "explore": explore, "prepare_validation": prepare_validation, "validate": validate, "finish_cycle": finish_cycle}
+
+    def _step(self, load_A, load_B, load_B_membership, idea_pool):
+        """Execute one persisted phase (also used for checkpoint recovery checks)."""
+        self._phase_actions(load_A, load_B, load_B_membership, idea_pool)[self.state["phase"]]()
 
     def run(self, load_A: Callable[[], FactorInputPanel], load_B: Callable[[], FactorInputPanel],
             load_B_membership: Callable[[], pd.Series], idea_pool: Path, *, poll_seconds: float,
@@ -410,10 +449,33 @@ class GoalRunner:
                 return self.state
             self._save(status="waiting" if self.state["phase"] == "wait_data" else "active", error=None)
             try:
-                while self.state["status"] != "complete":
-                    self._step(load_A, load_B, load_B_membership, Path(idea_pool))
-                    if self.state["status"] == "waiting":
-                        sleep(poll_seconds)
+                graph = StateGraph(dict)
+                actions = self._phase_actions(load_A, load_B, load_B_membership, Path(idea_pool))
+
+                def phase_node(name, action):
+                    def execute(state):
+                        require(self.state["phase"] == name, "graph phase differs from persisted Goal state")
+                        action()
+                        return dict(self.state)
+                    return execute
+
+                def route(state):
+                    if state["status"] == "complete":
+                        return END
+                    return "poll" if state["status"] == "waiting" else state["phase"]
+
+                def poll(state):
+                    sleep(poll_seconds)
+                    return dict(self.state)
+
+                for name, action in actions.items():
+                    graph.add_node(name, self.progress.track(f"goal.{name}", phase_node(name, action)))
+                    graph.add_conditional_edges(name, route, [*actions, "poll", END])
+                graph.add_node("poll", self.progress.track("goal.poll", poll))
+                graph.add_edge("poll", "wait_data")
+                graph.add_conditional_edges(START, lambda state: state["phase"], list(actions))
+                self.graph = graph.compile()
+                self.graph.invoke(dict(self.state), config=GRAPH_CONFIG)
             except KeyboardInterrupt:
                 self._save(status="paused", error=None)
                 raise

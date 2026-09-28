@@ -16,11 +16,13 @@ import requests
 
 from crypto_quant.features.factor_expressions import compile_expression, evaluate_expression
 from crypto_quant.features.factor_inputs import FactorInputPanel, INPUT_COLUMNS
-from crypto_quant.research.factor_mining.contracts import ResearchSpec, digest, dumps
-from crypto_quant.research.factor_mining.evaluation import build_labels, compare_experiment, correct_batch, evaluate_factor, hac_mean
+from crypto_quant.research.factor_mining.contracts import ResearchSpec, digest, dumps, model_fields
+from crypto_quant.research.factor_mining.agent_evaluator import REPORT_SCHEMA
+from crypto_quant.research.factor_mining.agent_optimizer import RESEARCH_QUESTIONS
+from crypto_quant.research.factor_mining.evaluation import build_labels, compare_experiment, correct_batch, evaluate_factor, evaluate_horizon_comparison, hac_mean
 from crypto_quant.research.factor_mining.model import ApiCallError, ModelReply, OpenCodeGoModel, read_api_key
-from crypto_quant.research.factor_mining.records import AgentGateway, EvidenceIntegrityError, ContextBudgetError, ModelResponseError, RecordStore, compact_record
-from crypto_quant.research.factor_mining.workflow import CHECK_DIMENSIONS, RESEARCH_QUESTIONS, FactorMiner, _check_report
+from crypto_quant.research.factor_mining.records import AgentGateway, EvidenceIntegrityError, ContextBudgetError, RecordStore, compact_record
+from crypto_quant.research.factor_mining.workflow import FactorMiner, b_admission_reasons
 
 
 def specification(**overrides):
@@ -32,7 +34,7 @@ def specification(**overrides):
         data_usage_review="engineering fixtures only; these dates are not held-out research evidence",
         label="perp_next_open_24h", sample_hours=1, groups=3, min_symbols=6,
         min_periods=26, hac_lags=23, confidence=0.95, stage_hours=48, rolling_periods=26,
-        fdr_method="BY", fdr_alpha=0.05, min_abs_ic=0.02, min_directional_spread=0.0001,
+        fdr_method="BH", fdr_alpha=0.05, min_abs_ic=0.02, min_directional_spread=0.0001,
         min_stage_share=0.5, max_repairs=2, max_formula_nodes=80, max_lookback_hours=7,
         context_tokens=2000000, output_tokens=4000)
     values.update(overrides)
@@ -140,8 +142,10 @@ class ScenarioModel:
             if role == "ideator":
                 self.ideations += 1
                 if self.ideations == 1:
-                    result = {"candidates": [definition(), definition("ts_mean(perp_close)", meaning="近期均值，窗口未定义")],
-                              "dispositions": [], "analysis": "构造一个市场错误和一个定义不足的例子"}
+                    result = {"candidates": [
+                        definition("div(perp_close,ts_mean(perp_close))"),
+                        definition("ts_mean(perp_close)", meaning="近期均值，窗口未定义")],
+                        "dispositions": [], "analysis": "构造两个公式错误用于检验程序修复"}
                 else:
                     proposal_id, proposed = next(iter(request["payload"]["pending_proposals"].items()))
                     result = {"candidates": [definition_from_task(proposal_id, proposed)], "dispositions": [
@@ -150,15 +154,11 @@ class ScenarioModel:
             elif role == "calculator":
                 payload = request["payload"]
                 expression = payload["current_expression"]
-                insufficient = "未定义" in payload["original_definition"]["meaning"]
-                mismatch = "spot_close" in expression
-                checks = [{"dimension": d, "original_meaning": payload["original_definition"]["meaning"],
-                           "actual": "脚本核对已提供的程序步骤", "matches": not insufficient and not (mismatch and d == "fields_units"),
-                           "reason": "模拟核对该已知错误"} for d in sorted(CHECK_DIMENSIONS)]
                 result = {"candidate_id": payload["candidate_id"],
-                          "status": "insufficient_definition" if insufficient else "inconsistent" if mismatch else "consistent",
-                          "checks": checks, "repair_expression": expression.replace("spot_close", "perp_close") if mismatch else None,
-                          "reason": "按原始含义核对，不修改含义"}
+                          "repair_expression": (
+                              "div(perp_close,ts_mean(perp_close,3))"
+                              if expression == "div(perp_close,ts_mean(perp_close))" else expression),
+                          "reason": "脚本只修复第一个公式；第二个保留错误以验证次数限制"}
             elif role == "evaluator":
                 result = narrative()
             elif role == "optimizer":
@@ -198,6 +198,94 @@ def four_destination_scenario(request, result):
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_admission_schemes_keep_ic_gate_and_stage_rules(self):
+        report = {"direction": 1, "summary": {
+            "rank_ic": {"mean": 0.03}, "directional_spread": {"mean": 0.0002},
+            "positive_stage_share": 0.45, "valid_stages": 52}}
+        accepted = [{"metric": "rank_ic", "rejected": True}]
+        baseline = specification()
+        self.assertNotIn("admission_scheme", baseline.as_dict())
+        self.assertIn("stage repetition", b_admission_reasons(report, accepted, baseline)[0][0])
+        with self.assertRaisesRegex(ValueError, "unknown admission scheme"):
+            specification(admission_scheme="plan2")
+        plan3 = specification(admission_scheme="plan3")
+        self.assertEqual(b_admission_reasons(report, accepted, plan3), ([], ["payout"]))
+        report["summary"].update(directional_spread={"mean": 0.00005}, positive_stage_share=0.70)
+        self.assertEqual(b_admission_reasons(report, accepted, plan3), ([], ["stability"]))
+        self.assertIn("spread", b_admission_reasons(report, accepted, baseline)[0][0])
+        report["summary"].update(directional_spread={"mean": 0.0002}, positive_stage_share=None)
+        self.assertIn("stage repetition", b_admission_reasons(report, accepted, baseline)[0][0])
+        self.assertTrue(any("Plan 3" in reason for reason in b_admission_reasons(report, accepted, plan3)[0]))
+        self.assertIn("Rank IC", b_admission_reasons(report, [{"metric": "rank_ic", "rejected": False}], plan3)[0][0])
+        report["summary"].update(directional_spread={"mean": 0.0002}, positive_stage_share=0.55)
+        self.assertEqual(b_admission_reasons(report, [{"metric": "rank_ic", "rejected": False}], plan3)[1], [])
+
+        tags = specification(admission_scheme="plan3", plan3_tracks_gate=False, min_abs_ic=0.01)
+        self.assertEqual(b_admission_reasons(report, accepted, tags), ([], ["payout", "balanced"]))
+        report["summary"].update(rank_ic={"mean": 0.012}, directional_spread={"mean": 0.00001},
+                                 positive_stage_share=None)
+        self.assertEqual(b_admission_reasons(report, accepted, tags), ([], []))
+        self.assertTrue(any("Plan 3" in reason for reason in b_admission_reasons(report, accepted, plan3)[0]))
+        report["summary"]["directional_spread"]["mean"] = 0.0
+        self.assertIn("positive", b_admission_reasons(report, accepted, tags)[0][0])
+        self.assertIn("Rank IC", b_admission_reasons(report, [{"metric": "rank_ic", "rejected": False}], tags)[0][0])
+        self.assertFalse(tags.as_dict()["plan3_tracks_gate"])
+        self.assertNotIn("plan3_tracks_gate", plan3.as_dict())
+        self.assertEqual(ResearchSpec.from_dict(tags.as_dict()), tags)
+        with self.assertRaisesRegex(ValueError, "BH Rank IC correction"):
+            specification(admission_scheme="plan3", plan3_tracks_gate=False, fdr_method="BY")
+
+    def test_horizon_labels_use_next_open_and_exclude_segment_boundary(self):
+        spec = specification()
+        panel = input_panel(spec)
+        t, end = spec.bounds("A")
+        for horizon in (1, 4, 24):
+            with self.subTest(horizon=horizon):
+                labels = build_labels(panel, spec, "A", horizon_hours=horizon)
+                entry = panel.values.loc[(t + pd.Timedelta(hours=1), "BTCUSDT"), "perp_open"]
+                exit_price = panel.values.loc[(t + pd.Timedelta(hours=horizon + 1), "BTCUSDT"), "perp_open"]
+                self.assertAlmostEqual(labels.loc[(t, "BTCUSDT"), "forward_return"], exit_price / entry - 1)
+                self.assertEqual(labels.loc[(t, "BTCUSDT"), "label_end"], t + pd.Timedelta(hours=horizon + 1))
+                boundary = end - pd.Timedelta(hours=horizon + 1)
+                self.assertTrue(labels.loc[(boundary, "BTCUSDT"), "purged"])
+                self.assertTrue(pd.isna(labels.loc[(boundary, "BTCUSDT"), "forward_return"]))
+                self.assertEqual(labels.groupby(level="symbol")["purged"].sum().iloc[0], horizon + 1)
+        with self.assertRaisesRegex(ValueError, "frozen 24h"):
+            build_labels(input_panel(spec, "B"), spec, "B", horizon_hours=1)
+        allowed = build_labels(input_panel(spec, "B"), spec, "B", horizon_hours=1,
+                               allow_nonprimary_horizon=True)
+        self.assertEqual(allowed["label_end"].iloc[0] - allowed["label_start"].iloc[0], pd.Timedelta(hours=1))
+
+    def test_horizon_comparison_uses_common_assets_and_preserves_primary_labels(self):
+        spec = specification(min_symbols=4, groups=2)
+        panel = input_panel(spec)
+        t = pd.Timestamp(spec.a_start)
+        # A missing 1h exit must exclude the same asset from all three comparison sorts.
+        panel.values.loc[(t + pd.Timedelta(hours=2), "BTCUSDT"), "perp_open"] = np.nan
+        labels = {h: build_labels(panel, spec, "A", horizon_hours=h) for h in (1, 4, 24)}
+        original = labels[24].copy(deep=True)
+        values = panel.values["perp_close"]
+        primary = evaluate_factor(values, labels[24], spec, "A", -1)
+        result = evaluate_horizon_comparison(values, labels, spec, -1)
+        pd.testing.assert_frame_equal(labels[24], original)
+        self.assertEqual(primary["periods"][0]["n"], 6)
+        for horizon in (1, 4, 24):
+            report = result["horizons"][str(horizon)]
+            first = report["periods"][0]
+            clean = pd.DataFrame({"factor": values, "return": labels[horizon]["forward_return"]}).xs(t).drop(index="BTCUSDT")
+            expected_ic = clean["factor"].rank().corr(clean["return"].rank())
+            self.assertAlmostEqual(first["rank_ic"], expected_ic)
+            self.assertEqual(first["n"], 5)
+            self.assertEqual(report["horizon_hours"], horizon)
+            self.assertEqual(report["label"], f"perp_next_open_{horizon}h")
+            self.assertEqual(report["direction"], -1)
+            self.assertEqual(report["summary"]["rank_ic"]["lags"], 23)
+            self.assertEqual(report["coverage"]["purged_hours"], 25)
+        counts = [[(p["timestamp"], p["n"], p["group_1_n"], p["group_2_n"]) for p in r["periods"]]
+                  for r in result["horizons"].values()]
+        self.assertEqual(counts[0], counts[1])
+        self.assertEqual(counts[1], counts[2])
+
     def test_24_hour_prices_exact_shift_and_boundary(self):
         spec = specification()
         panel = input_panel(spec)
@@ -270,13 +358,15 @@ class EvaluationTests(unittest.TestCase):
         pd.testing.assert_series_equal(before.loc[:t], after.loc[:t])
         self.assertTrue(pd.isna(before.loc[(t, "BTCUSDT")]))
 
-    def test_batch_keeps_missing_tests_in_family(self):
-        spec = specification(fdr_method="BH")
-        reports = {"a": {"summary": {"rank_ic": {"p_value": .01}, "directional_spread": {"p_value": .04}}},
-                   "b": {"summary": {"rank_ic": {"p_value": .03}, "directional_spread": {"p_value": None}}}}
+    def test_batch_corrects_only_ic_and_keeps_missing_ic_in_family(self):
+        spec = specification()
+        reports = {"a": {"summary": {"rank_ic": {"p_value": .01}, "directional_spread": {"p_value": .000001}}},
+                   "b": {"summary": {"rank_ic": {"p_value": .03}, "directional_spread": {"p_value": .04}}},
+                   "c": {"summary": {"rank_ic": {"p_value": None}, "directional_spread": {"p_value": .000001}}}}
         bh = correct_batch(reports, spec)
-        self.assertEqual(bh["family_size"], 4)
-        np.testing.assert_allclose([t["adjusted_p"] for t in bh["tests"]], [.04, .04 * 4 / 3, .04 * 4 / 3, 1])
+        self.assertEqual(bh["family_size"], 3)
+        self.assertEqual([t["metric"] for t in bh["tests"]], ["rank_ic"] * 3)
+        np.testing.assert_allclose([t["adjusted_p"] for t in bh["tests"]], [.03, .045, 1])
         self.assertIsNone(bh["tests"][-1]["raw_p"])
         self.assertFalse(bh["tests"][-1]["rejected"])
         by = correct_batch(reports, replace(spec, fdr_method="BY"))
@@ -290,6 +380,31 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(steps[-1]["window_hours"], 2)
         self.assertEqual(steps[-1]["arguments"][0], 3)
         self.assertEqual(steps[2]["window_hours"], 3)
+
+    def test_formula_compiler_does_not_check_units(self):
+        for expression in ("spot_close", "cross_rank(spot_close)", "cross_zscore(spot_volume)",
+                           "add(spot_volume,perp_close)", "log(spot_close)",
+                           "div(spot_quote_volume,spot_volume)", "div(1,spot_close)",
+                           "cross_rank(sub(perp_high,perp_low))",
+                           "cross_rank(ts_std(perp_close,24))",
+                           "div(spot_quote_volume,add(spot_trades,1))",
+                           "sub(log(perp_close),ts_mean(log(perp_close),24))"):
+            with self.subTest(expression=expression):
+                compile_expression(expression)
+        with self.assertRaisesRegex(ValueError, "operator is not allowed"):
+            compile_expression("count_literal(1)")
+        with tempfile.TemporaryDirectory() as directory:
+            miner = FactorMiner(specification(), ScenarioModel(), Path(directory))
+            self.assertEqual(miner._compile("cross_rank(spot_close)").fields, ("spot_close",))
+        panel = input_panel(specification())
+        self.assertGreater(evaluate_expression("cross_rank(spot_close)", panel).values.notna().sum(), 0)
+        expression = "ts_delta(log(perp_close),1)"
+        pd.testing.assert_series_equal(
+            evaluate_expression(expression, panel).values,
+            evaluate_expression("sub(log(perp_close),log(ts_delay(perp_close,1)))", panel).values)
+        smoothed = evaluate_expression("div(spot_quote_volume,add(spot_trades,1))", panel).values
+        pd.testing.assert_series_equal(smoothed, (panel.values["spot_quote_volume"] /
+                                                 (panel.values["spot_trades"] + 1)).rename("factor_value"))
 
 
 class WorkflowTests(unittest.TestCase):
@@ -319,7 +434,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual({n["role"] for n in notes}, {"ideator", "calculator", "evaluator", "optimizer"})
             paths = {p for note in notes for p in note["extra_fields"]}
             for path in ("/extra_note", "/result/read_records", "/result/candidates/0/extra_note",
-                         "/result/checks/0/extra_note", "/result/proposals/0/modification_task/extra_note",
+                         "/result/proposals/0/modification_task/extra_note",
                          "/result/proposals/0/experiment_design/extra_note",
                          "/result/dispositions/0/extra_note",
                          "/result/decisions/0/answers/research_basis/extra_note"):
@@ -352,36 +467,29 @@ class WorkflowTests(unittest.TestCase):
 
     def test_nested_missing_fields_and_types_are_rejected_with_local_calculator_failure(self):
         cases = [
-            ("ideator", lambda r: r["candidates"][0].pop("expression"), "missing required fields: expression"),
-            ("ideator", lambda r: r["candidates"][0].update(direction="-1"), "direction must be integer"),
-            ("calculator", lambda r: r["checks"][0].pop("matches"), "missing required fields: matches"),
-            ("calculator", lambda r: r["checks"][0].update(matches="true"), "matches must be boolean"),
+            ("ideator", lambda r: r["candidates"][0].pop("expression"), '"expression"', 'missing'),
+            ("ideator", lambda r: r["candidates"][0].update(direction="-1"), '"direction"', 'int_type'),
             ("optimizer", lambda r: r["proposals"][0]["experiment_design"].pop("expected_outcome"),
-             "missing required fields: expected_outcome"),
+             '"expected_outcome"', 'missing'),
             ("optimizer", lambda r: r["proposals"][0]["modification_task"].pop("change_target"),
-             "missing required fields: change_target"),
-            ("optimizer", lambda r: r["decisions"][0]["answers"]["research_basis"].pop("reason"), "missing required fields: reason"),
+             '"change_target"', 'missing'),
+            ("optimizer", lambda r: r["decisions"][0]["answers"]["research_basis"].pop("reason"), '"reason"', 'missing'),
         ]
-        for role, mutate, error in cases:
+        for role, mutate, error, error_type in cases:
+            mutated = False
             def transform(request, result):
-                if request["role"] == role:
+                nonlocal mutated
+                if request["role"] == role and not mutated:
+                    mutated = True
                     result["extra_note"] = "unused-extra-value"
                     mutate(result)
             with self.subTest(role=role, error=error), tempfile.TemporaryDirectory() as directory:
                 miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
-                if role == "calculator":
-                    result = miner.explore(input_panel(miner.spec))
-                    self.assertEqual(result["evaluated_ids"], [])
-                    self.assertTrue(all(item["calculation"]["status"] == "model_review_failed"
-                                        for item in miner.candidates.values()))
-                    self.assertFalse((miner.root / "exploration-stopped.json").exists())
-                else:
-                    with self.assertRaisesRegex(ModelResponseError, error):
-                        miner.explore(input_panel(miner.spec))
-                    self.assertTrue((miner.root / "exploration-stopped.json").exists())
-                    self.assertFalse((miner.root / "a-complete.json").exists())
+                miner.explore(input_panel(miner.spec))
+                self.assertFalse((miner.root / "exploration-stopped.json").exists())
+                self.assertTrue((miner.root / "a-complete.json").exists())
                 invalid = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
-                self.assertTrue(any(error in r["data"]["error"] for r in invalid))
+                self.assertTrue(any(error in r["data"]["error"] and error_type in r["data"]["error"] for r in invalid))
                 self.assertTrue(any(r["kind"] == "format_deviation" for r in miner.store.all()))
 
     def test_extra_report_fields_are_preserved_raw_but_not_forwarded_in_A_or_B(self):
@@ -414,17 +522,20 @@ class WorkflowTests(unittest.TestCase):
         for field in narrative():
             bad = {**narrative(), "conditions_note": None}
             del bad[field]
-            with self.subTest(missing=field), self.assertRaisesRegex(ValueError, f"missing required fields: {field}"):
-                _check_report(bad)
+            with self.subTest(missing=field), self.assertRaisesRegex(ValueError, field):
+                model_fields(bad, REPORT_SCHEMA, [])
         for field, wrong in (("analysis", None), ("mechanism", ""),
                              ("conditions", "text"), ("falsifiers", []),
                              ("limitations", [None]), ("next_steps", [""])):
             with self.subTest(field=field, wrong=wrong), self.assertRaisesRegex(ValueError, field):
-                _check_report({**narrative(), field: wrong, "conditions_note": None})
+                model_fields({**narrative(), field: wrong, "conditions_note": None}, REPORT_SCHEMA, [])
 
-    def test_invalid_report_is_pending_and_preserves_evidence(self):
+    def test_invalid_report_is_corrected_and_preserves_evidence(self):
+        invalid_once = False
         def invalid_report(request, result):
-            if request["role"] == "evaluator":
+            nonlocal invalid_once
+            if request["role"] == "evaluator" and not invalid_once:
+                invalid_once = True
                 result.update(analysis=None, conditions_note=None)
         spec, model = specification(), ScenarioModel(invalid_report)
         with tempfile.TemporaryDirectory() as directory:
@@ -432,9 +543,10 @@ class WorkflowTests(unittest.TestCase):
             result = miner.explore(input_panel(spec))
             self.assertTrue(any(r["role"] == "optimizer" for r in model.requests))
             self.assertFalse((miner.root / "exploration-stopped.json").exists())
-            self.assertEqual(result["pending_report_ids"], result["evaluated_ids"])
+            self.assertEqual(result["pending_report_ids"], [])
             self.assertTrue(list((miner.root / "a_records").glob("model-*-format.json")))
-            self.assertFalse((miner.root / "a_records/candidate-0001-report.json").exists())
+            self.assertTrue(any(r["kind"] == "invalid_model_response" for r in miner.store.all()))
+            self.assertTrue((miner.root / "a_records/candidate-0001-report.json").exists())
 
     def test_four_destinations_control_next_round_and_freeze(self):
         spec = specification()
@@ -453,6 +565,8 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(len(miner.candidates), 5)
             self.assertEqual(miner.candidates["candidate-0005"]["definition"]["parent_id"], "candidate-0001")
             self.assertEqual(set(result["retained_ids"]), {"candidate-0001", "candidate-0002", "candidate-0005"})
+            self.assertFalse((miner.root / "code.json").exists())
+            (miner.root / "code.json").write_text('{"legacy.py": "different-code-version"}')
             restored = FactorMiner.open(miner.root, model=None)
             for cid in ("candidate-0003", "candidate-0004"):
                 with self.subTest(cid=cid), self.assertRaisesRegex(ValueError, "explicitly retained"):
@@ -461,6 +575,10 @@ class WorkflowTests(unittest.TestCase):
             restored.freeze(result["retained_ids"], input_panel(spec, "B").universe)
             frozen = json.loads((miner.root / "frozen_batch.json").read_text())
             self.assertEqual(frozen["candidates"]["candidate-0002"]["a_decision"], states["candidate-0002"])
+            self.assertNotIn("code", frozen)
+            frozen["code"] = {"legacy.py": "different-code-version"}
+            (miner.root / "frozen_batch.json").write_text(json.dumps(frozen))
+            self.assertEqual(restored._checked_frozen()[1], frozen["sha256"])
             report = (miner.root / "A-report.md").read_text()
             for label in ("保留待B验证", "暂停", "淘汰", "恢复条件", "有研究依据"):
                 self.assertIn(label, report)
@@ -497,13 +615,13 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(model.ideations, 1)
             self.assertFalse((miner.root / "b-access-started.json").exists())
 
-    def test_bad_decisions_stop_before_next_round(self):
+    def test_bad_decisions_are_corrected_before_next_round(self):
         cases = [
-            (lambda r: r["decisions"].pop(), "needs one decision"),
+            (lambda r: r["decisions"].pop(), r'too_short.*decisions'),
             (lambda r: r["decisions"].__setitem__(1, copy.deepcopy(r["decisions"][0])), "repeated candidate"),
-            (lambda r: r["decisions"][0]["answers"].pop("research_basis"), "missing required fields: research_basis"),
+            (lambda r: r["decisions"][0]["answers"].pop("research_basis"), r'missing.*research_basis'),
             (lambda r: r["decisions"][0]["answers"]["research_basis"].update(supported=False), "all four questions"),
-            (lambda r: r["decisions"][0]["answers"]["attempt_value"].update(supported="true"), "supported must be boolean"),
+            (lambda r: r["decisions"][0]["answers"]["attempt_value"].update(supported="true"), r'bool_type.*supported'),
             (lambda r: r["decisions"][0].update(evidence_refs=["invented-evidence"]), "existing records"),
             (lambda r: r["decisions"][0].update(evidence_refs=["candidate-0002-calculation"]), "this candidate's program evidence"),
             (lambda r: r["decisions"][1].update(resume_condition=None), "pause resume condition"),
@@ -515,27 +633,42 @@ class WorkflowTests(unittest.TestCase):
             (lambda r: r["proposals"][0].update(evidence_refs=["candidate-0001-report"]), "control evaluation"),
         ]
         for mutate, error in cases:
+            mutated = False
             def transform(request, result):
-                if request["role"] == "optimizer":
+                nonlocal mutated
+                if request["role"] == "optimizer" and not mutated:
                     mutate(result)
+                    mutated = True
             with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
                 spec, model = specification(), ScenarioModel(transform)
                 miner = FactorMiner(spec, model, Path(directory))
-                with self.assertRaisesRegex(ValueError, error):
-                    miner.explore(input_panel(spec))
-                self.assertEqual(model.ideations, 1)
-                self.assertTrue((miner.root / "exploration-stopped.json").exists())
-                self.assertFalse((miner.root / "a-complete.json").exists())
+                result = miner.explore(input_panel(spec))
+                self.assertTrue(mutated)
+                invalid = [record["data"]["error"] for record in miner.store.all()
+                           if record["kind"] == "invalid_model_response"]
+                self.assertTrue(any(re.search(error, message) for message in invalid))
+                self.assertEqual(result["completed_rounds"], 2)
+                self.assertEqual(model.ideations, 2)
+                self.assertFalse((miner.root / "exploration-stopped.json").exists())
+                self.assertTrue((miner.root / "a-complete.json").exists())
 
-    def test_paused_candidate_cannot_be_revived_by_ideator(self):
+    def test_paused_candidate_revive_is_rejected_before_correction(self):
+        revived_once = False
         def revive(request, result):
-            if request["role"] == "ideator" and request["payload"]["pending_proposals"]:
+            nonlocal revived_once
+            if request["role"] == "ideator" and request["payload"]["pending_proposals"] and not revived_once:
+                revived_once = True
                 result["candidates"].append(definition("ts_mean(perp_close,2)", parent="candidate-0002"))
         spec, model = specification(), ScenarioModel(revive)
         with tempfile.TemporaryDirectory() as directory:
             miner = FactorMiner(spec, model, Path(directory))
-            with self.assertRaisesRegex(ValueError, "does not authorize a new version"):
-                miner.explore(input_panel(spec))
+            result = miner.explore(input_panel(spec))
+            self.assertTrue(revived_once)
+            self.assertEqual(result["completed_rounds"], 2)
+            invalid = [record["data"]["error"] for record in miner.store.all()
+                       if record["kind"] == "invalid_model_response"]
+            self.assertTrue(any("does not authorize a new version" in message for message in invalid))
+            self.assertNotIn("candidate-0004", miner.candidates)
             self.assertFalse(any(r["payload"].get("candidate_id") == "candidate-0004" for r in model.requests))
 
     def test_natural_loop_can_exceed_previous_round_and_candidate_caps(self):
@@ -580,25 +713,31 @@ class WorkflowTests(unittest.TestCase):
                 miner.gateway.ask("evaluator", "prior call fixture", {}, {})
             result = miner.explore(input_panel(spec))
             self.assertEqual(result["completed_rounds"], 2)
-            self.assertEqual(len(model.requests), 45)
+            self.assertEqual(len(model.requests), 44)
             for field in ("rounds", "max_candidates", "candidates_per_round", "max_route_attempts", "max_model_calls"):
                 self.assertNotIn(field, spec.as_dict())
             decision_request = next(r for r in model.requests if r["role"] == "optimizer")
             self.assertNotIn("remaining_budget", decision_request["payload"])
 
-    def test_semantic_review_cannot_be_attached_to_another_candidate(self):
+    def test_formula_repair_rejects_wrong_candidate_before_accepting_correction(self):
         spec, model = specification(), Mock()
-        wrong = {"candidate_id": "candidate-9999", "status": "consistent", "checks": [], "repair_expression": None,
-                 "reason": "wrong candidate"}
-        model.complete.return_value = ModelReply(dumps({"result": wrong, "read_records": []}), {}, "fixture")
+        wrong = {"candidate_id": "candidate-9999", "repair_expression": "perp_close", "reason": "wrong candidate"}
+        corrected = {"candidate_id": "candidate-0001", "repair_expression": "ts_mean(perp_close,2)",
+                     "reason": "补齐显式窗口"}
+        model.complete.side_effect = [ModelReply(dumps({"result": reply, "read_records": []}), {}, "fixture")
+                                      for reply in (wrong, corrected)]
         with tempfile.TemporaryDirectory() as directory:
             miner = FactorMiner(spec, model, Path(directory))
-            miner.candidates["candidate-0001"] = {"definition": definition("div(perp_close,ts_mean(perp_close,3))")}
-            with patch("crypto_quant.research.factor_mining.workflow.evaluate_expression") as compute:
-                self.assertIsNone(miner._calculate("candidate-0001", input_panel(spec)))
-            compute.assert_not_called()
-            self.assertEqual(model.complete.call_count, 3)
-            self.assertEqual(miner.candidates["candidate-0001"]["calculation"]["status"], "model_review_failed")
+            miner.candidates["candidate-0001"] = {"definition": definition("ts_mean(perp_close)")}
+            self.assertIsNotNone(miner._calculate("candidate-0001", input_panel(spec)))
+            self.assertEqual(model.complete.call_count, 2)
+            invalid = [record["data"]["error"] for record in miner.store.all()
+                       if record["kind"] == "invalid_model_response"]
+            self.assertTrue(any("candidate_id" in message and "candidate-0001" in message
+                                for message in invalid))
+            calculation = miner.candidates["candidate-0001"]["calculation"]
+            self.assertEqual(calculation["status"], "computed")
+            self.assertEqual(calculation["executed_expression"]["expression"], corrected["repair_expression"])
 
     def test_B_card_admission_is_independent_of_legacy_evaluator_verdict(self):
         for legacy in ("keep", "discard"):
@@ -616,7 +755,7 @@ class WorkflowTests(unittest.TestCase):
                     controlled_report = copy.deepcopy(miner.candidates["candidate-0001"]["evaluation"])
                     controlled_report["segment"] = "B"
                     controlled_report["summary"]["rank_ic"].update(mean=-0.2, p_value=p_value)
-                    controlled_report["summary"]["directional_spread"].update(mean=0.003, p_value=p_value)
+                    controlled_report["summary"]["directional_spread"].update(mean=0.003, p_value=0.8)
                     controlled_report["summary"].update(valid_stages=2, positive_stage_share=1.0)
                     with patch("crypto_quant.research.factor_mining.workflow.evaluate_factor", return_value=controlled_report):
                         result = miner.validate(lambda: b_panel, Path(directory) / "ideas")
@@ -638,10 +777,14 @@ class WorkflowTests(unittest.TestCase):
                         for key in ("source", "original_claim", "economic_mechanism", "market_and_horizon",
                                     "data_and_coverage", "falsification_conditions", "unverified_assumptions", "next_research_plan"):
                             self.assertIn(key, card)
-                        self.assertNotIn("spot_close", card["original_claim"]["formula"]["expression"])
+                        self.assertEqual(card["original_claim"]["formula"]["expression"],
+                                         "div(perp_close,ts_mean(perp_close,3))")
                         self.assertEqual(card["a_research_decision"]["disposition"], "retain")
                         self.assertEqual(card["b_validation_status"], "passed")
                         self.assertEqual(card["admission_evidence"]["decision_source"], "program")
+                        self.assertEqual([t["metric"] for t in card["admission_evidence"]["tests"]], ["rank_ic"])
+                        self.assertEqual(card["multiple_testing"], {"method": "BH", "alpha": 0.05})
+                        self.assertEqual(card["data_and_coverage"]["data_usage_review"], spec.data_usage_review)
                         self.assertEqual(card["strategy_validation_status"], "not_started")
                     else:
                         self.assertFalse((Path(directory) / "ideas").exists())
@@ -655,6 +798,52 @@ class WorkflowTests(unittest.TestCase):
                         path.write_text(dumps({**card, "status": "changed"}))
                         with self.assertRaisesRegex(ValueError, "existing idea card differs"):
                             miner.complete_reports("B", Path(directory) / "ideas")
+
+    def test_plan3_stability_track_admits_and_labels_card(self):
+        with tempfile.TemporaryDirectory() as directory:
+            spec, model = specification(purpose="research", admission_scheme="plan3"), ScenarioModel(propose_once=False)
+            miner = FactorMiner(spec, model, Path(directory))
+            miner.explore(input_panel(spec))
+            panel = input_panel(spec, "B")
+            miner.freeze(["candidate-0001"], panel.universe)
+            report = copy.deepcopy(miner.candidates["candidate-0001"]["evaluation"])
+            report["segment"] = "B"
+            report["summary"]["rank_ic"].update(mean=-0.2, p_value=0.000001)
+            report["summary"]["directional_spread"].update(mean=0.00005, p_value=0.8)
+            report["summary"].update(valid_stages=1, positive_stage_share=0.65)
+            with patch("crypto_quant.research.factor_mining.workflow.evaluate_factor", return_value=report):
+                result = miner.validate(lambda: panel, Path(directory) / "ideas")
+            decision = result["decisions"]["candidate-0001"]
+            self.assertTrue(decision["eligible_for_idea_pool"])
+            self.assertEqual(decision["tracks"], ["stability"])
+            card = json.loads(next((Path(directory) / "ideas").glob("*.json")).read_text())
+            self.assertEqual(card["classification"], {"scheme": "plan3", "tracks": ["stability"],
+                                                      "track_labels": ["胜率轨"]})
+            self.assertIn("胜率轨", card["title"])
+
+    def test_plan3_tags_admit_weak_ic_without_a_track_and_record_base_style(self):
+        with tempfile.TemporaryDirectory() as directory:
+            spec = specification(purpose="research", admission_scheme="plan3", plan3_tracks_gate=False,
+                                 min_abs_ic=0.01)
+            model = ScenarioModel(propose_once=False)
+            miner = FactorMiner(spec, model, Path(directory))
+            miner.explore(input_panel(spec))
+            panel = input_panel(spec, "B")
+            miner.freeze(["candidate-0001"], panel.universe)
+            report = copy.deepcopy(miner.candidates["candidate-0001"]["evaluation"])
+            report["segment"] = "B"
+            report["summary"]["rank_ic"].update(mean=-0.012, p_value=0.000001)
+            report["summary"]["directional_spread"].update(mean=0.00001, p_value=0.8)
+            report["summary"].update(valid_stages=1, positive_stage_share=0.1)
+            with patch("crypto_quant.research.factor_mining.workflow.evaluate_factor", return_value=report):
+                result = miner.validate(lambda: panel, Path(directory) / "ideas")
+            decision = result["decisions"]["candidate-0001"]
+            self.assertTrue(decision["eligible_for_idea_pool"])
+            self.assertEqual(decision["tracks"], [])
+            card = json.loads(next((Path(directory) / "ideas").glob("*.json")).read_text())
+            self.assertEqual(card["classification"], {"scheme": "plan3", "tracks": [],
+                                                      "track_labels": ["基础型"], "tracks_gate": False})
+            self.assertIn("基础型", card["title"])
 
     def test_B_thresholds_and_engineering_exclusion_remain_enforced(self):
         cases = [
@@ -703,10 +892,10 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("expression", dumps(proposal))
             self.assertEqual(proposal["modification_task"], modification_task())
             self.assertEqual(proposal["experiment_design"], experiment_design())
-            child_review = next(request for request in model.requests
-                                if request["role"] == "calculator"
-                                and request["payload"]["candidate_id"] == "candidate-0003")
-            self.assertEqual(child_review["payload"]["modification_plan"], experiment())
+            self.assertFalse(any(request["role"] == "calculator"
+                                 and request["payload"]["candidate_id"] == "candidate-0003"
+                                 for request in model.requests))
+            self.assertEqual(child["calculation"]["status"], "computed")
             self.assertFalse(any(record["kind"] == "experiment_scope_error" for record in miner.store.all()))
             report = (miner.root / "A-report.md").read_text()
             for label in ("修改任务与配对检验合同", "原核心假设", "改动目标", "判断标准"):
@@ -749,7 +938,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(stopped["decision"], "stop")
         self.assertEqual(uncertain["decision"], "pause_insufficient")
 
-    def test_missing_meaning_returns_without_repair(self):
+    def test_missing_meaning_does_not_block_formula_calculation(self):
         spec, model = specification(), Mock()
         with tempfile.TemporaryDirectory() as directory:
             miner = FactorMiner(spec, model, Path(directory))
@@ -757,9 +946,9 @@ class WorkflowTests(unittest.TestCase):
             data["meaning"] = ""
             miner.candidates["candidate-0001"] = {"definition": data}
             result = miner._calculate("candidate-0001", input_panel(spec))
-            self.assertIsNone(result)
+            self.assertIsNotNone(result)
             model.complete.assert_not_called()
-            self.assertEqual(miner.store.all()[0]["data"]["status"], "returned_to_ideator")
+            self.assertEqual(miner.store.all()[0]["data"]["status"], "computed")
 
     def test_frozen_membership_cannot_be_changed_before_B(self):
         spec, model = specification(), ScenarioModel(propose_once=False)
@@ -796,10 +985,19 @@ class WorkflowTests(unittest.TestCase):
             records = {r["id"]: r["data"] for r in second["records"]}
             calc = records["candidate-0001-calculation"]
             self.assertEqual(len(calc["checks"]), 2)
-            self.assertIn("spot_close", calc["original_expression"])
-            self.assertNotIn("spot_close", calc["executed_expression"]["expression"])
-            self.assertEqual(records["candidate-0002-calculation"]["status"], "returned_to_ideator")
+            self.assertEqual(calc["original_expression"], "div(perp_close,ts_mean(perp_close))")
+            self.assertEqual(calc["executed_expression"]["expression"],
+                             "div(perp_close,ts_mean(perp_close,3))")
+            self.assertEqual(records["candidate-0002-calculation"]["status"], "calculation_failed")
             self.assertTrue(records["candidate-0001-evaluation"]["periods"])
+            comparison = records["candidate-0001-evaluation"]["horizon_comparison"]
+            self.assertEqual(set(comparison["horizons"]), {"1", "4", "24"})
+            compact = compact_record(next(r for r in miner.store.all() if r["id"] == "candidate-0001-evaluation"))
+            for horizon in compact["data"]["horizon_comparison"]["horizons"].values():
+                self.assertIn("pointer", horizon["periods"])
+                self.assertIn("group_means", horizon["summary"])
+            report_text = (miner.root / "A-report.md").read_text()
+            self.assertIn("| 指标 | 未来1h | 未来4h | 未来24h |", report_text)
             self.assertIn("candidate-0001-report", records)
             self.assertIn("round-001-optimization", records)
             third = miner.candidates["candidate-0003"]
@@ -814,7 +1012,7 @@ class WorkflowTests(unittest.TestCase):
                 called.append(True)
                 return input_panel(spec, "B")
             validation = restored.validate(loader, Path(directory) / "ideas")
-            self.assertEqual(validation["batch_correction"]["family_size"], 4)
+            self.assertEqual(validation["batch_correction"]["family_size"], 2)
             self.assertEqual(digest(miner.store.all()), before)
             self.assertFalse((Path(directory) / "ideas").exists())
             for request in model.requests:
@@ -826,17 +1024,18 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "new research"):
                 restored.explore(input_panel(spec))
 
-    def test_invalid_model_response_is_saved_and_stops_after_two_corrections(self):
+    def test_invalid_model_response_can_recover_after_four_corrections(self):
         model = Mock()
-        model.complete.return_value = ModelReply("not json", {}, "broken")
+        model.complete.side_effect = [ModelReply("not json", {}, "broken") for _ in range(4)] + [
+            ModelReply(dumps({"result": {}, "read_records": []}), {}, "fixture")]
         spec = specification()
         with tempfile.TemporaryDirectory() as directory:
-            miner = FactorMiner(spec, model, Path(directory))
-            with self.assertRaisesRegex(ModelResponseError, "JSONDecodeError"):
-                miner.explore(input_panel(spec))
-            self.assertEqual(model.complete.call_count, 3)
-            self.assertTrue((miner.root / "model_calls/00001-response.json").exists())
-            self.assertTrue((miner.root / "exploration-stopped.json").exists())
+            gateway = AgentGateway(model, spec, RecordStore(Path(directory) / "records"), Path(directory) / "calls")
+            self.assertEqual(gateway.ask("ideator", "work", {}, {}), {})
+            self.assertEqual(model.complete.call_count, 5)
+            invalid = [record for record in gateway.store.all() if record["kind"] == "invalid_model_response"]
+            self.assertEqual([record["data"]["correction"] for record in invalid], [0, 1, 2, 3])
+            self.assertTrue(all(record["data"]["will_correct"] for record in invalid))
 
     def test_inherited_model_failure_id_does_not_block_a_new_correction(self):
         spec = specification(run_id="successor-run")
@@ -865,7 +1064,7 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 specification(**kwargs)
 
-    def test_record_mutation_is_detected(self):
+    def test_record_hash_mismatch_does_not_block_read(self):
         with tempfile.TemporaryDirectory() as directory:
             store = RecordStore(Path(directory))
             store.append("record", "fact", {"number": 1})
@@ -873,8 +1072,9 @@ class WorkflowTests(unittest.TestCase):
             value = json.loads(path.read_text())
             value["data"]["number"] = 2
             path.write_text(dumps(value))
-            with self.assertRaisesRegex(ValueError, "changed"):
-                store.all()
+            loaded = store.all()[0]
+            self.assertEqual(loaded["data"]["number"], 2)
+            self.assertNotEqual(loaded["sha256"], digest(loaded["data"]))
 
     def test_context_pages_original_rows_only_when_budget_requires_it(self):
         spec = specification(context_tokens=7000, output_tokens=1000)
@@ -944,6 +1144,51 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(compacted["data"]["records"]["pointer"], "/records")
         self.assertEqual(compacted["data"]["records"]["rows"], 1)
         self.assertEqual(compacted["data"]["context"]["run_id"], "prior-run")
+
+    def test_context_pages_cycle_candidates_when_saved_summaries_exceed_budget(self):
+        spec = specification(context_tokens=7000, output_tokens=1000)
+        with tempfile.TemporaryDirectory() as directory:
+            store = RecordStore(Path(directory) / "records")
+            candidates = [{"candidate_ref": f"prior-run/candidate-{i:04d}",
+                           "A_evaluation": {"summary": "x" * 3000}} for i in range(3)]
+            store.append("cycle-00000001", "research_cycle", {
+                "records": [], "context": {"run_id": "prior-run", "candidates": candidates,
+                                          "previous_expressions": [{"expression": "cross_rank(funding_24h_sum)"}]},
+            })
+            model = Mock()
+            model.complete.return_value = ModelReply(dumps({"result": {"checked": True},
+                                                              "read_records": []}), {}, "fixture")
+            gateway = AgentGateway(model, spec, store, Path(directory) / "calls")
+            self.assertTrue(gateway.ask("optimizer", "核对Goal历史", {}, {})["checked"])
+            request = json.loads((Path(directory) / "calls/00001-request.json").read_text())
+            self.assertEqual(request["context_mode"], "cycle_candidates_paged")
+            context = json.loads(request["messages"][1]["content"])["records"][0]["data"]["context"]
+            self.assertEqual(context["candidates"]["pointer"], "/context/candidates")
+            self.assertEqual(context["candidates"]["rows"], 3)
+            self.assertEqual(context["previous_expressions"],
+                             [{"expression": "cross_rank(funding_24h_sum)"}])
+            self.assertEqual(store.read("cycle-00000001", "/context/candidates", 2, 1)["items"], candidates[2:])
+
+    def test_goal_context_pages_prior_a_cycles_and_keeps_exact_retrieval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RecordStore(Path(directory) / "records")
+            cycles = [{"source_record_id": f"cycle-{i:08d}", "summary": "x" * 1000}
+                      for i in range(20)]
+            store.append("goal-context", "goal_context", {
+                "goal": {"goal_id": "fixture"},
+                "research_task": {"task": "current"},
+                "previous_expressions": [{"expression": "perp_close"}],
+                "prior_A_research": {"tasks": [{"task": "prior"}], "cycles": cycles},
+            })
+            original = store.all()[0]
+            compacted = compact_record(original)
+            paged = compacted["data"]["prior_A_research"]["cycles"]
+            self.assertEqual((paged["record_id"], paged["pointer"], paged["rows"]),
+                             ("goal-context", "/prior_A_research/cycles", 20))
+            self.assertEqual(compacted["data"]["previous_expressions"], [{"expression": "perp_close"}])
+            self.assertEqual(compacted["data"]["research_task"], {"task": "current"})
+            self.assertLess(len(dumps(compacted)), len(dumps(original)))
+            self.assertEqual(store.read("goal-context", "/prior_A_research/cycles", 19, 1)["items"], cycles[-1:])
 
     def test_context_overflow_does_not_make_a_request(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1095,6 +1340,10 @@ class ApiRetryTests(unittest.TestCase):
                 self.assertEqual(retry["retry_of"], "00001")
                 self.assertEqual(retry["attempt"], 2)
                 self.assertEqual(post.call_args_list[0].kwargs, post.call_args_list[1].kwargs)
+                progress = [json.loads(line) for line in (Path(directory) / "progress.jsonl").read_text().splitlines()]
+                self.assertIn({"event": "retry", "step": "factor.model_call", "stage": "A",
+                               "role": "optimizer", "next_attempt": 2, "delay_seconds": 1},
+                              [{key: value for key, value in item.items() if key != "time"} for item in progress])
                 for path in (Path(directory) / "calls").glob("*.json"):
                     self.assertNotIn("fixture-secret", path.read_text())
 
@@ -1194,37 +1443,25 @@ class ApiRetryTests(unittest.TestCase):
             self.assertEqual(len(list((miner.root / "model_calls").glob("*-error.json"))), 2)
 
 class ResponseRecoveryTests(unittest.TestCase):
-    def test_ideator_prompt_requires_statistical_only_oi_conditioning(self):
+    def test_interpretation_text_does_not_block_a_valid_formula(self):
         with tempfile.TemporaryDirectory() as directory:
-            model = ScenarioModel()
-            miner = FactorMiner(specification(), model, Path(directory))
-            miner.explore(input_panel(miner.spec))
-
-            task = next(request["task"] for request in model.requests
-                        if request["role"] == "ideator")
-            self.assertIn("可证伪统计条件关联", task)
-            self.assertIn("无法写成纯统计假设时必须不生成该候选", task)
-            self.assertIn("纠错时必须删除全部越界机制", task)
-
-    def test_ideator_rejects_reversed_shifted_correlation_orientation(self):
-        rejected = []
-        def transform(request, result):
-            if request["role"] == "ideator" and not rejected:
-                rejected.append(True)
-                result["candidates"] = [definition(
-                    "cross_rank(ts_corr(spot_log_return_1bar,ts_delay(perp_log_return_1bar,1),24))",
-                    meaning="现货当期收益与永续上一小时收益的相关表示现货对下一小时永续的领先")]
-                result["candidates"][0].update(
-                    name="spot_lead_perp_lag_corr",
-                    hypothesis="现货领先永续的强度可能预测未来收益",
-                )
-        with tempfile.TemporaryDirectory() as directory:
-            miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
-            result = miner.explore(input_panel(miner.spec))
-            self.assertEqual(result["completed_rounds"], 2)
-            failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
-            self.assertEqual(len(failures), 1)
-            self.assertIn("corr(current x, delay(y, n)) means y leads x", failures[0]["data"]["error"])
+            miner = FactorMiner(specification(), ScenarioModel(), Path(directory))
+            value = definition(
+                "mul(cross_rank(funding_24h_sum),cross_rank(open_interest_value))",
+                meaning="资金费率与当前未平仓名义价值的截面秩交互")
+            value.update(
+                name="funding_oi_value_interaction",
+                hypothesis="仅为统计条件关联，不据此陈述任何杠杆率、加杠杆或去杠杆、开平仓、多空方向或参与者身份",
+                change_reason="检验资金费率与OI交互")
+            response = {"candidates": [value], "dispositions": [], "analysis": "测试"}
+            definitions, _, _, _ = miner._check_ideation(response, {})
+            self.assertEqual(definitions, [value])
+            value["meaning"] = ""
+            definitions, _, _, _ = miner._check_ideation(response, {})
+            self.assertEqual(definitions[0]["meaning"], "")
+            report = narrative()
+            report["mechanism"] = "讨论OI变化与杠杆率的假设"
+            self.assertEqual(model_fields(report, REPORT_SCHEMA, []), report)
 
     def test_ideator_accepts_correct_shifted_correlation_orientation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1236,47 +1473,6 @@ class ResponseRecoveryTests(unittest.TestCase):
             definitions, _, _, _ = miner._check_ideation(
                 {"candidates": [value], "dispositions": [], "analysis": "测试时间对齐"}, {})
             self.assertEqual(definitions[0]["name"], "perp_lead_spot_lag_corr")
-
-    def test_ideator_rejects_misstated_maximum_lookback(self):
-        with tempfile.TemporaryDirectory() as directory:
-            miner = FactorMiner(specification(max_lookback_hours=168), ScenarioModel(), Path(directory))
-            expression = "cross_rank(ts_corr(perp_log_return_1bar,ts_delay(spot_log_return_1bar,1),24))"
-            value = definition(expression, meaning="24小时窗口与1小时滞后；最大回看24小时")
-            value.update(name="spot_lead_perp_lag_corr", hypothesis="现货领先永续的强度可能预测未来收益")
-            response = {"candidates": [value], "dispositions": [], "analysis": "测试回看口径"}
-            with self.assertRaisesRegex(ValueError, "claimed=\\[24\\], actual=25"):
-                miner._check_ideation(response, {})
-            value["meaning"] = "24小时窗口与1小时滞后；最大回看25小时"
-            definitions, _, _, _ = miner._check_ideation(response, {})
-            self.assertEqual(definitions[0]["meaning"], value["meaning"])
-
-            # Test precalculated feature lookback: funding_7d_sum accepts both 0 and 168 hours
-            funding_expr = "mul(cross_rank(basis_trade_spot), neg(cross_zscore(funding_7d_sum)))"
-            funding_val = definition(funding_expr, meaning="永续基差与7天资金费率状态；最大回看168小时")
-            funding_val.update(name="basis_funding_state", hypothesis="基差与7天资金费率交互可能预测未来收益")
-            res_funding = {"candidates": [funding_val], "dispositions": [], "analysis": "测试预计算特征回看"}
-            defs, _, _, _ = miner._check_ideation(res_funding, {})
-            self.assertEqual(defs[0]["name"], "basis_funding_state")
-
-            funding_val["meaning"] = "永续基差与7天资金费率状态；最大回看0小时"
-            defs, _, _, _ = miner._check_ideation(res_funding, {})
-            self.assertEqual(defs[0]["name"], "basis_funding_state")
-
-            funding_val["meaning"] = "永续基差与7天资金费率状态；最大回看50小时"
-            with self.assertRaisesRegex(ValueError, "claimed=\\[50\\], actual=0"):
-                miner._check_ideation(res_funding, {})
-
-    def test_evaluator_and_optimizer_prompts_do_not_invite_oi_denial_lists(self):
-        with tempfile.TemporaryDirectory() as directory:
-            model = ScenarioModel()
-            miner = FactorMiner(specification(), model, Path(directory))
-            miner.explore(input_panel(miner.spec))
-
-            tasks = {request["role"]: request["task"] for request in model.requests
-                     if request["role"] in {"evaluator", "optimizer"}}
-            for role in ("evaluator", "optimizer"):
-                self.assertIn("聚合OI数量/名义价值变化的统计条件关联", tasks[role])
-                self.assertIn("不列举被排除的解释，即便是否定句", tasks[role])
 
     def test_each_role_corrects_once_before_research_state_is_committed(self):
         mutations = {
@@ -1335,71 +1531,6 @@ class ResponseRecoveryTests(unittest.TestCase):
             self.assertEqual(miner.routes["window-route"]["attempts"], 1)
             self.assertEqual(len(miner.candidates), 3)
 
-    def test_optimizer_cannot_request_unsupported_residualization(self):
-        rejected = []
-        def transform(request, result):
-            if request["role"] == "optimizer" and result["proposals"] and not rejected:
-                rejected.append(True)
-                result["proposals"][0]["modification_task"]["change_target"] = "对候选做截面正交化"
-        with tempfile.TemporaryDirectory() as directory:
-            miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
-            result = miner.explore(input_panel(miner.spec))
-            self.assertEqual(result["completed_rounds"], 2)
-            failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
-            self.assertEqual(len(failures), 1)
-            self.assertIn("no regression/residualization operator", failures[0]["data"]["error"])
-
-    def test_optimizer_cannot_infer_leverage_change_from_open_interest(self):
-        rejected = []
-        def transform(request, result):
-            if request["role"] == "optimizer" and result["proposals"] and not rejected:
-                rejected.append(True)
-                result["proposals"][0]["modification_task"].update(
-                    modification_hypothesis="open_interest_base 上升说明大户加杠杆",
-                    change_target="用 OI 变化识别新杠杆头寸",
-                )
-        with tempfile.TemporaryDirectory() as directory:
-            miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
-            result = miner.explore(input_panel(miner.spec))
-            self.assertEqual(result["completed_rounds"], 2)
-            failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
-            self.assertEqual(len(failures), 1)
-            self.assertIn("does not identify leverage ratios", failures[0]["data"]["error"])
-
-    def test_ideator_cannot_label_fixed_arithmetic_as_residualization(self):
-        rejected = []
-        def transform(request, result):
-            if request["role"] == "ideator" and request["payload"]["pending_proposals"] and not rejected:
-                rejected.append(True)
-                result["candidates"][0]["name"] = "orthogonalized_price_deviation"
-                result["candidates"][0]["change_reason"] = "用固定系数的 rank 加减实现正交化"
-        with tempfile.TemporaryDirectory() as directory:
-            miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
-            result = miner.explore(input_panel(miner.spec))
-            self.assertEqual(result["completed_rounds"], 2)
-            failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
-            self.assertEqual(len(failures), 1)
-            self.assertIn("no regression/residualization operator", failures[0]["data"]["error"])
-
-    def test_evaluator_cannot_claim_unsupported_residualization_in_any_report_field(self):
-        for field in ("analysis", "mechanism", "conditions", "falsifiers", "limitations", "next_steps"):
-            rejected = []
-            def transform(request, result):
-                if request["role"] == "evaluator" and not rejected:
-                    rejected.append(True)
-                    claim = "对控制变量做正交化并报告残差 rank_ic"
-                    if isinstance(result[field], list):
-                        result[field].append(claim)
-                    else:
-                        result[field] += claim
-            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
-                miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
-                result = miner.explore(input_panel(miner.spec))
-                self.assertEqual(result["completed_rounds"], 2)
-                failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
-                self.assertEqual(len(failures), 1)
-                self.assertIn("no regression/residualization operator", failures[0]["data"]["error"])
-
     def test_evaluator_can_record_unavailable_residualization_as_a_limitation(self):
         noted = []
         def transform(request, result):
@@ -1413,34 +1544,6 @@ class ResponseRecoveryTests(unittest.TestCase):
             self.assertEqual(result["completed_rounds"], 2)
             failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
             self.assertEqual(failures, [])
-
-    def test_evaluator_cannot_infer_leverage_change_from_open_interest(self):
-        rejected = []
-        def transform(request, result):
-            if request["role"] == "evaluator" and not rejected:
-                rejected.append(True)
-                result["mechanism"] = "open_interest_base 上升说明大户继续加杠杆"
-        with tempfile.TemporaryDirectory() as directory:
-            miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
-            result = miner.explore(input_panel(miner.spec))
-            self.assertEqual(result["completed_rounds"], 2)
-            failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
-            self.assertEqual(len(failures), 1)
-            self.assertIn("does not identify leverage ratios", failures[0]["data"]["error"])
-
-    def test_evaluator_cannot_infer_position_building_from_open_interest(self):
-        rejected = []
-        def transform(request, result):
-            if request["role"] == "evaluator" and not rejected:
-                rejected.append(True)
-                result["mechanism"] = "open_interest_base 上升表示方向性头寸建立阶段"
-        with tempfile.TemporaryDirectory() as directory:
-            miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
-            result = miner.explore(input_panel(miner.spec))
-            self.assertEqual(result["completed_rounds"], 2)
-            failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
-            self.assertEqual(len(failures), 1)
-            self.assertIn("open/close and long/short position direction", failures[0]["data"]["error"])
 
     def test_truncated_and_fenced_json_are_corrected_without_accepting_invalid_output(self):
         good = dumps({"result": {"ok": True}, "read_records": []})
@@ -1470,14 +1573,13 @@ class ResponseRecoveryTests(unittest.TestCase):
                 last_messages = model.complete.call_args_list[-1].args[0]
                 self.assertEqual(json.loads(last_messages[-1]["content"])["requested_original_evidence"][0]["data"]["items"], [123])
 
-    def test_evidence_corruption_is_fatal_during_correction_or_read(self):
+    def test_malformed_saved_record_is_fatal_during_read(self):
         with tempfile.TemporaryDirectory() as directory:
             store = RecordStore(Path(directory) / "records")
             store.append("facts", "fact", {"value": 1})
             def corrupt(*args, **kwargs):
                 path = store.root / "facts.json"
-                record = json.loads(path.read_text()); record["data"]["value"] = 2
-                path.write_text(dumps(record))
+                path.write_text("{")
                 return ModelReply(dumps({"result": None, "read_records": [
                     {"record_id": "facts", "pointer": "", "offset": 0, "limit": 1}]}), {}, "fixture")
             model = Mock(); model.complete.side_effect = corrupt
@@ -1532,27 +1634,40 @@ class ResponseRecoveryTests(unittest.TestCase):
                 gateway.ask("ideator", "work", {}, {}, validate=lambda result: result["internal-invariant"])
             self.assertEqual(model.complete.call_count, 1)
 
-    def test_each_task_keeps_two_corrections_without_a_total_call_limit(self):
+    def test_each_task_can_continue_past_three_corrections(self):
         with tempfile.TemporaryDirectory() as directory:
-            model = Mock(); model.complete.return_value = ModelReply("invalid", {}, "fixture")
+            def answer(messages, *, max_output_tokens, session_id):
+                correction = json.loads(messages[-1]["content"]).get("correction", 0)
+                return ModelReply("invalid" if correction < 4 else dumps({"result": {}, "read_records": []}),
+                                  {}, "fixture")
+            model = Mock(); model.complete.side_effect = answer
             gateway = AgentGateway(model, specification(), RecordStore(Path(directory) / "records"), Path(directory) / "calls")
-            for task in range(12):
-                with self.assertRaises(ModelResponseError):
-                    gateway.ask("ideator", f"work {task}", {}, {})
-                self.assertEqual(model.complete.call_count, (task + 1) * 3)
-                self.assertFalse(gateway.store.all()[-1]["data"]["will_correct"])
-            self.assertEqual(model.complete.call_count, 36)
+            for task in range(2):
+                self.assertEqual(gateway.ask("ideator", f"work {task}", {}, {}), {})
+                self.assertEqual(model.complete.call_count, (task + 1) * 5)
 
     def test_failed_calculator_or_report_does_not_block_second_candidate(self):
         for role in ("calculator", "evaluator"):
             def transform(request, result):
                 if request["role"] == "ideator":
-                    result["candidates"] = [definition(f"div(perp_close,ts_mean(perp_close,{window}))") for window in (3, 2)]
-                if request["role"] == role and request["payload"]["candidate_id"] == "candidate-0001":
-                    result.pop("candidate_id" if role == "calculator" else "limitations")
+                    result["candidates"] = [
+                        definition("ts_mean(perp_close)" if role == "calculator"
+                                   else "div(perp_close,ts_mean(perp_close,3))"),
+                        definition("div(perp_close,ts_mean(perp_close,2))")]
+                if role == "calculator" and request["role"] == "calculator" and request["payload"]["candidate_id"] == "candidate-0001":
+                    result["repair_expression"] = "ts_mean(perp_close)"
             with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
                 miner = FactorMiner(specification(), ScenarioModel(transform, propose_once=False), Path(directory))
-                result = miner.explore(input_panel(miner.spec))
+                if role == "evaluator":
+                    original_interpret = miner._interpret
+                    def report_or_pending(cid, gateway):
+                        if cid == "candidate-0001":
+                            raise ContextBudgetError("report context exceeds budget")
+                        return original_interpret(cid, gateway)
+                    with patch.object(miner, "_interpret", side_effect=report_or_pending):
+                        result = miner.explore(input_panel(miner.spec))
+                else:
+                    result = miner.explore(input_panel(miner.spec))
                 self.assertIn("candidate-0002", result["evaluated_ids"])
                 self.assertTrue((miner.root / "a_records/candidate-0002-report.json").exists())
                 self.assertFalse((miner.root / "exploration-stopped.json").exists())
@@ -1560,24 +1675,22 @@ class ResponseRecoveryTests(unittest.TestCase):
                                  "pause" if role == "calculator" else "retain")
 
     def test_A_report_completion_does_not_recalculate_and_freeze_requires_report(self):
-        def bad_report(request, result):
-            if request["role"] == "evaluator": result.pop("limitations")
         with tempfile.TemporaryDirectory() as directory:
-            model = ScenarioModel(bad_report)
+            model = ScenarioModel()
             model.propose_once = False
             miner = FactorMiner(specification(), model, Path(directory))
-            done = miner.explore(input_panel(miner.spec))
+            with patch.object(miner, "_interpret", side_effect=ContextBudgetError("report context exceeds budget")):
+                done = miner.explore(input_panel(miner.spec))
             panel_b = input_panel(miner.spec, "B")
             with self.assertRaisesRegex(ValueError, "complete.*report"):
                 miner.freeze(done["retained_ids"], panel_b.universe)
-            before = {r["id"]: r["sha256"] for r in miner.store.all()}
-            model.transform = None
+            before = {r["id"]: r["data"] for r in miner.store.all()}
             restored = FactorMiner.open(miner.root, model)
             with patch("crypto_quant.research.factor_mining.workflow.evaluate_expression") as compute:
                 completed = restored.complete_reports("A", Path(directory) / "ideas")
             compute.assert_not_called()
             self.assertEqual(completed["status"], "complete")
-            after = {r["id"]: r["sha256"] for r in restored.store.all()}
+            after = {r["id"]: r["data"] for r in restored.store.all()}
             self.assertTrue(all(after[key] == value for key, value in before.items()))
             count = len(model.requests)
             restored.complete_reports("A", Path(directory) / "ideas")
@@ -1601,12 +1714,14 @@ class ResponseRecoveryTests(unittest.TestCase):
     def test_B_saves_all_numerical_decisions_and_completes_only_missing_report(self):
         with tempfile.TemporaryDirectory() as directory:
             miner, model, panel = self.prepare_B(directory)
-            def bad_first(request, result):
-                if request["role"] == "evaluator" and request["payload"]["candidate_id"] == "candidate-0001":
-                    result.pop("limitations")
-            model.transform = bad_first
+            original_interpret = miner._interpret
+            def report_or_pending(cid, gateway):
+                if cid == "candidate-0001":
+                    raise ContextBudgetError("report context exceeds budget")
+                return original_interpret(cid, gateway)
             loader = Mock(return_value=panel)
-            result = miner.validate(loader, Path(directory) / "ideas")
+            with patch.object(miner, "_interpret", side_effect=report_or_pending):
+                result = miner.validate(loader, Path(directory) / "ideas")
             self.assertEqual(result["status"], "reports_pending")
             self.assertEqual(result["pending_report_ids"], ["candidate-0001"])
             self.assertEqual(len(list((miner.root / "b_records").glob("*-validation.json"))), 2)
@@ -1614,7 +1729,6 @@ class ResponseRecoveryTests(unittest.TestCase):
             self.assertFalse((miner.root / "validation.json").exists())
             checkpoint = (miner.root / "b-numerical-complete.json").read_bytes()
             before = {p.name: p.read_bytes() for p in (miner.root / "b_records").glob("*.json")}
-            model.transform = None
             restored = FactorMiner.open(miner.root, model)
             call_count = len(model.requests)
             with patch("crypto_quant.research.factor_mining.workflow.evaluate_expression") as compute, patch(
@@ -1647,36 +1761,29 @@ class ResponseRecoveryTests(unittest.TestCase):
             self.assertEqual(miner.complete_reports("B", Path(directory) / "ideas")["status"], "complete")
             loader.assert_called_once_with()
 
-    def test_B_completion_refuses_changed_numerical_evidence_and_incomplete_batch(self):
-        for change in ("record", "checkpoint", "incomplete"):
-            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
-                miner, model, panel = self.prepare_B(directory)
-                if change == "incomplete":
-                    with self.assertRaisesRegex(ValueError, "numerical validation"):
-                        miner.complete_reports("B", Path(directory) / "ideas")
-                    continue
-                miner.validate(lambda: panel, Path(directory) / "ideas")
-                if change == "record":
-                    path = miner.root / "b_records/candidate-0001-validation.json"
-                    value = json.loads(path.read_text())
-                    value["data"]["eligible_for_idea_pool"] = True
-                    value["sha256"] = digest(value["data"])  # Even a rehashed edit violates the numerical checkpoint.
-                else:
-                    path = miner.root / "b-numerical-complete.json"
-                    value = json.loads(path.read_text()); value["b_records"] = {}
-                path.write_text(dumps(value))
-                calls = len(model.requests)
-                with self.assertRaisesRegex(ValueError, "changed"):
-                    miner.complete_reports("B", Path(directory) / "ideas")
-                self.assertEqual(len(model.requests), calls)
+    def test_B_completion_requires_checkpoint_and_rechecks_program_decision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            miner, model, panel = self.prepare_B(directory)
+            with self.assertRaisesRegex(ValueError, "numerical validation"):
+                miner.complete_reports("B", Path(directory) / "ideas")
+            miner.validate(lambda: panel, Path(directory) / "ideas")
+            checkpoint = miner.root / "b-numerical-complete.json"
+            value = json.loads(checkpoint.read_text()); value["b_records"] = {}
+            checkpoint.write_text(dumps(value))
+            self.assertEqual(miner.complete_reports("B", Path(directory) / "ideas")["status"], "complete")
+            path = miner.root / "b_records/candidate-0001-validation.json"
+            value = json.loads(path.read_text()); value["data"]["eligible_for_idea_pool"] = True
+            path.write_text(dumps(value))
+            calls = len(model.requests)
+            with self.assertRaisesRegex(ValueError, "B program decision differs"):
+                miner.complete_reports("B", Path(directory) / "ideas")
+            self.assertEqual(len(model.requests), calls)
 
     def test_report_completion_can_continue_after_many_prior_calls(self):
         with tempfile.TemporaryDirectory() as directory:
             miner, model, panel = self.prepare_B(directory)
-            def bad(request, result):
-                if request["role"] == "evaluator": result.pop("limitations")
-            model.transform = bad
-            pending = miner.validate(lambda: panel, Path(directory) / "ideas")
+            with patch.object(miner, "_interpret", side_effect=ContextBudgetError("report context exceeds budget")):
+                pending = miner.validate(lambda: panel, Path(directory) / "ideas")
             self.assertEqual(pending["status"], "reports_pending")
             previous = Mock()
             previous.complete.return_value = ModelReply('{"result":{},"read_records":[]}', {}, "fixture")
@@ -1685,7 +1792,6 @@ class ResponseRecoveryTests(unittest.TestCase):
             for _ in range(35):
                 gateway.ask("evaluator", "prior call fixture", {}, {})
             before = len(model.requests)
-            model.transform = None
             result = miner.complete_reports("B", Path(directory) / "ideas")
             self.assertEqual(result["status"], "complete")
             self.assertEqual(len(model.requests), before + 2)
@@ -1696,7 +1802,7 @@ class ResponseRecoveryTests(unittest.TestCase):
         from crypto_quant.research.factor_mining.cli import add_arguments, execute
         parser = argparse.ArgumentParser(); add_arguments(parser)
         args = parser.parse_args(["complete-reports", "--run-dir", "saved-run", "--stage", "B",
-                                  "--model", "fixture"])
+                                  "--provider", "codex", "--model", "fixture"])
         with patch("crypto_quant.research.factor_mining.cli.FactorMiner.open") as opened, patch(
                 "crypto_quant.research.factor_mining.cli.load_stage") as loader:
             execute(args)
