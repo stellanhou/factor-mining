@@ -7,8 +7,8 @@ cannot repair a formula or send feedback into the exploration loop.
 from __future__ import annotations
 
 import ast
-import hashlib
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -23,20 +23,18 @@ from .agent_calculator import CalculatorRole
 from .agent_evaluator import EvaluatorRole
 from .agent_ideator import IdeatorRole
 from .agent_optimizer import OptimizerRole
-from .contracts import ResearchSpec, digest, require
+from .contracts import ResearchSpec, dumps, require, without_hash_metadata
 from .evaluation import build_labels, compare_experiment, correct_batch, evaluate_factor, evaluate_horizon_comparison
+from .factor_archive import EvaluationKey, FactorArchive, FactorIdentity
 from .model import JsonModel
-from .records import AgentGateway, RecordStore, write_json
+from .records import AgentGateway, RecordStore, load_record_reference, record_reference, write_json
 from .runtime import GRAPH_CONFIG
 from langgraph.graph import StateGraph, START, END
 from .reporting import write_group_plot, write_research_report
 
 
-def _panel_fingerprint(panel: FactorInputPanel) -> dict[str, Any]:
-    values = pd.util.hash_pandas_object(panel.values, index=True).to_numpy().tobytes()
-    members = pd.util.hash_pandas_object(panel.universe, index=True).to_numpy().tobytes()
-    return {"values_sha256": hashlib.sha256(values).hexdigest(), "membership_sha256": hashlib.sha256(members).hexdigest(),
-            "columns": list(panel.values.columns), "rows": len(panel.values),
+def _panel_metadata(panel: FactorInputPanel) -> dict[str, Any]:
+    return {"columns": list(panel.values.columns), "rows": len(panel.values),
             "dtypes": {k: str(v) for k, v in panel.values.dtypes.items()}}
 
 
@@ -56,7 +54,6 @@ PLAN3_TRACKS = {
     "stability": (0.3, 0.60),
     "balanced": (1.0, 0.50),
 }
-TRACK_LABELS = {"payout": "赔率轨", "stability": "胜率轨", "balanced": "均衡轨"}
 TAG_LABELS = {"payout": "赔率型", "stability": "稳定型", "balanced": "均衡型"}
 
 
@@ -73,32 +70,57 @@ def b_admission_reasons(report: dict[str, Any], tests: list[dict[str, Any]],
     spread = summary["directional_spread"]["mean"]
     share = summary["positive_stage_share"]
     tracks = []
-    if spec.admission_scheme == "plan3":
-        if (not reasons or not spec.plan3_tracks_gate) and spread is not None and share is not None:
-            spread_bp = spread * 10_000
-            tracks = [name for name, (min_spread, min_share) in PLAN3_TRACKS.items()
-                      if spread_bp >= min_spread and share >= min_share]
-        if spec.plan3_tracks_gate and not tracks:
-            reasons.append("no Plan 3 track meets spread and stage-share thresholds")
-        if not spec.plan3_tracks_gate and (spread is None or spread <= 0):
-            reasons.append("directional spread must be positive")
-    else:
-        if spread is None or spread < spec.min_directional_spread:
-            reasons.append("directional return spread is below the predeclared minimum")
-        if (
-            summary["valid_stages"] is None or summary["valid_stages"] < 2
-            or share is None or share < spec.min_stage_share
-        ):
-            reasons.append("stage repetition is insufficient")
+    if spread is None or spread <= 0:
+        reasons.append("directional spread must be positive")
+    if spread is not None and share is not None:
+        spread_bp = spread * 10_000
+        tracks = [name for name, (min_spread, min_share) in PLAN3_TRACKS.items()
+                  if spread_bp >= min_spread and share >= min_share]
     return reasons, tracks
+
+
+def b_candidate_decision(candidate_id: str, report: dict[str, Any], correction: dict[str, Any],
+                         spec: ResearchSpec) -> dict[str, Any]:
+    candidate_tests = [test for test in correction["tests"]
+                       if test["candidate_id"] == candidate_id]
+    horizon_results = {}
+    passed_horizons, tracks = [], set()
+    for horizon in report["retained_horizons"]:
+        horizon_report = report["horizons"][str(horizon)]
+        horizon_tests = [test for test in candidate_tests if test["horizon_hours"] == horizon]
+        reasons, horizon_tracks = b_admission_reasons(horizon_report, horizon_tests, spec)
+        status = "not_passed" if reasons else "passed"
+        horizon_results[str(horizon)] = {"validation_status": status, "reasons": reasons,
+                                         "tests": horizon_tests, "tracks": horizon_tracks}
+        if status == "passed":
+            passed_horizons.append(horizon)
+            tracks.update(horizon_tracks)
+    retained_horizons = report["retained_horizons"]
+    matched_horizons = [horizon for horizon in retained_horizons if horizon in passed_horizons]
+    reasons = [] if matched_horizons else [
+        "B-passed horizons do not intersect the A-retained horizons"]
+    validation_status = "passed" if matched_horizons else "not_passed"
+    if spec.purpose != "research":
+        reasons.append("engineering checks cannot enter the idea pool")
+    return {"validation_status": validation_status, "decision_source": "program",
+            "eligible_for_idea_pool": not reasons, "reasons": reasons,
+            "tests": candidate_tests, "admission_scheme": spec.admission_scheme,
+            "tracks": [name for name in PLAN3_TRACKS if name in tracks],
+            "retained_horizons": retained_horizons,
+            "passed_horizons": passed_horizons, "horizon_results": horizon_results}
 
 
 class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
     def __init__(self, spec: ResearchSpec, model: JsonModel, output_root: Path):
         self.spec, self.model = spec, model
-        self.root = Path(output_root) / spec.run_id
+        output_root = Path(output_root).resolve()
+        self.root = output_root / spec.run_id
         self.root.mkdir(parents=True, exist_ok=False)
         write_json(self.root / "contract.json", spec.as_dict())
+        archive_root = RecordStore._expected_archive_root(self.root.resolve())
+        marker = {"format": "one-factor-one-file-v2",
+                  "archive_root": os.path.relpath(archive_root, self.root.resolve())}
+        write_json(self.root / "factor_archive.json", marker)
         self._attach()
 
     @classmethod
@@ -110,14 +132,75 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
         return self
 
     def _attach(self) -> None:
+        resolved_root = self.root.resolve()
+        self.archive_root = RecordStore._marked_archive_root(resolved_root)
+        require(self.archive_root is not None, "FM-v6 requires a current factor archive marker")
         self.progress = ProgressLog.for_run(self.root)
-        self.store = RecordStore(self.root / "a_records")
+        self.store = RecordStore(self.root / "a_records", run_root=resolved_root,
+                                 archive_root=self.archive_root)
         self.gateway = AgentGateway(self.model, self.spec, self.store, self.root / "model_calls",
                                     progress=self.progress)
         self.candidates: dict[str, dict[str, Any]] = {}
         self.routes: dict[str, dict[str, Any]] = {}
         self.proposals: dict[str, dict[str, Any]] = {}
         self.decisions: dict[str, dict[str, Any]] = {}
+
+    def _factor_identity(self, expression: str, direction: Any) -> FactorIdentity:
+        return FactorIdentity(expression, str(direction), "expr-v1")
+
+    def _evaluation_key(self, stage: str, horizon_hours: int) -> EvaluationKey:
+        return EvaluationKey(f"{self.spec.run_id}/{stage}", dumps(self.spec.as_dict()),
+                             "factor-eval-v1", stage, f"{horizon_hours}h")
+
+    def _write_evaluation(self, candidate_id: str, stage: str,
+                          report: dict[str, Any], identity: FactorIdentity,
+                          value_set_id: str | None = None,
+                          factor_value_count: int = 0,
+                          definition: dict[str, Any] | None = None) -> dict[str, Any]:
+        key = self._evaluation_key(stage, int(report["horizon_hours"]))
+        archive = FactorArchive.open_for(self.archive_root, identity)
+        result = archive.append_evaluation(
+            key, report, value_set_id=value_set_id,
+            provenance={"run_id": self.spec.run_id, "candidate_id": candidate_id,
+                        "segment": stage, "definition": definition,
+                        "expanded_expression": identity.expanded_expression,
+                        "direction": identity.direction})
+        return {"root": os.path.relpath(self.archive_root.resolve(), self.root.resolve()),
+                "identity": identity.as_dict(), "evaluation_key": key.as_dict(),
+                "evaluation_id": result["evaluation_id"], "value_set_id": result["value_set_id"],
+                "factor_value_count": factor_value_count}
+
+    @staticmethod
+    def _evaluation_record_data(candidate_id: str, report: dict[str, Any],
+                                locator: dict[str, Any]) -> dict[str, Any]:
+        return {"candidate_id": candidate_id, "segment": report["segment"],
+                "direction": report["direction"], "horizon_hours": report["horizon_hours"],
+                "summary": report["summary"], "coverage": report["coverage"],
+                "factor_archive": locator}
+
+    @staticmethod
+    def _multi_horizon_evaluation_record_data(
+            candidate_id: str, reports: dict[int, dict[str, Any]],
+            locators: dict[int, dict[str, Any]], retained_horizons: list[int]) -> dict[str, Any]:
+        require(bool(reports) and set(reports) == set(locators),
+                "each B horizon report requires one archive locator")
+        require(bool(retained_horizons) and all(type(horizon) is int for horizon in retained_horizons)
+                and len(retained_horizons) == len(set(retained_horizons))
+                and set(reports) == set(retained_horizons),
+                "B reports and archive locators must match the frozen horizon set")
+        first = reports[retained_horizons[0]]
+        require(all(report["segment"] == first["segment"] == "B"
+                    and report["direction"] == first["direction"]
+                    and report["horizon_hours"] == horizon
+                    and locators[horizon]["evaluation_key"]["horizon"] == f"{horizon}h"
+                    for horizon, report in reports.items()),
+                "B horizon reports must share a segment and frozen direction")
+        return {"candidate_id": candidate_id, "segment": "B", "direction": first["direction"],
+                "retained_horizons": list(retained_horizons),
+                "horizons": {str(horizon): {"summary": reports[horizon]["summary"],
+                                             "coverage": reports[horizon]["coverage"],
+                                             "factor_archive": locators[horizon]}
+                             for horizon in retained_horizons}}
 
     def _validate_panel(self, panel: FactorInputPanel, stage: str) -> None:
         validate_panel(panel, self.spec, stage)
@@ -143,7 +226,7 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
         catalog = panel.ideation_context()
         catalog["formula_rule"] = ("程序只检查允许的字段、算子、参数、复杂度和数据时间边界，"
                                    "不根据量纲拒绝公式；研究解释应说明跨币比较的经济含义。")
-        self.store.append("inputs", "data_provenance", {"fingerprint": _panel_fingerprint(panel), "catalog": catalog})
+        self.store.append("inputs", "data_provenance", {"panel": _panel_metadata(panel), "catalog": catalog})
         if goal_context is not None:
             self.store.append("goal-context", "goal_context", goal_context)
         return self._run_exploration(panel)
@@ -241,10 +324,18 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                     values, labels_by_horizon, self.spec, definition["direction"])
             item["evaluation"] = report
             if f"{cid}-evaluation" not in saved:
-                self.store.append(f"{cid}-evaluation", "evaluation", {"candidate_id": cid, **report})
-            plot = self.root / "plots" / f"{cid}-A.svg"
-            if not plot.exists():
-                write_group_plot(plot, report)
+                expression = item["calculation"]["executed_expression"]["expanded_expression"]
+                identity = self._factor_identity(expression, definition["direction"])
+                values_artifact = item["calculation"]["values_artifact"]
+                locator = self._write_evaluation(
+                    cid, "A", report, identity, value_set_id=values_artifact["value_set_id"],
+                    factor_value_count=values_artifact["rows"], definition=definition)
+                self.store.append(f"{cid}-evaluation", "evaluation",
+                                  self._evaluation_record_data(cid, report, locator))
+            for horizon, horizon_report in report["horizon_comparison"]["horizons"].items():
+                plot = self.root / "plots" / f"{cid}-A-{horizon}h.svg"
+                if not plot.exists():
+                    write_group_plot(plot, horizon_report)
             if item["experiment"]:
                 if f"{cid}-comparison" in saved:
                     item["comparison"] = saved[f"{cid}-comparison"]
@@ -367,15 +458,40 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                     "only explicitly retained candidates can be frozen for B")
             item = self.candidates[cid]
             require("model_report" in item, "complete the retained candidate report before freezing B")
-            definitions[cid] = {"definition": item["definition"], "executed": item["calculation"]["executed_expression"],
-                                "calculation_sha256": digest(item["calculation"]), "a_evaluation": item["evaluation"],
+            evaluation = self.store._load(self.store.root / f"{cid}-evaluation.json")
+            require(evaluation["data"] == {"candidate_id": cid, **item["evaluation"]},
+                    "saved A evaluation differs from the frozen candidate")
+            retained_horizons = self.decisions[cid]["retained_horizons"]
+            require(isinstance(retained_horizons, list) and bool(retained_horizons)
+                    and all(type(horizon) is int for horizon in retained_horizons)
+                    and len(retained_horizons) == len(set(retained_horizons))
+                    and set(retained_horizons) <= set(self.spec.b_horizons),
+                    "A retained horizons must be a nonempty unique subset of the B contract")
+            a_horizons = evaluation["data"]["horizon_comparison"]["horizons"]
+            require(set(a_horizons) == {str(horizon) for horizon in self.spec.b_horizons},
+                    "complete A horizon comparison evidence before freezing B")
+            a_horizon_evidence = {}
+            for horizon in retained_horizons:
+                report = a_horizons[str(horizon)]
+                require(report["horizon_hours"] == horizon and
+                        {"summary", "coverage", "periods", "stages", "per_symbol"} <= report.keys(),
+                        "retained A horizon evidence is incomplete")
+                fields = ("horizon_hours", "label", "direction", "summary", "coverage",
+                          "sample_hours", "grouping")
+                a_horizon_evidence[str(horizon)] = {field: report[field] for field in fields}
+            definitions[cid] = {"definition": item["definition"],
+                                "executed": item["calculation"]["executed_expression"],
+                                "a_evaluation_ref": record_reference(evaluation),
+                                "a_evaluation_archive": evaluation["data"]["factor_archive"],
+                                "a_evaluation_summary": {"summary": evaluation["data"]["summary"],
+                                                          "coverage": evaluation["data"]["coverage"]},
+                                "retained_horizons": retained_horizons,
+                                "a_horizon_evidence": a_horizon_evidence,
                                 "a_model_report": item["model_report"], "a_decision": self.decisions[cid]}
         frozen = {"contract": self.spec.as_dict(), "candidates": definitions,
-                  "a_records": {r["id"]: r["sha256"] for r in self.store.all()},
                   "frozen_at": datetime.now(timezone.utc).isoformat()}
-        frozen["sha256"] = digest(frozen)
         write_json(self.root / "frozen_batch.json", frozen)
-        return {"candidate_ids": candidate_ids, "sha256": frozen["sha256"]}
+        return {"candidate_ids": candidate_ids}
 
     def validate(self, load_panel: Callable[[], FactorInputPanel], idea_pool: Path) -> dict[str, Any]:
         already_accessed = (self.root / "b-access-started.json").exists()
@@ -387,18 +503,72 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                            "B_status": "access was attempted; inspect existing evidence before any subsequent research"})
             raise
 
-    def _checked_frozen(self) -> tuple[dict[str, Any], str]:
+    def _checked_frozen(self) -> dict[str, Any]:
         frozen = json.loads((self.root / "frozen_batch.json").read_text())
-        expected_hash = frozen.pop("sha256")
         require(frozen["contract"] == json.loads((self.root / "contract.json").read_text()), "research contract changed")
         require(frozen["contract"] == self.spec.as_dict(), "loaded research contract changed")
-        return frozen, expected_hash
+        self._load_candidates()
+        for cid, item in frozen["candidates"].items():
+            require(cid in self.candidates and "calculation" in self.candidates[cid],
+                    "frozen candidate is missing its saved A calculation")
+            candidate = self.candidates[cid]
+            require(item["definition"] == candidate["definition"],
+                    "frozen candidate definition differs from its A record")
+            require(item["executed"] == candidate["calculation"]["executed_expression"],
+                    "frozen formula differs from its A calculation")
+            require(item["a_model_report"] == candidate.get("model_report"),
+                    "frozen A report differs from its A record")
+            require(item["a_decision"] == self.decisions.get(cid),
+                    "frozen A decision differs from its A record")
+            retained_horizons = item["retained_horizons"]
+            require(retained_horizons == item["a_decision"]["retained_horizons"]
+                    and isinstance(retained_horizons, list) and bool(retained_horizons)
+                    and all(type(horizon) is int for horizon in retained_horizons)
+                    and len(retained_horizons) == len(set(retained_horizons))
+                    and set(retained_horizons) <= set(self.spec.b_horizons),
+                    "frozen horizons differ from the A decision or B contract")
+            require("a_evaluation_ref" in item and item.get("a_evaluation_archive") is not None,
+                    "FM-v6 frozen batches require A archive references")
+            record = load_record_reference(self.store.root, item["a_evaluation_ref"])
+            require(record["id"] == f"{cid}-evaluation" and record["data"]["candidate_id"] == cid,
+                    "frozen A evaluation reference differs from candidate")
+            locator = item["a_evaluation_archive"]
+            identity = locator["identity"]
+            key = locator["evaluation_key"]
+            require(identity["expanded_expression"] == item["executed"]["expanded_expression"]
+                    and identity["direction"] == str(item["definition"]["direction"]),
+                    "frozen factor identity differs from its formula")
+            require(identity == self._factor_identity(
+                item["executed"]["expanded_expression"], item["definition"]["direction"]).as_dict()
+                    and key == self._evaluation_key("A", 24).as_dict(),
+                    "frozen A evaluation version differs from its run")
+            require(record["data"]["factor_archive"] == locator,
+                    "frozen A archive IDs differ from the saved evaluation")
+            require({"summary": record["data"]["summary"], "coverage": record["data"]["coverage"]}
+                    == item["a_evaluation_summary"],
+                    "frozen A summary differs from the saved evaluation")
+            a_horizons = record["data"]["horizon_comparison"]["horizons"]
+            require(set(a_horizons) == {str(horizon) for horizon in self.spec.b_horizons}
+                    and set(item["a_horizon_evidence"]) == {str(horizon) for horizon in retained_horizons},
+                    "frozen A horizon evidence is incomplete or changed")
+            for horizon in retained_horizons:
+                report = a_horizons[str(horizon)]
+                fields = ("horizon_hours", "label", "direction", "summary", "coverage",
+                          "sample_hours", "grouping")
+                snapshot = {field: report[field] for field in fields}
+                require(snapshot == item["a_horizon_evidence"][str(horizon)]
+                        and report["horizon_hours"] == horizon
+                        and {"summary", "coverage", "periods", "stages", "per_symbol"} <= report.keys(),
+                        "frozen A horizon evidence differs from the archived report")
+        return frozen
 
     def _validate_once(self, load_panel: Callable[[], FactorInputPanel], idea_pool: Path) -> dict[str, Any]:
-        frozen, expected_hash = self._checked_frozen()
+        frozen = self._checked_frozen()
         # This marker is committed before even invoking the B data loader.
-        write_json(self.root / "b-access-started.json", {"frozen_sha256": expected_hash,
-                   "time": datetime.now(timezone.utc).isoformat(), "use": "fixed_batch_validation"})
+        access_marker = {"candidate_ids": list(frozen["candidates"]),
+                         "time": datetime.now(timezone.utc).isoformat(),
+                         "use": "fixed_batch_validation"}
+        write_json(self.root / "b-access-started.json", access_marker)
         panel = load_panel()
         self._validate_panel(panel, "B")
         frozen_membership = self.root / "B-membership-frozen.csv"
@@ -407,33 +577,47 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                     "B membership changed after the batch was frozen")
         with (self.root / "B-universe.csv").open("x") as handle:
             panel.universe.rename("eligible").to_csv(handle)
-        labels = build_labels(panel, self.spec, "B")
-        store = RecordStore(self.root / "b_records")
-        store.append("inputs", "data_provenance", {"fingerprint": _panel_fingerprint(panel), "catalog": panel.ideation_context()})
+        requested_horizons = {horizon for item in frozen["candidates"].values()
+                              for horizon in item["retained_horizons"]}
+        labels_by_horizon = {horizon: build_labels(
+            panel, self.spec, "B", horizon_hours=horizon) for horizon in sorted(requested_horizons)}
+        store = RecordStore(self.root / "b_records", run_root=self.root.resolve(),
+                            archive_root=self.archive_root)
+        store.append("inputs", "data_provenance", {
+            "panel": _panel_metadata(panel), "catalog": panel.ideation_context()})
         reports = {}
         for cid, item in frozen["candidates"].items():
             store.append(f"{cid}-frozen", "frozen_definition_and_A_evidence", item)
             result = evaluate_expression(item["executed"]["expression"], panel)
-            expected = {key: value for key, value in item["executed"].items() if key != "unit"}
-            require(result.definition == expected, "B execution differs from frozen formula")
-            reports[cid] = evaluate_factor(result.values, labels, self.spec, "B", item["definition"]["direction"])
-            store.append(f"{cid}-evaluation", "evaluation", {"candidate_id": cid, **reports[cid]})
-            write_group_plot(self.root / "plots" / f"{cid}-B.svg", reports[cid])
+            require(result.definition == item["executed"], "B execution differs from frozen formula")
+            identity = self._factor_identity(result.definition["expanded_expression"],
+                                             item["definition"]["direction"])
+            horizon_reports, locators = {}, {}
+            for horizon in item["retained_horizons"]:
+                horizon_report = evaluate_factor(
+                    result.values, labels_by_horizon[horizon], self.spec, "B",
+                    item["definition"]["direction"], horizon_hours=horizon)
+                horizon_reports[horizon] = horizon_report
+                locators[horizon] = self._write_evaluation(
+                    cid, "B", horizon_report, identity, definition=item["definition"])
+                write_group_plot(self.root / "plots" / f"{cid}-B-{horizon}h.svg", horizon_report)
+            reports[cid] = {"segment": "B", "direction": item["definition"]["direction"],
+                            "retained_horizons": list(item["retained_horizons"]),
+                            "horizons": {str(horizon): horizon_reports[horizon]
+                                         for horizon in item["retained_horizons"]}}
+            store.append(f"{cid}-evaluation", "evaluation",
+                         self._multi_horizon_evaluation_record_data(
+                             cid, horizon_reports, locators, item["retained_horizons"]))
         correction = correct_batch(reports, self.spec)
         store.append("batch-correction", "multiple_testing", correction)
         decisions = {}
         for cid, report in reports.items():
-            tests = [t for t in correction["tests"] if t["candidate_id"] == cid]
-            reasons, tracks = b_admission_reasons(report, tests, self.spec)
-            validation_status = "not_passed" if reasons else "passed"
-            if self.spec.purpose != "research":
-                reasons.append("engineering checks cannot enter the idea pool")
-            decisions[cid] = {"validation_status": validation_status, "decision_source": "program",
-                              "eligible_for_idea_pool": not reasons, "reasons": reasons, "tests": tests,
-                              "admission_scheme": self.spec.admission_scheme, "tracks": tracks}
+            decisions[cid] = b_candidate_decision(cid, report, correction, self.spec)
             store.append(f"{cid}-validation", "validation_result", {"candidate_id": cid, **decisions[cid]})
-        checkpoint = {"frozen_sha256": expected_hash, "b_records": {r["id"]: r["sha256"] for r in store.all()}}
-        write_json(self.root / "b-numerical-complete.json", {**checkpoint, "sha256": digest(checkpoint)})
+        checkpoint = {"candidate_ids": list(reports),
+                      "retained_horizons": {cid: report["retained_horizons"]
+                                            for cid, report in reports.items()}}
+        write_json(self.root / "b-numerical-complete.json", checkpoint)
         return self._complete_b_reports(idea_pool)
 
     def complete_reports(self, stage: str, idea_pool: Path) -> dict[str, Any]:
@@ -459,32 +643,51 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                 "exploration_complete": (self.root / "a-complete.json").exists()}
 
     def _complete_b_reports(self, idea_pool: Path) -> dict[str, Any]:
-        frozen, expected_hash = self._checked_frozen()
+        frozen = self._checked_frozen()
         require((self.root / "b-numerical-complete.json").exists(), "complete B numerical validation before completing reports")
         require((self.root / "b-access-started.json").exists(), "B access marker is missing")
-        store = RecordStore(self.root / "b_records")
+        store = RecordStore(self.root / "b_records", run_root=self.root.resolve(),
+                            archive_root=self.archive_root)
         records = store.all()
-        reports = {r["data"]["candidate_id"]: r["data"] for r in records if r["kind"] == "evaluation"}
-        decisions = {r["data"]["candidate_id"]: {k: v for k, v in r["data"].items() if k != "candidate_id"}
-                     for r in records if r["kind"] == "validation_result"}
+        evaluation_records = [record for record in records if record["kind"] == "evaluation"]
+        validation_records = [record for record in records if record["kind"] == "validation_result"]
+        correction_records = [record for record in records if record["kind"] == "multiple_testing"]
+        require(len(evaluation_records) == len(validation_records) == len(frozen["candidates"])
+                and len(correction_records) == 1, "B numerical records are incomplete or repeated")
+        reports = {record["data"]["candidate_id"]: {
+            key: value for key, value in record["data"].items() if key != "candidate_id"}
+            for record in evaluation_records}
+        decisions = {record["data"]["candidate_id"]: {
+            key: value for key, value in record["data"].items() if key != "candidate_id"}
+            for record in validation_records}
         require(set(reports) == set(decisions) == set(frozen["candidates"]), "B numerical batch is incomplete")
-        correction = next(r["data"] for r in records if r["kind"] == "multiple_testing")
-        family = correction["family"]
-        if family == "one two-sided Rank IC mean test per frozen candidate, including unavailable tests":
-            require(correction == correct_batch(reports, self.spec), "B batch correction differs from saved evaluations")
-            for cid, report in reports.items():
-                tests = [test for test in correction["tests"] if test["candidate_id"] == cid]
-                reasons, tracks = b_admission_reasons(report, tests, self.spec)
-                status = "not_passed" if reasons else "passed"
-                if self.spec.purpose != "research":
-                    reasons.append("engineering checks cannot enter the idea pool")
-                expected = {"validation_status": status, "decision_source": "program",
-                            "eligible_for_idea_pool": not reasons, "reasons": reasons, "tests": tests,
-                            "admission_scheme": self.spec.admission_scheme, "tracks": tracks}
-                require(decisions[cid] == expected, "B program decision differs from saved evaluation")
-        else:
-            require(family == "two primary two-sided mean tests per frozen candidate, including unavailable tests",
-                    "unknown B correction family")
+        expected_checkpoint = {"candidate_ids": list(frozen["candidates"]),
+                               "retained_horizons": {cid: item["retained_horizons"]
+                                                     for cid, item in frozen["candidates"].items()}}
+        require(json.loads((self.root / "b-numerical-complete.json").read_text()) == expected_checkpoint,
+                "B numerical checkpoint differs from the frozen batch")
+        for cid, report in reports.items():
+            require(report["segment"] == "B"
+                    and report["direction"] == frozen["candidates"][cid]["definition"]["direction"]
+                    and report["retained_horizons"] == frozen["candidates"][cid]["retained_horizons"]
+                    and set(report["horizons"]) == {str(horizon) for horizon in report["retained_horizons"]},
+                    "B evaluation horizons differ from the frozen batch")
+            identity = self._factor_identity(
+                frozen["candidates"][cid]["executed"]["expanded_expression"], report["direction"]).as_dict()
+            for horizon in report["retained_horizons"]:
+                horizon_report = report["horizons"][str(horizon)]
+                locator = horizon_report["factor_archive"]
+                require(horizon_report["segment"] == "B"
+                        and horizon_report["direction"] == frozen["candidates"][cid]["definition"]["direction"]
+                        and horizon_report["horizon_hours"] == horizon
+                        and locator["identity"] == identity
+                        and locator["evaluation_key"] == self._evaluation_key("B", horizon).as_dict(),
+                        "B archive identity differs from its frozen formula, direction or horizon")
+        correction = correction_records[0]["data"]
+        require(correction == correct_batch(reports, self.spec), "B batch correction differs from saved evaluations")
+        for cid, report in reports.items():
+            expected = b_candidate_decision(cid, report, correction, self.spec)
+            require(decisions[cid] == expected, "B program decision differs from saved evaluation")
         completed_path = self.root / "validation.json"
         if completed_path.exists():
             completed = json.loads(completed_path.read_text())
@@ -505,14 +708,16 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
             if decision["eligible_for_idea_pool"] and cid in narratives:
                 narrative = narratives[cid]
                 card = self._idea_card(cid, frozen["candidates"][cid], reports[cid], narrative["data"], decision,
-                                       expected_hash, narrative["created_at"])
+                                       narrative["created_at"])
                 path = Path(idea_pool) / f"{self.spec.run_id}--{cid}.json"
                 if path.exists():
-                    require(json.loads(path.read_text()) == card, "existing idea card differs from saved research evidence")
+                    existing_card = json.loads(path.read_text())
+                    require(without_hash_metadata(existing_card) == without_hash_metadata(card),
+                            "existing idea card differs from saved research evidence")
                 else:
                     write_json(path, card)
                 decision["idea_card"] = str(path)
-        output = {"frozen_sha256": expected_hash, "batch_correction": correction, "decisions": decisions,
+        output = {"batch_correction": correction, "decisions": decisions,
                   "status": "reports_pending" if pending else "complete", "pending_report_ids": pending,
                   "B_use": "used for fixed-candidate selection; not untouched data for subsequent strategy development",
                   "C_use": "reserved; never loaded by factor mining"}
@@ -520,22 +725,33 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
         if not pending:
             path = self.root / "validation.json"
             if path.exists():
-                require(json.loads(path.read_text()) == output, "completed validation differs from saved evidence")
+                prior = json.loads(path.read_text())
+                require(prior == output, "completed validation differs from saved evidence")
             else:
                 write_json(path, output)
         return output
 
     def _idea_card(self, cid: str, item: dict[str, Any], report: dict[str, Any], narrative: dict[str, Any],
-                   decision: dict[str, Any], frozen_hash: str, report_created_at: str) -> dict[str, Any]:
+                   decision: dict[str, Any], report_created_at: str) -> dict[str, Any]:
         definition = item["definition"]
+        horizon_summaries = {str(horizon): report["horizons"][str(horizon)]["summary"]
+                             for horizon in report["retained_horizons"]}
+        horizon_coverage = {str(horizon): report["horizons"][str(horizon)]["coverage"]
+                            for horizon in report["retained_horizons"]}
+        source = {"run_id": self.spec.run_id, "candidate_id": cid, "date": report_created_at,
+                  "research_directory": str(self.root.resolve())}
         card = {"id": f"{self.spec.run_id}--{cid}", "source_type": "factor_mining", "status": "research_idea",
-                "source": {"run_id": self.spec.run_id, "candidate_id": cid, "date": report_created_at,
-                           "research_directory": str(self.root.resolve()), "frozen_batch_sha256": frozen_hash},
+                "source": source,
                 "original_claim": {"formula": item["executed"], "meaning": definition["meaning"],
-                                   "hypothesis": definition["hypothesis"], "initial_findings": report["summary"]},
+                                   "direction": definition["direction"],
+                                   "hypothesis": definition["hypothesis"],
+                                   "initial_findings": horizon_summaries},
                 "economic_mechanism": narrative["mechanism"],
-                "market_and_horizon": {"venue": "Binance", "market": "USD-M perpetual", "inputs": "1h", "target": "24h"},
-                "data_and_coverage": {"fields": item["executed"]["fields"], "B": report["coverage"],
+                "market_and_horizon": {"venue": "Binance", "market": "USD-M perpetual", "inputs": "1h",
+                                        "target": decision["passed_horizons"],
+                                        "retained_horizons": decision["retained_horizons"],
+                                        "passed_horizons": decision["passed_horizons"]},
+                "data_and_coverage": {"fields": item["executed"]["fields"], "B": horizon_coverage,
                                       "universe_provenance": self.spec.universe_provenance,
                                       "data_usage_review": self.spec.data_usage_review},
                 "falsification_conditions": narrative["falsifiers"],
@@ -543,19 +759,18 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                 "next_research_plan": narrative["next_steps"], "applicability": narrative["conditions"],
                 "admission_evidence": decision, "multiple_testing": {"method": self.spec.fdr_method,
                                                                     "alpha": self.spec.fdr_alpha},
+                "evidence_references": {
+                    "A": {"record_id": item["a_evaluation_ref"]["record_id"]},
+                    "B": {"record_id": f"{cid}-evaluation",
+                          "factor_archives": {str(horizon): report["horizons"][str(horizon)]["factor_archive"]
+                                              for horizon in report["retained_horizons"]}}},
                 "a_research_decision": item["a_decision"],
                 "b_validation_status": decision["validation_status"],
                 "strategy_validation_status": "not_started"}
-        if self.spec.admission_scheme == "plan3":
-            names = TRACK_LABELS if self.spec.plan3_tracks_gate else TAG_LABELS
-            labels = [names[name] for name in decision["tracks"]]
-            if not self.spec.plan3_tracks_gate and not labels:
-                labels = ["基础型"]
-            card["title"] = definition["name"] + " · " + "、".join(labels)
-            card["classification"] = {"scheme": self.spec.admission_scheme, "tracks": decision["tracks"],
-                                      "track_labels": labels}
-            if not self.spec.plan3_tracks_gate:
-                card["classification"]["tracks_gate"] = False
-            card["unverified_assumptions"].append(
-                "准入规则在既有B区间被使用后修订；该B结果不能充当规则选择后的全新独立验证。")
+        labels = [TAG_LABELS[name] for name in decision["tracks"]] or ["基础型"]
+        card["title"] = definition["name"] + " · " + "、".join(labels)
+        card["classification"] = {"scheme": self.spec.admission_scheme, "tracks": decision["tracks"],
+                                  "track_labels": labels, "tracks_gate": False}
+        card["unverified_assumptions"].append(
+            "准入规则在既有B区间被使用后修订；该B结果不能充当规则选择后的全新独立验证。")
         return card

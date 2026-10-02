@@ -1,12 +1,14 @@
 """Calculator role: deterministic formula execution and formula-error repair."""
 from __future__ import annotations
 
+import os
+
 import pandas as pd
 
 from crypto_quant.features.factor_expressions import evaluate_expression
 from crypto_quant.features.factor_inputs import FactorInputPanel
 from .contracts import _object_schema, _text_schema, require
-from .evaluation import finite
+from .factor_archive import FactorArchive
 from .model import ApiCallError
 from .records import ModelResponseError
 
@@ -66,16 +68,19 @@ class CalculatorRole:
                        "executed_expression": result.definition if result is not None else None}
         if result is not None:
             calculation["valid_values"] = int(result.values.notna().sum())
-            calculation["cross_section_counts"] = finite(result.cross_section_counts.reset_index().to_dict("records"))
-            path = self.root / "factor_values" / f"{cid}-A.csv"
-            path.parent.mkdir(exist_ok=True)
-            csv = result.values.to_csv()
-            if path.exists():
-                require(path.read_text() == csv, "saved factor values differ during checkpoint recovery")
-            else:
-                with path.open("x") as handle:
-                    handle.write(csv)
-            calculation["values_artifact"] = str(path.relative_to(self.root))
+            identity = self._factor_identity(result.definition["expanded_expression"], definition["direction"])
+            archive = FactorArchive.open_for(self.archive_root, identity)
+            data_version = f"{self.spec.run_id}/A"
+            value_set = archive.append_value_set(
+                data_version, "factor-eval-v1", result.values.to_csv().encode("utf-8"),
+                provenance={"run_id": self.spec.run_id, "candidate_id": cid, "segment": "A",
+                            "definition": definition, "executed_expression": result.definition})
+            calculation["values_artifact"] = {
+                "root": os.path.relpath(self.archive_root.resolve(), self.root.resolve()),
+                "identity": identity.as_dict(), "data_version": data_version,
+                "computation_semantics": "factor-eval-v1",
+                "value_set_id": value_set["value_set_id"], "rows": len(result.values),
+            }
         item["calculation"] = calculation
         self.store.append(f"{cid}-calculation", "calculation", {"candidate_id": cid, **calculation})
         return result.values if result is not None else None

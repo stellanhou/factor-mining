@@ -25,7 +25,8 @@ from crypto_quant.research.factor_mining.workflow import validate_panel
 
 HOUR = 3_600_000
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT = ROOT / "experiments/factor_mining/long_history_20260919_setup"
+DEFAULT_OUTPUT = ROOT / "experiments/factor_mining/v6_inputs"
+DEFAULT_CONTRACT = ROOT / "examples/factor_mining/research.contract.json"
 EXCLUDED = set("USDC USDP TUSD BUSD FDUSD DAI USDE USD1 USDS XUSD U AEUR EURI EUR GBP AUD BRL TRY RUB BIDR IDRT BVND UST USTC PAX PAXG XAUT".split())
 
 
@@ -94,19 +95,9 @@ def select_cohort(conn, selection: pd.Timestamp) -> list[dict]:
     return ranking
 
 
-def prepare(db: Path, output: Path) -> None:
+def prepare(db: Path, output: Path, contract: Path = DEFAULT_CONTRACT) -> None:
+    spec = ResearchSpec.from_dict(json.loads(contract.read_text()))
     output.mkdir(parents=True, exist_ok=False)
-    previous = json.loads((ROOT / "experiments/factor_mining/goals/full-history-five-ideas-20260917-v24/goal.json").read_text())
-    spec_dict = previous["research"]
-    spec_dict.update(
-        run_id="long_history_20260919",
-        a_start="2022-08-01T00:00:00Z", b_start="2024-08-01T00:00:00Z",
-        c_start="2025-08-01T00:00:00Z", c_end="2026-08-01T00:00:00Z",
-        objective="在两年A开发段及一年B候选验证段上研究横截面因子，沿用现有统计准入规则；一年C日历段包含既有开发暴露，不能宣称为未触碰最终测试。",
-        universe_provenance="Fixed 30-asset cohort selected at 2022-07-25 00:00 UTC using only preceding 30 complete days of valid spot and mapped perpetual hourly bars. Rank median daily spot USDT turnover; exclude stable/fiat/gold and leveraged-token bases. Selection precedes A warm-up. No future-survival or future-field-coverage filter. Hourly eligibility requires valid contemporaneous closed spot and perpetual bars. Archived presence is a trading-status proxy; universe limited to local archive.",
-        data_usage_review="A=[2022-08-01,2024-08-01), B=[2024-08-01,2025-08-01), nominal C=[2025-08-01,2026-08-01), UTC. Source coverage has been inspected. No comprehensive historical-use registry exists. Prior factor development and B selection used 2026-04 through 2026-07 inside nominal C; nominal C is therefore NOT an untouched final holdout. This preparation and mining load A/B only. Freeze a separate clean final-test arrangement before any final strategy claim. Liquidations disabled; missing early top-trader ratios remain missing. No statistical thresholds changed.",
-    )
-    spec = ResearchSpec.from_dict(spec_dict)
     start = pd.Timestamp(spec.a_start) - pd.Timedelta(hours=spec.max_lookback_hours)
     end = pd.Timestamp(spec.c_start)
     conn = sqlite3.connect(f"file:{db.resolve()}?mode=ro", uri=True)
@@ -155,10 +146,7 @@ def prepare(db: Path, output: Path) -> None:
          "C_loaded_by_this_setup": False, "include_liquidations": False,
          "database": str(db.resolve()), "database_size": db.stat().st_size,
          "database_mtime_ns": db.stat().st_mtime_ns,
-         "previous_contract": str(ROOT / "experiments/factor_mining/goals/full-history-five-ideas-20260917-v24/goal.json")})
-    save(output / "goal.json", {"goal_id": "long-history-five-ideas-20260919",
-         "objective": "在历史时点选出的30资产币池、两年A与一年B数据上持续探索，累计获得5个通过既定冻结批次B验收且实际写入创意池的因子创意卡。不得声称名义C为未触碰最终测试。",
-         "target_ideas": previous["goal"]["target_ideas"]})
+         "contract_source": str(contract.resolve())})
     print(json.dumps(segments, ensure_ascii=False), flush=True)
 
 
@@ -218,5 +206,10 @@ if __name__ == "__main__":
     parser.add_argument("action", choices=("prepare", "verify"))
     parser.add_argument("--db", type=Path, default=ROOT / "market_data/crypto_quant.sqlite")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT,
+                        help="FM-v6 research contract used by prepare")
     args = parser.parse_args()
-    (prepare if args.action == "prepare" else verify)(args.db, args.output_dir)
+    if args.action == "prepare":
+        prepare(args.db, args.output_dir, args.contract)
+    else:
+        verify(args.db, args.output_dir)

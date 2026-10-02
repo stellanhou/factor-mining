@@ -16,12 +16,14 @@ import pandas as pd
 
 from crypto_quant.features.factor_inputs import FactorInputPanel, INPUT_COLUMNS
 from crypto_quant.research.progress import ProgressLog
-from .contracts import ResearchSpec, digest, identifier, require, text, _array_schema, _object_schema, _text_schema
+from .contracts import (ResearchSpec, digest, identifier, require, text, without_hash_metadata,
+                        _array_schema, _object_schema, _text_schema)
 from .runtime import GRAPH_CONFIG
 from langgraph.graph import StateGraph, START, END
 from .model import JsonModel
-from .records import AgentGateway, RecordStore, compact_record, write_json
-from .workflow import FactorMiner, _panel_fingerprint, validate_panel
+from .records import (AgentGateway, RecordStore, compact_record, load_record_reference,
+                      read_pointer, record_reference, write_json)
+from .workflow import FactorMiner, _panel_metadata, validate_panel
 
 
 @dataclass(frozen=True)
@@ -86,9 +88,51 @@ class GoalResearchStore(RecordStore):
                 records.append(self._load(path))
         return records
 
+    def _source_run(self, data: dict[str, Any]) -> Path:
+        run_path = Path(data["records"]["run_path"])
+        require(not run_path.is_absolute() and run_path.parts
+                and all(part not in {".", ".."} for part in run_path.parts),
+                "saved research run path is invalid")
+        run = self.root.parent.parent / run_path
+        require(run.is_dir() and run.name == data["run_id"], "saved research run is missing")
+        return run
+
+    def source_records(self, record_id: str) -> list[dict[str, Any]]:
+        cycle = self._load(self.root / f"{identifier(record_id)}.json")["data"]
+        run = self._source_run(cycle)
+        records = []
+        for item in cycle["records"]["items"]:
+            record = load_record_reference(run / "a_records", item["ref"])
+            require(record["kind"] == item["kind"], "saved research record kind changed")
+            records.append(record)
+        return records
+
     def read(self, record_id: str, pointer: str, offset: int, limit: int) -> Any:
         if record_id.startswith("cycle-") and pointer.startswith("/context"):
             return RecordStore(self.index).read(record_id, pointer, offset, limit)
+        if record_id.startswith("cycle-") and pointer.startswith("/records"):
+            cycle = self._load(self.root / f"{identifier(record_id)}.json")["data"]
+            items = cycle["records"]["items"]
+            if pointer == "/records":
+                return read_pointer(items, "", offset, limit)
+            parts = pointer.split("/")
+            require(len(parts) >= 3 and parts[2].isdigit(), "use a saved research record index")
+            index = int(parts[2])
+            require(index < len(items), "saved research record index is out of range")
+            item = items[index]
+            source_run = self._source_run(cycle)
+            record_id = identifier(item["ref"]["record_id"])
+            source_record = _read(source_run / "a_records" / f"{record_id}.json")
+            require(source_record["id"] == record_id,
+                    "referenced research record identifier differs")
+            require(source_record["kind"] == item["kind"],
+                    "saved research record kind changed")
+            if len(parts) >= 4 and parts[3] == "data":
+                nested_pointer = "/" + "/".join(parts[4:]) if len(parts) > 4 else ""
+                return RecordStore(source_run / "a_records").read(
+                    record_id, nested_pointer, offset, limit)
+            return read_pointer(source_record, "/" + "/".join(parts[3:]) if len(parts) > 3 else "",
+                                offset, limit)
         return super().read(record_id, pointer, offset, limit)
 
 
@@ -96,7 +140,6 @@ class GoalRunner:
     def __init__(self, root: Path, model: JsonModel):
         self.root, self.model = Path(root), model
         saved = _read(self.root / "goal.json")
-        saved.pop("sha256", None)
         self.goal = GoalSpec(**saved["goal"])
         self.spec = ResearchSpec.from_dict(saved["research"])
         self.inputs = saved["inputs"]
@@ -179,17 +222,10 @@ class GoalRunner:
     def _select(self, panel: FactorInputPanel) -> None:
         records = self.research.all()
         index = len(records) + 1
-        catalog = {
-            "fingerprint": _panel_fingerprint(panel), "catalog": panel.ideation_context(),
-            "valid_A_rows": self._counts(panel)}
-        matching = [record for record in records
-                    if record["kind"] == "data_provenance"
-                    and record["data"]["fingerprint"] == catalog["fingerprint"]]
-        if matching:
-            catalog_id = matching[-1]["id"]
-        else:
-            catalog_id = f"inputs-{index:08d}"
-            self.research.append(catalog_id, "data_provenance", catalog)
+        catalog = {"fingerprint": _panel_metadata(panel),
+                   "catalog": panel.ideation_context(), "valid_A_rows": self._counts(panel)}
+        catalog_id = f"inputs-{index:08d}"
+        self.research.append(catalog_id, "data_provenance", catalog)
         decision = self._gateway(self.research).ask("optimizer",
             "你继续担任优化Agent，现在负责Goal层的下一项研究决策，不新增角色。"
             "对照goal和全部A研究记录，选择新的有依据的研究方向，或等待明确缺失的数据。"
@@ -269,34 +305,17 @@ class GoalRunner:
 
     def _context(self, panel: FactorInputPanel) -> dict[str, Any]:
         history = self.research.all()
-        fingerprint = _panel_fingerprint(panel)
-        previous = []
         cycles = []
         for record in history:
             if record["kind"] != "research_cycle":
                 continue
-            data = record["data"]
-            # With changed A evidence, a new run may re-examine the same formula.
-            if isinstance(data["records"], list):
-                source = {r["id"]: r for r in data["records"]}
-                prior_fingerprint = source["inputs"]["data"]["fingerprint"]
-                context = data.get("context") or self._cycle_context(record["id"], data)
-            else:
-                run_id = identifier(data["run_id"])
-                matches = list(self.root.parent.glob(f"*/runs/{run_id}/a_records/inputs.json"))
-                require(len(matches) == 1, f"saved A inputs missing or ambiguous for {run_id}")
-                inputs = _read(matches[0])
-                prior_fingerprint = inputs["data"]["fingerprint"]
-                context = data["context"]
-            if prior_fingerprint != fingerprint:
-                continue
-            previous.extend(context["previous_expressions"])
+            context = record["data"]["context"]
             cycles.append({key: value for key, value in context.items() if key != "previous_expressions"})
         tasks = [{"source_record_id": record["id"], **record["data"]}
                  for record in history if record["kind"] == "goal_task"]
         return {"goal": asdict(self.goal), "research_task": self.state["task"],
                 "prior_A_research": {"tasks": tasks, "cycles": cycles},
-                "previous_expressions": previous}
+                "previous_expressions": []}
 
     def _miner(self) -> FactorMiner:
         miner = FactorMiner.open(self.root / "runs" / self.state["current_run"], self.model)
@@ -308,27 +327,163 @@ class GoalRunner:
         record_id = f"cycle-{self.state['cycle']:08d}"
         if record_id in {record["id"] for record in self.research.all()}:
             return
-        data = {"run_id": miner.spec.run_id,
-                "records": [r for r in miner.store.all() if r["kind"] != "goal_context"]}
-        data["context"] = self._cycle_context(record_id, data)
+        records = [_read(path) for path in sorted(miner.store.root.glob("*.json"))]
+        records = [record for record in records if record["kind"] != "goal_context"]
+        context = self._cycle_context(record_id, {"run_id": miner.spec.run_id, "records": records})
+        run_path = miner.root.resolve().relative_to(self.root.parent.resolve())
+        items = []
+        for index, record in enumerate(records):
+            data = record["data"]
+            candidate_id = data.get("candidate_id")
+            if record["kind"] == "candidate":
+                candidate_id = data["id"]
+            item = {"record_id": record["id"], "kind": record["kind"],
+                    "candidate_id": candidate_id, "ref": record_reference(record),
+                    "pointer": f"/records/{index}"}
+            if record["kind"] == "evaluation":
+                item["factor_archive_ref"] = data["factor_archive"]
+            items.append(item)
+        data = {"run_id": miner.spec.run_id, "context": context,
+                "candidate_ids": [record["data"]["id"] for record in records
+                                  if record["kind"] == "candidate"],
+                "records": {"run_path": str(run_path), "items": items}}
         self.research.append(record_id, "research_cycle", data)
 
     def _review_completion(self, miner: FactorMiner, validation: dict[str, Any]) -> None:
+        require(validation["status"] == "complete", "Goal admission requires complete B reports")
         ideas = []
-        frozen, _ = miner._checked_frozen()
-        for cid, decision in validation["decisions"].items():
-            if decision["eligible_for_idea_pool"] and "idea_card" in decision:
-                card = _read(Path(decision["idea_card"]))
-                require(card["b_validation_status"] == "passed" and card["source"]["run_id"] == miner.spec.run_id,
-                        "goal admission receipt differs from the idea card")
-                ideas.append({"idea_id": card["id"], "definition": frozen["candidates"][cid]["definition"],
-                              "a_evaluation": frozen["candidates"][cid]["a_evaluation"],
-                              "a_model_report": frozen["candidates"][cid]["a_model_report"],
-                              "admitted_by_program": True})
-        if not ideas:
-            return
+        delivery_ideas = []
+        frozen = miner._checked_frozen()
         receipt_id = f"admission-{self.state['cycle']:08d}"
         records = {r["id"]: r["data"] for r in self.receipts.all()}
+        b_store = RecordStore(miner.root / "b_records", run_root=miner.root.resolve(),
+                              archive_root=miner.archive_root)
+        b_records = {record["id"]: record for record in b_store.all()}
+        for cid, decision in validation["decisions"].items():
+            if not decision["eligible_for_idea_pool"]:
+                require("idea_card" not in decision,
+                        "ineligible B verdict cannot have an idea card")
+                continue
+            require("idea_card" in decision, "eligible B verdict is missing its idea card")
+            card = _read(Path(decision["idea_card"]))
+            item = frozen["candidates"][cid]
+            b_evaluation = b_records[f"{cid}-evaluation"]
+            b_report = b_records[f"{cid}-report"]
+            b_validation = b_records[f"{cid}-validation"]
+            require(b_evaluation["kind"] == "evaluation" and b_report["kind"] == "model_report"
+                    and b_validation["kind"] == "validation_result",
+                    "Goal admission B evidence has unexpected record kinds")
+            evaluation = b_evaluation["data"]
+            require(b_report["data"]["candidate_id"] == cid,
+                    "Goal admission model report belongs to another candidate")
+            program = {key: value for key, value in decision.items() if key != "idea_card"}
+            saved_program = {key: value for key, value in b_validation["data"].items()
+                             if key != "candidate_id"}
+            require(b_validation["data"]["candidate_id"] == cid and program == saved_program,
+                    "Goal admission verdict differs from the saved B program result")
+            require(program["decision_source"] == "program"
+                    and program["admission_scheme"] == miner.spec.admission_scheme,
+                    "Goal admission verdict has an unexpected source or scheme")
+            retained_horizons = item["a_decision"]["retained_horizons"]
+            require(retained_horizons == decision["retained_horizons"]
+                    and len(retained_horizons) == len(set(retained_horizons))
+                    and all(type(h) is int and h in miner.spec.b_horizons for h in retained_horizons),
+                    "Goal admission horizons differ from the frozen A decision")
+            passed_horizons = decision["passed_horizons"]
+            require(len(passed_horizons) == len(set(passed_horizons))
+                    and all(type(h) is int and h in retained_horizons for h in passed_horizons)
+                    and set(passed_horizons) & set(retained_horizons)
+                    and decision["validation_status"] == "passed"
+                    and decision["eligible_for_idea_pool"],
+                    "Goal admission has no passed A/B horizon intersection")
+            require(evaluation["candidate_id"] == cid and evaluation["segment"] == "B"
+                    and evaluation["direction"] == item["definition"]["direction"]
+                    and evaluation["retained_horizons"] == retained_horizons,
+                    "Goal admission evaluation differs from the frozen candidate")
+            horizons = evaluation["horizons"]
+            require(set(horizons) == {str(h) for h in retained_horizons},
+                    "Goal admission evaluations differ from the frozen horizon set")
+            tests_by_horizon = {test["horizon_hours"]: test for test in decision["tests"]}
+            require(len(tests_by_horizon) == len(decision["tests"])
+                    and set(tests_by_horizon) == set(retained_horizons)
+                    and all(test["candidate_id"] == cid for test in tests_by_horizon.values()),
+                    "Goal admission BH tests differ from the frozen candidate horizons")
+            horizon_results = decision["horizon_results"]
+            require(set(horizon_results) == {str(h) for h in retained_horizons},
+                    "Goal admission verdict omits a frozen horizon")
+            require(passed_horizons == [h for h in retained_horizons
+                                        if horizon_results[str(h)]["validation_status"] == "passed"],
+                    "Goal admission passed horizons differ from per-horizon verdicts")
+            factor_identity = miner._factor_identity(
+                item["executed"]["expanded_expression"], item["definition"]["direction"]).as_dict()
+            factor_archives = {}
+            horizon_evidence = {}
+            for horizon in retained_horizons:
+                result = horizons[str(horizon)]
+                locator = result["factor_archive"]
+                require(result["segment"] == "B" and result["direction"] == item["definition"]["direction"]
+                        and result["horizon_hours"] == horizon
+                        and locator["identity"] == factor_identity
+                        and locator["evaluation_key"] == miner._evaluation_key("B", horizon).as_dict(),
+                        "Goal admission factor archive differs from formula, direction, or horizon")
+                horizon_verdict = horizon_results[str(horizon)]
+                require(horizon_verdict["tests"] == [tests_by_horizon[horizon]],
+                        "Goal admission horizon tests differ from the batch correction")
+                factor_archives[str(horizon)] = locator
+                horizon_evidence[str(horizon)] = {
+                    "summary": result["summary"], "coverage": result["coverage"],
+                    "verdict": horizon_verdict, "factor_archive": locator}
+            a_evaluation_record_id = identifier(item["a_evaluation_ref"]["record_id"])
+            a_evaluation = load_record_reference(miner.store.root,
+                                                 {"record_id": a_evaluation_record_id})
+            require(a_evaluation["kind"] == "evaluation"
+                    and a_evaluation["data"]["candidate_id"] == cid
+                    and a_evaluation["data"]["factor_archive"] == item["a_evaluation_archive"],
+                    "Goal admission A evaluation reference differs from candidate")
+            a_horizons = a_evaluation["data"]["horizon_comparison"]["horizons"]
+            require(set(map(str, retained_horizons)) <= set(a_horizons),
+                    "Goal admission A evaluation omits a retained horizon")
+            a_horizon_evidence = {str(h): a_horizons[str(h)]["summary"]
+                                  for h in retained_horizons}
+            expected_card = miner._idea_card(cid, item, evaluation, b_report["data"],
+                                             program, b_report["created_at"])
+            require(without_hash_metadata(card) == without_hash_metadata(expected_card),
+                    "Goal admission card differs from its candidate, evaluation, verdict, or model report")
+            ideas.append({"idea_id": card["id"], "candidate_id": cid,
+                          "run_id": miner.spec.run_id,
+                          "run_path": str(miner.root.resolve().relative_to(self.root.resolve())),
+                          "definition": item["definition"],
+                          "a_evaluation_ref": {"record_id": a_evaluation_record_id},
+                          "factor_archive_ref": item["a_evaluation_archive"],
+                          "retained_horizons": retained_horizons,
+                          "a_horizon_evidence": a_horizon_evidence,
+                          "a_model_report": item["a_model_report"],
+                          "admitted_by_program": True})
+            delivery_ideas.append({"idea_id": card["id"], "candidate_id": cid,
+                                   "run_id": miner.spec.run_id,
+                                   "card_path": str(Path(decision["idea_card"]).resolve()),
+                                   "source": card["source"],
+                                   "executed_formula": item["executed"],
+                                   "direction": item["definition"]["direction"],
+                                   "retained_horizons": retained_horizons,
+                                   "passed_horizons": passed_horizons,
+                                   "a_evaluation_ref": {"record_id": a_evaluation_record_id},
+                                   "factor_archive_ref": item["a_evaluation_archive"],
+                                   "b_evaluation_ref": {"record_id": b_evaluation["id"]},
+                                   "b_validation_ref": {"record_id": b_validation["id"]},
+                                   "horizon_evidence": horizon_evidence,
+                                   "admission_evidence": program})
+        if not ideas:
+            return
+        require(len({idea["idea_id"] for idea in ideas}) == len(ideas),
+                "Goal admission contains duplicate idea cards")
+        delivery_path = self.root / "delivery_evidence" / f"admission-{self.state['cycle']:08d}.json"
+        delivery_record = {"ideas": delivery_ideas}
+        if delivery_path.exists():
+            require(_read(delivery_path) == delivery_record,
+                    "saved Goal delivery evidence differs from the program admission")
+        else:
+            write_json(delivery_path, delivery_record)
         if receipt_id not in records:
             self.receipts.append(receipt_id, "program_admission", {"ideas": ideas})
         else:
@@ -350,7 +505,12 @@ class GoalRunner:
         else:
             result = self._gateway(self.receipts).ask("optimizer",
                 "你是优化Agent，当前只核验已获程序准入的成果是否符合Goal文本。"
-                "逐项核对目标要求与候选定义、A证据，输出匹配结论及理由。不能更改Goal或B标准。"
+                "只根据Goal中的研究目标，逐卡核对候选定义和A段研究证据是否研究了目标所述问题；不把运行流程、批次数量或收据状态当作研究内容要求。"
+                "GoalId标识外层Goal，run_id标识它runs目录中的一次研究运行，二者无需相同；程序已核对运行归属。"
+                "target_ideas由程序累计计数，单张卡或单批数量低于目标数量不能据此判该卡不匹配。"
+                "程序已经核验准入、完整报告和卡片落盘；本请求正在生成Goal匹配收据，不得要求匹配收据预先存在。"
+                "不能仅以A段统计不显著判为不匹配；仍须依据目标、候选定义和A证据判断研究内容是否符合目标。"
+                "研究内容确实不符合Goal时应判false并说明具体差异；不得无条件判true。不能更改Goal或B标准。"
                 "程序已检查B准入；这里没有B数值或失败反馈，不得推测这些结果。"
                 "此上下文只作成果核验，不能生成或修改后续研究任务。程序按匹配的合格创意数量判断完成。",
                 {"goal_phase": "verify_completion", "goal": asdict(self.goal), "idea_ids": sorted(ids)},

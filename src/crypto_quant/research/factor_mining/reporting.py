@@ -2,8 +2,20 @@
 
 from __future__ import annotations
 
+import os
+import sqlite3
 from pathlib import Path
 from typing import Any
+
+
+def _cell(value: Any) -> str:
+    if value is None:
+        return "N/A"
+    if isinstance(value, list):
+        return "[" + ", ".join(_cell(item) for item in value) + "]"
+    if isinstance(value, (int, float)):
+        return f"{value:.6g}"
+    return str(value)
 
 
 def write_group_plot(path: Path, report: dict[str, Any]) -> None:
@@ -22,13 +34,42 @@ def write_group_plot(path: Path, report: dict[str, Any]) -> None:
     axis.axhline(0, color="#666666", linewidth=0.7)
     axis.set_xticks(x, [f"Group {i}" for i in x])
     axis.set_xlabel("Factor value: low to high (equal values remain together)")
-    axis.set_ylabel("Mean 24-hour forward return")
+    horizon_hours = report["horizon_hours"]
+    axis.set_ylabel(f"Mean {horizon_hours}-hour forward return")
     axis.yaxis.set_major_formatter(PercentFormatter(1))
-    axis.set_title(f"Segment {report['segment']} | fixed direction {report['direction']:+d}")
+    axis.set_title(f"Segment {report['segment']} | {horizon_hours}h | fixed direction {report['direction']:+d}")
     axis.spines[["top", "right"]].set_visible(False)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("x", encoding="utf-8") as handle:
         figure.savefig(handle, format="svg", metadata={"Date": None})
+
+
+def _archive_file(run_dir: Path, pointer: dict[str, Any]) -> Path:
+    root = pointer["root"]
+    identity = pointer["identity"]
+    if not isinstance(root, str) or Path(root).is_absolute() or not isinstance(identity, dict):
+        raise ValueError("因子归档定位信息无效")
+    archive_root = (run_dir.resolve() / root).resolve()
+    registry = archive_root / "registry.sqlite3"
+    if not registry.is_file():
+        raise FileNotFoundError(registry)
+    try:
+        connection = sqlite3.connect(f"{registry.as_uri()}?mode=ro", uri=True)
+        try:
+            row = connection.execute("""SELECT factor_id FROM factor_identities
+                WHERE expanded_expression=? AND direction=? AND semantics_version=?""",
+                (identity["expanded_expression"], identity["direction"],
+                 identity["semantics_version"])).fetchone()
+        finally:
+            connection.close()
+    except (KeyError, sqlite3.DatabaseError) as exc:
+        raise ValueError(f"因子归档注册表无效：{registry}") from exc
+    if row is None:
+        raise ValueError(f"因子归档身份不存在：{registry}")
+    path = archive_root / f"factor-{int(row[0]):06d}.sqlite3"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
 
 
 def write_research_report(path: Path, run_id: str, purpose: str, records: list[dict[str, Any]], stage: str,
@@ -78,6 +119,9 @@ def write_research_report(path: Path, run_id: str, purpose: str, records: list[d
                       f"继续修改：{'是' if decision['continue_optimization'] else '否'}。", "", decision["reason"], ""]
             for key, answer in decision["answers"].items():
                 lines.append(f"- {questions[key]}：{'支持' if answer['supported'] else '不支持'}。{answer['reason']}")
+            if decision["disposition"] == "retain":
+                lines.append("- 保留送检期限：" + "、".join(
+                    f"{h}h" for h in decision["retained_horizons"]))
             lines += ["", "依据：" + "、".join(f"[{ref}](a_records/{ref}.json)" for ref in decision["evidence_refs"]), ""]
             if decision["resume_condition"] is not None:
                 lines += ["恢复条件：" + decision["resume_condition"], ""]
@@ -106,52 +150,125 @@ def write_research_report(path: Path, run_id: str, purpose: str, records: list[d
             continue
         data = record["data"]
         cid = data["candidate_id"]
-        summary = data["summary"]
-        lines += [f"## {cid}", "", "| 指标 | 数值 |", "|---|---|",
-                  f"| 平均 Rank IC | {summary['rank_ic']['mean']} |",
-                  f"| ICIR（未年化） | {summary['rank_ic']['mean_std_ratio']} |",
-                  f"| 有向高低组收益差 | {summary['directional_spread']['mean']} |",
-                  f"| 有效 IC 期数 | {summary['rank_ic']['n']} |",
-                  f"| 跨段排除小时数 | {data['coverage']['purged_hours']} |", "",
-                  f"![各组未来24小时平均收益](plots/{cid}-{stage}.svg)", ""]
-        if "horizon_comparison" in data:
-            horizons = data["horizon_comparison"]["horizons"]
-            summaries = [horizons[str(h)]["summary"] for h in (1, 4, 24)]
-            lines += ["### 同一因子的预测期限对照（A段）", "",
-                      "三列使用相同因子值、方向、共同有效时点与币种，统一按24h边界排除跨段样本。"
-                      "各组等权；收益未扣交易成本和资金费。", "",
-                      "| 指标 | 未来1h | 未来4h | 未来24h |", "|---|---|---|---|"]
+        lines += [f"## {cid}", ""]
+        if stage == "A":
+            primary = data
+            primary_summary = primary["summary"]
+            primary_horizon = primary["horizon_hours"]
+            lines += [f"A段主评估期限：{primary_horizon}h；以下主评估数值使用全主评估样本。", "",
+                      "| 指标 | 数值 |", "|---|---|",
+                      f"| 平均 Rank IC | {primary_summary['rank_ic']['mean']} |",
+                      f"| ICIR（未年化） | {primary_summary['rank_ic']['mean_std_ratio']} |",
+                      f"| 有向高低组收益差 | {primary_summary['directional_spread']['mean']} |",
+                      f"| 有效 IC 期数 | {primary_summary['rank_ic']['n']} |",
+                      f"| 跨段排除小时数 | {primary['coverage']['purged_hours']} |", ""]
+            if "horizon_comparison" in primary:
+                horizons = primary["horizon_comparison"]["horizons"]
+                horizon_ids = sorted(int(h) for h in horizons)
+                summaries = [horizons[str(h)]["summary"] for h in horizon_ids]
+                lines += ["### A段共同样本期限对照", "",
+                          "各期限使用相同因子值、方向、共同有效时点和币种，并排除跨段标签。"
+                          "各组等权；收益未扣交易成本和资金费。", "",
+                          "| 指标 | " + " | ".join(f"未来{h}h" for h in horizon_ids) + " |",
+                          "|---|" + "---|" * len(horizon_ids)]
+                rows = [
+                    ("平均 Rank IC", [s["rank_ic"]["mean"] for s in summaries]),
+                    ("Rank IC 标准误", [s["rank_ic"]["se"] for s in summaries]),
+                    ("Rank IC 置信区间", [s["rank_ic"]["ci"] for s in summaries]),
+                    ("Rank IC 原始 p 值", [s["rank_ic"]["p_value"] for s in summaries]),
+                    ("固定方向平均 Rank IC", [None if s["rank_ic"]["mean"] is None else s["rank_ic"]["mean"] * horizons[str(h)]["direction"]
+                                             for h, s in zip(horizon_ids, summaries)]),
+                    ("ICIR（未年化）", [s["rank_ic"]["mean_std_ratio"] for s in summaries]),
+                    ("有向高低组收益差", [s["directional_spread"]["mean"] for s in summaries]),
+                    ("价差置信区间", [s["directional_spread"]["ci"] for s in summaries]),
+                    ("IC方向一致期占比", [s["ic_direction_share"] for s in summaries]),
+                    ("正向阶段占比", [s["positive_stage_share"] for s in summaries]),
+                    ("有效阶段数", [s["valid_stages"] for s in summaries]),
+                    ("有效 IC 期数", [s["rank_ic"]["n"] for s in summaries]),
+                    ("有效资产小时观测", [horizons[str(h)]["coverage"]["eligible_observations"]
+                                        for h in horizon_ids]),
+                    ("跨段排除资产小时观测", [horizons[str(h)]["coverage"]["purged_observations"]
+                                          for h in horizon_ids]),
+                    ("跨段排除小时数", [horizons[str(h)]["coverage"]["purged_hours"]
+                                        for h in horizon_ids]),
+                ]
+                rows += [(f"第{group}组平均收益", [s["group_means"][group] for s in summaries])
+                         for group in summaries[0]["group_means"]]
+                for label, values in rows:
+                    lines.append("| " + label + " | " + " | ".join(_cell(value) for value in values) + " |")
+                lines += ["", "对照表沿用相同 HAC 带宽，p 值为未校正的开发诊断；它保留每个期限的不确定性、滚动及分阶段结果，不自动挑选最佳期限。", "",
+                          "各期限分组收益图：" + "、".join(
+                              f"[{h}h](plots/{cid}-A-{h}h.svg)" for h in horizon_ids), ""]
+        else:
+            horizons = data["horizons"]
+            horizon_ids = sorted(int(h) for h in horizons)
+            outcome = validations[cid]["data"]
+            horizon_results = outcome["horizon_results"]
+            tests = {test["horizon_hours"]: test for test in outcome["tests"]}
+            correction = next(r["data"] for r in records if r["kind"] == "multiple_testing")
+            summaries = [horizons[str(h)]["summary"] for h in horizon_ids]
+            lines += ["### B段逐期限程序结果", "",
+                      f"各期限使用冻结的 A 保留范围和对应段边界；BH 家族包含 {correction['family_size']} 个候选 × 期限检验，"
+                      f"FDR α={correction['alpha']}。", "",
+                      "| 指标 | " + " | ".join(f"未来{h}h" for h in horizon_ids) + " |",
+                      "|---|" + "---|" * len(horizon_ids)]
             rows = [
                 ("平均 Rank IC", [s["rank_ic"]["mean"] for s in summaries]),
+                ("固定方向平均 Rank IC", [None if s["rank_ic"]["mean"] is None else s["rank_ic"]["mean"] * horizons[str(h)]["direction"]
+                                         for h, s in zip(horizon_ids, summaries)]),
+                ("Rank IC 标准误", [s["rank_ic"]["se"] for s in summaries]),
+                ("Rank IC 置信区间", [s["rank_ic"]["ci"] for s in summaries]),
+                ("原始 p 值", [tests[h]["raw_p"] for h in horizon_ids]),
+                ("BH 调整后 p 值", [tests[h]["adjusted_p"] for h in horizon_ids]),
+                ("BH 检验通过", ["是" if tests[h]["rejected"] else "否" for h in horizon_ids]),
                 ("ICIR（未年化）", [s["rank_ic"]["mean_std_ratio"] for s in summaries]),
                 ("有向高低组收益差", [s["directional_spread"]["mean"] for s in summaries]),
-                ("IC方向一致期占比", [s["ic_direction_share"] for s in summaries]),
-                ("正向阶段占比", [s["positive_stage_share"] for s in summaries]),
-                ("有效阶段数", [s["valid_stages"] for s in summaries]),
+                ("价差置信区间", [s["directional_spread"]["ci"] for s in summaries]),
                 ("有效 IC 期数", [s["rank_ic"]["n"] for s in summaries]),
+                ("有效资产小时观测", [horizons[str(h)]["coverage"]["eligible_observations"]
+                                    for h in horizon_ids]),
+                ("跨段排除资产小时观测", [horizons[str(h)]["coverage"]["purged_observations"]
+                                      for h in horizon_ids]),
+                ("跨段排除小时数", [horizons[str(h)]["coverage"]["purged_hours"]
+                                    for h in horizon_ids]),
+                ("逐期限程序判定", [horizon_results[str(h)]["validation_status"] for h in horizon_ids]),
+                ("逐期限Plan3轨道", ["、".join(horizon_results[str(h)]["tracks"]) or "无"
+                                   for h in horizon_ids]),
             ]
             rows += [(f"第{group}组平均收益", [s["group_means"][group] for s in summaries])
                      for group in summaries[0]["group_means"]]
             for label, values in rows:
-                lines.append("| " + label + " | " + " | ".join(
-                    "N/A" if value is None else f"{value:.6g}" for value in values) + " |")
-            lines += ["", "三列沿用合同的同一HAC带宽，完整记录保留各期限的不确定性、滚动及分阶段结果。"
-                      "这是开发段诊断；不自动选择最好期限，不改变24h主评估及B验证规则。"
-                      "若共同有效样本减少，对照的24h列可能与上方主评估不同。", ""]
+                lines.append("| " + label + " | " + " | ".join(_cell(value) for value in values) + " |")
+            lines += ["", "逐期限分组收益图：" + "、".join(
+                f"[{h}h](plots/{cid}-B-{h}h.svg)" for h in horizon_ids), "",
+                f"整批程序判定：{'通过' if outcome['validation_status'] == 'passed' else '未通过'}；"
+                f"创意卡交付资格：{'满足' if outcome['eligible_for_idea_pool'] else '不满足'}。",
+                "A保留期限：" + "、".join(f"{h}h" for h in outcome["retained_horizons"]),
+                "B通过期限：" + "、".join(f"{h}h" for h in outcome["passed_horizons"]),
+                f"准入规则：{outcome['admission_scheme']}；Plan3轨道标签：" + "、".join(outcome["tracks"]), ""]
+            lines += [f"- {reason}" for reason in outcome["reasons"]]
+            for horizon in horizon_ids:
+                lines += [f"- {horizon}h：" + ("；".join(horizon_results[str(horizon)]["reasons"])
+                          or "无未通过原因")]
+            lines += ["", f"[完整程序判定](b_records/{validations[cid]['id']}.json)。模型解释不改变此结果。", ""]
         if cid in reports:
             model = reports[cid]
             lines += ["### 模型解释", "", model["analysis"], "", "适用及失效条件：", ""]
             lines += [f"- {value}" for value in model["conditions"]]
             lines += ["", "证据限制：", ""] + [f"- {value}" for value in model["limitations"]] + [""]
-        if cid in validations:
-            validation = validations[cid]
-            outcome = validation["data"]
-            lines += ["### B段程序验证结果", "",
-                      f"预定验证规则：{'通过' if outcome['validation_status'] == 'passed' else '未通过'}。",
-                      f"创意卡交付资格：{'满足' if outcome['eligible_for_idea_pool'] else '不满足'}。", ""]
-            lines += [f"- {reason}" for reason in outcome["reasons"]]
-            lines += ["", f"[逐项程序判定](b_records/{validation['id']}.json)。模型解释不改变此结果。", ""]
-        lines += [f"完整逐期、分阶段、分组和不确定性结果见 `{stage.lower()}_records/{record['id']}.json`。", ""]
+        archive_refs = ([(primary_horizon, data["factor_archive"])] if "factor_archive" in data else []) if stage == "A" else [
+            (horizon, horizons[str(horizon)]["factor_archive"]) for horizon in horizon_ids]
+        for horizon, pointer in archive_refs:
+            archive_path = _archive_file(path.parent, pointer)
+            relative_archive = Path(os.path.relpath(archive_path, path.parent.resolve())).as_posix()
+            evaluation_id = pointer["evaluation_id"]
+            value_set_id = pointer.get("value_set_id")
+            value_set_note = f" · factor value set `{value_set_id}`" if value_set_id is not None else ""
+            lines += [f"稳定定位：运行 `{run_id}` · 候选 `{cid}` · SQLite evaluation `{evaluation_id}` · {horizon}h{value_set_note}。",
+                      f"精确归档位置：[SQLite 因子归档]({relative_archive})。该 JSON 只含统计摘要和覆盖范围；"
+                      "逐期、分阶段、分组及因子值证据保存在归档中。", ""]
+        record_path = f"{stage.lower()}_records/{record['id']}.json"
+        lines += [f"保存的逐期限评估记录：[{record['id']}.json]({record_path})。", ""]
     unsuccessful = [r for r in records if r["kind"] == "duplicate"
                     or (r["kind"] == "calculation" and r["data"]["status"] != "computed")]
     if unsuccessful:

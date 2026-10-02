@@ -66,11 +66,10 @@ def hac_mean(series: pd.Series, spec: ResearchSpec) -> dict[str, Any]:
     return finite(result)
 
 
-def build_labels(panel: FactorInputPanel, spec: ResearchSpec, stage: str, *, horizon_hours: int = 24,
-                 allow_nonprimary_horizon: bool = False) -> pd.DataFrame:
+def build_labels(panel: FactorInputPanel, spec: ResearchSpec, stage: str, *, horizon_hours: int = 24) -> pd.DataFrame:
     require(horizon_hours in (1, 4, 24), "supported horizons: 1, 4, 24 hours")
-    require(stage == "A" or horizon_hours == 24 or allow_nonprimary_horizon,
-            "B retains the frozen 24h target unless a separate horizon contract is frozen")
+    require(stage == "A" or horizon_hours in spec.b_horizons,
+            "B horizon must be declared by the research contract")
     start, end = spec.bounds(stage)
     membership = validate_universe(panel.universe)
     require(panel.values.index.equals(membership.index), "input/universe indices differ")
@@ -105,11 +104,10 @@ def _summary(frame: pd.DataFrame, spec: ResearchSpec, direction: int) -> dict[st
 
 
 def evaluate_factor(values: pd.Series, labels: pd.DataFrame, spec: ResearchSpec, stage: str,
-                    direction: int, *, horizon_hours: int = 24,
-                    allow_nonprimary_horizon: bool = False) -> dict[str, Any]:
+                    direction: int, *, horizon_hours: int = 24) -> dict[str, Any]:
     require(horizon_hours in (1, 4, 24), "supported horizons: 1, 4, 24 hours")
-    require(stage == "A" or horizon_hours == 24 or allow_nonprimary_horizon,
-            "B retains the frozen 24h target unless a separate horizon contract is frozen")
+    require(stage == "A" or horizon_hours in spec.b_horizons,
+            "B horizon must be declared by the research contract")
     require(direction in {-1, 1}, "direction must be frozen before evaluation")
     require(values.index.equals(labels.index), "factor and label indices differ")
     start, end = spec.bounds(stage)
@@ -182,8 +180,7 @@ def evaluate_factor(values: pd.Series, labels: pd.DataFrame, spec: ResearchSpec,
 
 
 def evaluate_horizon_comparison(values: pd.Series, labels_by_horizon: dict[int, pd.DataFrame],
-                                spec: ResearchSpec, direction: int, *, stage: str = "A",
-                                allow_nonprimary_horizon: bool = False) -> dict[str, Any]:
+                                spec: ResearchSpec, direction: int, *, stage: str = "A") -> dict[str, Any]:
     """Compare a fixed factor on identical observations; retain the contract's HAC bandwidth."""
     common = np.isfinite(values)
     for labels in labels_by_horizon.values():
@@ -194,8 +191,7 @@ def evaluate_horizon_comparison(values: pd.Series, labels_by_horizon: dict[int, 
         # Use the same boundary and asset mask so all three rank sorts are identical.
         labels["purged"] = labels_by_horizon[24]["purged"]
         reports[str(horizon)] = evaluate_factor(
-            values.where(common), labels, spec, stage, direction, horizon_hours=horizon,
-            allow_nonprimary_horizon=allow_nonprimary_horizon)
+            values.where(common), labels, spec, stage, direction, horizon_hours=horizon)
     return {"interpretation": f"{stage}-stage horizon comparison on common finite observations and the 24h boundary; "
             "same formula, direction, groups and HAC bandwidth. Unadjusted exploratory p-values; "
             "batch admission is computed separately. Returns exclude trading costs and funding.",
@@ -203,26 +199,36 @@ def evaluate_horizon_comparison(values: pd.Series, labels_by_horizon: dict[int, 
 
 
 def correct_batch(reports: dict[str, dict[str, Any]], spec: ResearchSpec) -> dict[str, Any]:
-    """Rank IC tests of EVERY frozen candidate form one correction family.
+    """Every frozen candidate/horizon pair forms one BH correction family.
 
     Unavailable tests stay in the family (p=1 for adjustment, raw p remains null).
     """
     tests = []
-    for candidate_id, report in reports.items():
-        raw = report["summary"]["rank_ic"]["p_value"]
-        tests.append({"candidate_id": candidate_id, "metric": "rank_ic", "raw_p": raw})
+    for candidate_id, candidate_report in sorted(reports.items()):
+        horizons = candidate_report["horizons"]
+        require(bool(horizons), "each frozen candidate requires horizon evaluations")
+        for horizon, report in sorted(horizons.items(), key=lambda item: int(item[0])):
+            require(type(report["horizon_hours"]) is int
+                    and str(report["horizon_hours"]) == horizon
+                    and report["horizon_hours"] in spec.b_horizons,
+                    "correction horizon differs from its evaluation")
+            raw = report["summary"]["rank_ic"]["p_value"]
+            require(raw is None or type(raw) in (int, float)
+                    and math.isfinite(raw) and 0 <= raw <= 1,
+                    "Rank IC p-value must be null or finite in [0,1]")
+            tests.append({"candidate_id": candidate_id, "horizon_hours": report["horizon_hours"],
+                          "metric": "rank_ic", "raw_p": raw})
     require(bool(tests), "empty validation batch")
     p = np.array([1.0 if t["raw_p"] is None else t["raw_p"] for t in tests])
     order = np.argsort(p, kind="stable")
     m = len(tests)
-    dependency = sum(1 / i for i in range(1, m + 1)) if spec.fdr_method == "BY" else 1
-    adjusted = np.minimum.accumulate((p[order] * m * dependency / np.arange(1, m + 1))[::-1])[::-1]
+    adjusted = np.minimum.accumulate((p[order] * m / np.arange(1, m + 1))[::-1])[::-1]
     q = np.empty(m)
     q[order] = np.minimum(adjusted, 1)
     for item, value in zip(tests, q):
         item.update(adjusted_p=float(value), rejected=bool(item["raw_p"] is not None and value <= spec.fdr_alpha))
-    return {"method": spec.fdr_method, "alpha": spec.fdr_alpha, "family_size": m,
-            "family": "one two-sided Rank IC mean test per frozen candidate, including unavailable tests", "tests": tests}
+    return {"method": "BH", "alpha": spec.fdr_alpha, "family_size": m,
+            "family": "one two-sided Rank IC mean test per frozen candidate/horizon pair, including unavailable tests", "tests": tests}
 
 
 def compare_experiment(report: dict[str, Any], control: dict[str, Any], plan: dict[str, Any],

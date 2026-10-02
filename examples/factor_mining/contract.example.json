@@ -3,6 +3,7 @@
   "plan3_tracks_gate": false,
   "a_start": "2026-07-01T00:00:00Z",
   "b_start": "2026-07-05T00:00:00Z",
+  "b_horizons": [1, 4, 24],
   "c_end": "2026-07-13T00:00:00Z",
   "c_start": "2026-07-09T00:00:00Z",
   "confidence": 0.95,

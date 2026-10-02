@@ -3,16 +3,17 @@ import copy
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from test_factor_mining import ScenarioModel, definition, input_panel, specification
 from crypto_quant.research.factor_mining.contracts import dumps
 from crypto_quant.research.factor_mining.evaluation import evaluate_factor
+from crypto_quant.research.factor_mining.factor_archive import EvaluationKey, FactorArchive, FactorIdentity
 from crypto_quant.research.factor_mining.goal import GoalRunner, GoalSpec
 from crypto_quant.research.factor_mining.model import ModelReply
-from crypto_quant.research.factor_mining.records import write_json
-from crypto_quant.research.factor_mining.workflow import FactorMiner, _panel_fingerprint
+from crypto_quant.research.factor_mining.workflow import FactorMiner
 
 
 from crypto_quant.research.factor_mining.codex_model import CodexModel
@@ -68,7 +69,7 @@ class GoalModel:
                         for decision in value["decisions"]:
                             cid = decision["candidate_id"]
                             if f"{cid}-duplicate" in ids:
-                                decision.update(disposition="discard", continue_optimization=False,
+                                decision.update(disposition="discard", retained_horizons=[], continue_optimization=False,
                                                 evidence_refs=[f"{cid}-duplicate"], resume_condition=None)
                 self.miners[run_id] = ScenarioModel(transform=transform, propose_once=self.optimize)
             return self.miners[run_id].complete(messages, max_output_tokens=max_output_tokens, session_id=session_id)
@@ -89,7 +90,7 @@ class GoalTests(unittest.TestCase):
             saved = json.loads((runner.root / "goal.json").read_text())
             self.assertNotIn("code", saved)
             self.assertNotIn("sha256", saved)
-            saved["code"] = {"legacy.py": "different-code-version"}
+            saved["code"] = {"workflow.py": "different-code-version"}
             (runner.root / "goal.json").write_text(json.dumps(saved))
             self.assertEqual(GoalRunner(runner.root, runner.model).state["phase"], "select_task")
 
@@ -107,8 +108,8 @@ class GoalTests(unittest.TestCase):
                           poll_seconds=1, sleep=sleep)
 
     @staticmethod
-    def passing_B(values, labels, spec, stage, direction):
-        report = evaluate_factor(values, labels, spec, stage, direction)
+    def passing_B(values, labels, spec, stage, direction, *, horizon_hours=24):
+        report = evaluate_factor(values, labels, spec, stage, direction, horizon_hours=horizon_hours)
         if stage == "B":
             report["summary"]["rank_ic"].update(mean=direction * 0.2, p_value=0.000001)
             report["summary"]["directional_spread"].update(mean=0.003, p_value=0.000001)
@@ -120,18 +121,19 @@ class GoalTests(unittest.TestCase):
             model = GoalModel(optimize=True)
             runner, a, b = self.create(directory, model)
             b_runs = set()
-            def evaluation(values, labels, spec, stage, direction):
+            def evaluation(values, labels, spec, stage, direction, *, horizon_hours=24):
                 if stage == "B":
                     b_runs.add(spec.run_id)
                 if stage == "B" and len(b_runs) == 1:
-                    return evaluate_factor(values, labels, spec, stage, direction)
-                return self.passing_B(values, labels, spec, stage, direction)
+                    return evaluate_factor(values, labels, spec, stage, direction, horizon_hours=horizon_hours)
+                return self.passing_B(values, labels, spec, stage, direction, horizon_hours=horizon_hours)
             with patch("crypto_quant.research.factor_mining.workflow.evaluate_factor", side_effect=evaluation):
                 result = self.run_goal(runner, a, b)
             self.assertEqual(result["status"], "complete")
             self.assertEqual(result["cycle"], 2)
             self.assertGreaterEqual(len(result["qualified_ideas"]), 1)
-            runs = sorted((runner.root / "runs").iterdir())
+            runs = sorted(path for path in (runner.root / "runs").iterdir()
+                          if (path / "contract.json").is_file())
             self.assertEqual(len(runs), 2)
             first = json.loads((runs[0] / "a-complete.json").read_text())
             self.assertEqual(first["completed_rounds"], 2)  # existing optimization route still works
@@ -142,9 +144,45 @@ class GoalTests(unittest.TestCase):
             self.assertTrue(any(r["kind"] == "research_cycle" for r in selections[1]["records"]))
             self.assertIn("cycle-00000001", selections[1]["payload"]["allowed_evidence_refs"])
             self.assertNotIn("candidate-0001-evaluation", selections[1]["payload"]["allowed_evidence_refs"])
-            self.assertEqual(sum(record["kind"] == "data_provenance" for record in runner.research.all()), 1)
+            self.assertEqual(sum(record["kind"] == "data_provenance" for record in runner.research.all()), 2)
             archived = next(record for record in runner.research.all() if record["kind"] == "research_cycle")
             self.assertTrue(archived["data"]["context"]["candidates"])
+            cycle = json.loads((runner.research.root / f"{archived['id']}.json").read_text())["data"]
+            self.assertIsInstance(cycle["records"], dict)
+            self.assertEqual(cycle["candidate_ids"], ["candidate-0001", "candidate-0002"])
+            items = runner.research.read(archived["id"], "/records", 0, 100)["items"]
+            evaluation_index = next(i for i, item in enumerate(items)
+                                    if item["ref"]["record_id"] == "candidate-0001-evaluation")
+            evaluation_item = items[evaluation_index]
+            self.assertEqual(evaluation_item["candidate_id"], "candidate-0001")
+            self.assertIn("evaluation_id", evaluation_item["factor_archive_ref"])
+            page = runner.research.read(archived["id"],
+                                        f"/records/{evaluation_index}/data/periods", 0, 2)
+            self.assertEqual(len(page["items"]), 2)
+            originals = runner.research.source_records(archived["id"])
+            self.assertEqual(page["items"], originals[evaluation_index]["data"]["periods"][:2])
+            locator = evaluation_item["factor_archive_ref"]
+            source_run = runner.research._source_run(archived["data"])
+            factor_archive = FactorArchive.open_existing(
+                source_run / locator["root"], FactorIdentity(**locator["identity"]))
+            expected_values = factor_archive.page_factor_values(
+                EvaluationKey(**locator["evaluation_key"]), offset=0, limit=2)
+            values_page = runner.research.read(
+                archived["id"], f"/records/{evaluation_index}/data/factor_values", 0, 2)
+            self.assertEqual(values_page, expected_values)
+            self.assertEqual(evaluation_item["record_id"], "candidate-0001-evaluation")
+            self.assertNotIn('"periods"', dumps(cycle))
+            admissions = [r for r in runner.receipts.all() if r["kind"] == "program_admission"]
+            self.assertTrue(admissions)
+            for receipt in admissions:
+                for idea in receipt["data"]["ideas"]:
+                    self.assertEqual(idea["a_evaluation_ref"], {
+                        "record_id": f"{idea['candidate_id']}-evaluation"})
+                    self.assertEqual(idea["run_id"], (runner.root / idea["run_path"]).name)
+                    source_evaluation = json.loads((runner.root / idea["run_path"] / "a_records" /
+                        f"{idea['candidate_id']}-evaluation.json").read_text())
+                    self.assertEqual(idea["factor_archive_ref"], source_evaluation["data"]["factor_archive"])
+                    self.assertNotIn("a_evaluation", idea)
             for request in model.requests:
                 if request["role"] in {"ideator", "optimizer"}:
                     encoded = dumps(request)
@@ -167,58 +205,76 @@ class GoalTests(unittest.TestCase):
             runner, a, _ = self.create(directory)
             runner.state["task"] = {"action": "explore_new", "task": "next", "reason": "new",
                                     "evidence_refs": ["inputs-00000001"], "dependencies": []}
-            fingerprint = runner._context(a)["prior_A_research"]["cycles"]
-            self.assertEqual(fingerprint, [])
-            runner.research.append("cycle-00000001", "research_cycle", {"run_id": "prior-run", "records": [
-                {"id": "inputs", "kind": "data_provenance",
-                 "data": {"fingerprint": _panel_fingerprint(a)}},
-                {"id": "candidate-0001-definition", "kind": "candidate", "data": {
-                    "id": "candidate-0001", "definition": definition("ts_mean(perp_close,24)")}},
-                {"id": "candidate-0001-calculation", "kind": "calculation", "data": {
-                    "candidate_id": "candidate-0001", "status": "computed",
-                    "executed_expression": {"expanded_expression": "ts_mean(perp_close,24)"}}},
-                {"id": "candidate-0001-evaluation", "kind": "evaluation", "data": {
-                    "candidate_id": "candidate-0001", "summary": {"rank_ic": {"mean": 0.01}},
-                    "coverage": {"computed": 10}, "periods": [{"rank_ic": 0.01}] * 10000}},
-                {"id": "round-001-optimization", "kind": "optimization", "data": {"decisions": [{
-                    "candidate_id": "candidate-0001", "disposition": "pause",
-                    "continue_optimization": False, "reason": "weak", "resume_condition": "new evidence"}]}}
-            ]})
+            self.assertEqual(runner._context(a)["prior_A_research"]["cycles"], [])
+            miner = FactorMiner(replace(runner.spec, run_id="prior-run"), ScenarioModel(),
+                                runner.root / "runs")
+            miner.explore(a)
+            runner.state["cycle"] = 1
+            runner._archive_A(miner)
+            evaluation = miner.store._load(miner.store.root / "candidate-0001-evaluation.json")["data"]
             context = runner._context(a)
             encoded = dumps(context)
             self.assertLess(len(encoded), 10000)
             self.assertNotIn('"periods"', encoded)
             candidate = context["prior_A_research"]["cycles"][0]["candidates"][0]
-            self.assertEqual(candidate["A_evaluation"]["summary"]["rank_ic"]["mean"], 0.01)
-            self.assertEqual(candidate["final_decision"]["disposition"], "pause")
+            self.assertEqual(candidate["A_evaluation"]["summary"], evaluation["summary"])
+            self.assertEqual(candidate["final_decision"]["disposition"], "retain")
+            self.assertEqual(context["previous_expressions"], [])
+            cycle = json.loads((runner.research.root / "cycle-00000001.json").read_text())["data"]
+            evaluation_index = next(i for i, item in enumerate(cycle["records"]["items"])
+                                    if item["ref"]["record_id"] == "candidate-0001-evaluation")
+            original = runner.research.read("cycle-00000001",
+                f"/records/{evaluation_index}/data/periods", 5, 1)
+            self.assertEqual(original["items"], evaluation["periods"][5:6])
 
-    def test_goal_context_uses_saved_cycle_index_and_source_A_inputs(self):
+            miner = FactorMiner(specification(), ScenarioModel(), Path(directory) / "retest")
+            result = miner.explore(a, goal_context=context)
+            self.assertIn("candidate-0001", result["evaluated_ids"])
+            self.assertFalse((miner.root / "a_records" / "candidate-0001-duplicate.json").exists())
+
+    def test_goal_context_uses_saved_cycle_context_without_hash_lookup(self):
         with tempfile.TemporaryDirectory() as directory:
             runner, a, _ = self.create(directory)
             runner.state["task"] = {"action": "explore_new", "task": "next", "reason": "new",
                                     "evidence_refs": ["inputs-00000001"], "dependencies": []}
             run_id = "prior-run"
-            inputs = runner.root / "runs" / run_id / "a_records" / "inputs.json"
-            write_json(inputs, {"id": "inputs", "kind": "data_provenance",
-                                "data": {"fingerprint": _panel_fingerprint(a)}})
             context = {"source_record_id": "cycle-00000001", "run_id": run_id,
                        "candidates": [{"candidate_ref": "prior-run/candidate-0001"}],
                        "previous_expressions": [{"expression": "cross_rank(funding_24h_sum)"}]}
             runner.research.append("cycle-00000001", "research_cycle", {
-                "run_id": run_id, "records": [{"id": "inputs", "data": {"fingerprint": _panel_fingerprint(a)}}],
+                "run_id": run_id,
+                "records": {"run_path": f"{runner.goal.goal_id}/runs/{run_id}", "items": []},
                 "context": context,
             })
             summary = next(record for record in runner.research.all() if record["kind"] == "research_cycle")
-            self.assertEqual(summary["data"]["records"]["pointer"], "/records")
+            self.assertEqual(summary["data"]["records"]["items"], [])
             self.assertEqual(runner._context(a)["prior_A_research"]["cycles"][0]["candidates"],
                              context["candidates"])
+            self.assertEqual(runner._context(a)["previous_expressions"], [])
+
+    def test_goal_selection_does_not_deduplicate_catalog_by_fingerprint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, a, _ = self.create(directory)
+
+            runner._select(a)
+            first_id = runner.model.requests[-1]["payload"]["catalog_record_id"]
+            runner._select(a)
+            second_id = runner.model.requests[-1]["payload"]["catalog_record_id"]
+
+            catalog_ids = [record["id"] for record in runner.research.all()
+                           if record["kind"] == "data_provenance"]
+            self.assertEqual(catalog_ids, [first_id, second_id])
+            self.assertNotEqual(first_id, second_id)
+            fingerprints = [record["data"]["fingerprint"] for record in runner.research.all()
+                            if record["kind"] == "data_provenance"]
+            self.assertEqual(fingerprints[0], fingerprints[1])
 
     def test_successor_goal_continues_after_imported_cycle_numbers(self):
         with tempfile.TemporaryDirectory() as directory:
             runner, a, _ = self.create(directory)
             runner.research.append("cycle-00000020", "research_cycle", {
                 "run_id": "prior-run",
-                "records": [],
+                "records": {"run_path": f"{runner.goal.goal_id}/runs/prior-run", "items": []},
                 "context": {"source_record_id": "cycle-00000020", "run_id": "prior-run",
                             "candidates": [], "previous_expressions": []},
             })
@@ -244,6 +300,40 @@ class GoalTests(unittest.TestCase):
             self.assertEqual(archive.read_bytes(), original)
             self.assertEqual(len([record for record in runner.research.all()
                                   if record["kind"] == "research_cycle"]), 1)
+
+    def test_v6_admission_receipt_recovery_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, a, b = self.create(directory)
+            save = runner._save
+            def interrupt_completion(**changes):
+                if changes.get("status") == "complete":
+                    raise KeyboardInterrupt()
+                save(**changes)
+            with patch.object(runner, "_save", side_effect=interrupt_completion), patch(
+                    "crypto_quant.research.factor_mining.workflow.evaluate_factor", side_effect=self.passing_B):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.run_goal(runner, a, b)
+            self.assertEqual(runner.state["phase"], "finish_cycle")
+            saved_receipt = (runner.receipts.root / "admission-00000001.json").read_bytes()
+            saved_match = (runner.receipts.root / "match-00000001.json").read_bytes()
+            saved_cycle = (runner.research.root / "cycle-00000001.json").read_bytes()
+            idea = json.loads(saved_receipt)["data"]["ideas"][0]
+            self.assertIn("a_evaluation_ref", idea)
+            self.assertIn("factor_archive_ref", idea)
+            self.assertNotIn("a_evaluation", idea)
+            saved_cards = {p.name: p.read_bytes() for p in (runner.root / "ideas").glob("*.json")}
+            requests = len(runner.model.requests)
+            def forbidden():
+                raise AssertionError("completion recovery must not load A or B data")
+            restarted = GoalRunner(runner.root, runner.model)
+            result = restarted.run(forbidden, forbidden, forbidden, runner.root / "ideas", poll_seconds=1)
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual((runner.receipts.root / "admission-00000001.json").read_bytes(), saved_receipt)
+            self.assertEqual((runner.receipts.root / "match-00000001.json").read_bytes(), saved_match)
+            self.assertEqual((runner.research.root / "cycle-00000001.json").read_bytes(), saved_cycle)
+            self.assertEqual({p.name: p.read_bytes() for p in (runner.root / "ideas").glob("*.json")}, saved_cards)
+            self.assertEqual(result["qualified_ideas"], [idea["idea_id"]])
+            self.assertEqual(len(runner.model.requests), requests)
 
     def test_goal_and_ideation_do_not_block_interpretation_text(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -423,21 +513,21 @@ class GoalTests(unittest.TestCase):
             self.assertEqual(result["cycle"], 2)
             self.assertEqual(len(result["qualified_ideas"]), 2)
 
-    def test_same_formula_on_same_A_is_not_retested_under_new_run_id(self):
+    def test_same_formula_without_data_version_is_researched_under_new_run_id(self):
         with tempfile.TemporaryDirectory() as directory:
             model = GoalModel(duplicate=True)
             runner, a, b = self.create(directory, model, target=2)
             with patch("crypto_quant.research.factor_mining.workflow.evaluate_factor", side_effect=self.passing_B):
                 for _ in range(5):
                     runner._step(lambda: a, lambda: b, lambda: b.universe, runner.root / "ideas")
-                for _ in range(4):
+                for _ in range(5):
                     runner._step(lambda: a, lambda: b, lambda: b.universe, runner.root / "ideas")
             self.assertEqual(runner.state["cycle"], 2)
-            self.assertEqual(runner.state["phase"], "select_task")
-            self.assertEqual(len(runner.state["qualified_ideas"]), 1)
+            self.assertEqual(runner.state["phase"], "complete")
+            self.assertEqual(len(runner.state["qualified_ideas"]), 2)
             second = sorted((runner.root / "runs").iterdir())[1]
-            self.assertTrue((second / "a_records/candidate-0001-duplicate.json").exists())
-            self.assertFalse((second / "b-access-started.json").exists())
+            self.assertTrue((second / "a_records/candidate-0001-evaluation.json").exists())
+            self.assertTrue((second / "b-access-started.json").exists())
 
     def test_changed_A_cannot_resume_partial_run_and_incomplete_B_cannot_reread(self):
         with tempfile.TemporaryDirectory() as directory:

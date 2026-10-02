@@ -51,6 +51,9 @@ DECISION_SCHEMA = _object_schema({
     "candidate_id": _text_schema("本次需要决策的候选ID"),
     "disposition": {"type": "string", "enum": ["optimize", "retain", "pause", "discard"],
                     "description": "继续优化／保留待B验证／暂停／淘汰；retain可以同时继续优化"},
+    "retained_horizons": _array_schema(
+        {"type": "integer", "enum": [1, 4, 24]}, maxItems=3,
+        description="retain时选择有完整A数值证据的送B期限；其他去向填写空列表"),
     "continue_optimization": {"type": "boolean"},
     "answers": _object_schema({key: {**_object_schema({
         "supported": {"type": "boolean"}, "reason": _text_schema(question)}), "description": question}
@@ -61,6 +64,31 @@ DECISION_SCHEMA = _object_schema({
 })
 
 class OptimizerRole:
+    @staticmethod
+    def _check_retained_horizon_evidence(report: Any, horizon: int, direction: int) -> None:
+        require(isinstance(report, dict) and report.get("segment") == "A"
+                and type(report.get("horizon_hours")) is int and report["horizon_hours"] == horizon
+                and type(report.get("direction")) is int and report["direction"] == direction,
+                f"retained {horizon}h requires matching A horizon evidence")
+        required_report = {"summary", "coverage", "periods", "stages", "per_symbol"}
+        require(required_report <= report.keys(), f"retained {horizon}h A evidence is incomplete")
+        summary = report["summary"]
+        require(isinstance(summary, dict), f"retained {horizon}h A summary is incomplete")
+        summary_fields = {"rank_ic", "directional_spread", "raw_high_low_spread_mean", "ic_direction_share",
+                          "spread_direction_share", "group_means", "positive_stage_share", "valid_stages"}
+        require(summary_fields <= summary.keys(), f"retained {horizon}h A summary is incomplete")
+        inference_fields = {"mean", "std", "mean_std_ratio", "n", "grid_periods", "method", "lags",
+                            "confidence", "alternative", "se", "ci", "p_value", "status"}
+        for name in ("rank_ic", "directional_spread"):
+            metric = summary.get(name)
+            require(isinstance(metric, dict) and inference_fields <= metric.keys(),
+                    f"retained {horizon}h A {name} evidence is incomplete")
+        coverage_fields = {"eligible_observations", "purged_observations", "purged_hours", "status_counts"}
+        require(isinstance(report["coverage"], dict) and coverage_fields <= report["coverage"].keys()
+                and isinstance(report["periods"], list) and isinstance(report["stages"], list)
+                and isinstance(report["per_symbol"], list),
+                f"retained {horizon}h A detail evidence is incomplete")
+
     def _check_optimization(self, optimization: dict[str, Any], review_ids: list[str]):
         require(set(optimization) == {"analysis", "decisions", "diagnostics", "proposals"}, "invalid optimizer schema")
         text(optimization["analysis"], "optimization analysis")
@@ -99,6 +127,15 @@ class OptimizerRole:
             require(isinstance(cid, str) and cid in review_ids and cid not in decisions, "unknown or repeated candidate decision")
             disposition, continuing = value["disposition"], value["continue_optimization"]
             require(disposition in {"optimize", "retain", "pause", "discard"} and type(continuing) is bool, "invalid candidate disposition")
+            retained_horizons = value["retained_horizons"]
+            require(isinstance(retained_horizons, list)
+                    and all(type(horizon) is int and horizon in {1, 4, 24} for horizon in retained_horizons)
+                    and len(retained_horizons) == len(set(retained_horizons)),
+                    "retained_horizons must be a unique list from [1, 4, 24]")
+            if disposition == "retain":
+                require(bool(retained_horizons), "retain requires at least one retained horizon")
+            else:
+                require(not retained_horizons, "only retain decisions may specify retained horizons")
             require((disposition != "optimize" or continuing) and (disposition not in {"pause", "discard"} or not continuing),
                     "candidate disposition contradicts optimization decision")
             text(value["reason"], "candidate decision reason")
@@ -118,6 +155,20 @@ class OptimizerRole:
             if disposition == "retain" or continuing:
                 require("evaluation" in self.candidates[cid] and any(r["kind"] == "evaluation" for r in own_results),
                         "retention or optimization requires evaluated candidate evidence")
+            if disposition == "retain":
+                evaluation_records = [record for record in own_results if record["kind"] == "evaluation"]
+                require(len(evaluation_records) == 1
+                        and evaluation_records[0]["id"] == f"{cid}-evaluation"
+                        and evaluation_records[0]["data"].get("segment") == "A",
+                        "retained candidate requires its A evaluation record")
+                comparison = evaluation_records[0]["data"].get("horizon_comparison")
+                require(isinstance(comparison, dict) and isinstance(comparison.get("horizons"), dict),
+                        "retained candidate requires A horizon comparison evidence")
+                horizons = comparison["horizons"]
+                definition = self.candidates[cid]["definition"]
+                for horizon in retained_horizons:
+                    self._check_retained_horizon_evidence(horizons.get(str(horizon)), horizon,
+                                                          definition["direction"])
             if disposition == "discard":
                 require("evaluation" in self.candidates[cid] or "duplicate_of" in self.candidates[cid],
                         "calculation failure alone cannot discard a candidate; pause for diagnosis")
@@ -163,6 +214,8 @@ class OptimizerRole:
             "不得将‘A段未做全批次FDR、未做正交化或A段非独立样本’作为拒绝送B的理由。"
             "A段判断当前候选是否值得固定送B时，综合预设方向的Rank IC幅度与不确定性、"
             "ICIR和分阶段结果、分组收益形态及金融假设；微弱但有重复迹象的预测关系可以retain。"
+            "retain必须输出非空retained_horizons，只能从[1,4,24]选择且每个选择都须有完整的A数值证据；"
+            "不要求统计显著，保留微弱但有重复迹象的期限。optimize、pause、discard的retained_horizons必须为空列表。"
             "不得仅因单因子价差未显著、五组不严格单调或尚未做策略端中性化而拒绝送B。"
             "ICIR只是稳定性诊断，不设脱离本批历史分布的硬门槛；IC点估计稍正也不能单独证明有效。"
             "若认为当前候选仍有改进空间，支持在判定retain的同时将continue_optimization设为true继续优化。"
