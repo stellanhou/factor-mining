@@ -8,7 +8,6 @@ the daily object indexes, and :class:`~crypto_quant.data_access.market_data.Mark
 from __future__ import annotations
 
 import gzip
-import hashlib
 import io
 import json
 import os
@@ -427,7 +426,6 @@ def _fetch_one(
     key = str(item["key"])
     expected = int(item.get("size", 0))
     response = provider.client().get_object(Bucket=provider.bucket, Key=key)
-    digest = hashlib.sha256()
     chunks: List[bytes] = []
     body = response["Body"]
     try:
@@ -436,7 +434,6 @@ def _fetch_one(
             if not chunk:
                 break
             chunks.append(chunk)
-            digest.update(chunk)
     finally:
         body.close()
     payload = b"".join(chunks)
@@ -446,14 +443,12 @@ def _fetch_one(
     entry = {
         **dict(item),
         "member": key,
-        "sha256": digest.hexdigest(),
         "bytes": written,
     }
     aggregate_rows, invalid_notional_count = _aggregate_liquidation_payload(
         payload,
         symbol=str(item["symbol"]),
         source_key=key,
-        source_sha256=entry["sha256"],
     )
     if invalid_notional_count:
         entry["invalid_notional_count"] = invalid_notional_count
@@ -474,7 +469,6 @@ def _write_hourly_aggregate(
         "hourly_aggregate": str(path),
         "hourly_aggregate_rows": len(frame),
         "hourly_aggregate_bytes": path.stat().st_size,
-        "hourly_aggregate_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
 
 
@@ -489,7 +483,6 @@ def _existing_hourly_aggregate_metadata(path: Path) -> Dict[str, Any]:
         "hourly_aggregate": str(path),
         "hourly_aggregate_rows": parquet.ParquetFile(path).metadata.num_rows,
         "hourly_aggregate_bytes": path.stat().st_size,
-        "hourly_aggregate_sha256": _sha256_file(path),
     }
 
 
@@ -509,7 +502,6 @@ def _materialize_archive_aggregate(
                 member.read(),
                 symbol=str(entry["symbol"]),
                 source_key=key,
-                source_sha256=str(entry["sha256"]),
             )
             aggregate_rows.extend(rows)
             if invalid_notional_count and isinstance(entry, dict):
@@ -531,10 +523,6 @@ def _archive_day(
     if archive.is_file() and manifest.is_file():
         payload = json.loads(manifest.read_text(encoding="utf-8"))
         if int(payload.get("archive_bytes", -1)) == archive.stat().st_size:
-            actual_archive_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
-            expected_archive_sha256 = str(payload.get("archive_sha256", ""))
-            if expected_archive_sha256 and actual_archive_sha256 != expected_archive_sha256:
-                raise IOError(f"cached liquidation archive changed: {archive}")
             if not aggregate_path.is_file():
                 payload.update(
                     _materialize_archive_aggregate(
@@ -542,21 +530,13 @@ def _archive_day(
                     )
                 )
                 _write_json_atomic(manifest, payload)
-            elif not payload.get("hourly_aggregate_sha256"):
+            elif (
+                "hourly_aggregate_rows" not in payload
+                or "hourly_aggregate_bytes" not in payload
+            ):
                 payload.update(_existing_hourly_aggregate_metadata(aggregate_path))
                 _write_json_atomic(manifest, payload)
-            expected_aggregate_sha256 = str(
-                payload.get("hourly_aggregate_sha256", "")
-            )
-            if expected_aggregate_sha256:
-                actual_aggregate_sha256 = hashlib.sha256(
-                    aggregate_path.read_bytes()
-                ).hexdigest()
-                if actual_aggregate_sha256 != expected_aggregate_sha256:
-                    raise IOError(
-                        f"cached liquidation hourly aggregate changed: {aggregate_path}"
-                    )
-            return {**payload, "status": "existing_verified"}
+            return {**payload, "status": "existing"}
 
     fetched: Dict[str, tuple[Dict[str, Any], bytes, List[Dict[str, Any]]]] = {}
     failures: List[Dict[str, str]] = []
@@ -596,7 +576,6 @@ def _archive_day(
             member_entries.append(entry)
             aggregate_rows.extend(rows)
     os.replace(temporary, archive)
-    archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     result = {
         "provider": PROVIDER,
         "exchange": EXCHANGE,
@@ -604,7 +583,6 @@ def _archive_day(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "archive": str(archive),
         "archive_bytes": archive.stat().st_size,
-        "archive_sha256": archive_digest,
         "members": member_entries,
         "member_count": len(member_entries),
         "member_bytes": sum(int(row["bytes"]) for row in member_entries),
@@ -887,19 +865,8 @@ def liquidation_ingestion_status(raw_root: Path) -> Dict[str, Any]:
     }
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def audit_liquidation_history(raw_root: Path) -> Dict[str, Any]:
-    """Verify every daily raw archive and normalized aggregate against hashes."""
+    """Check daily raw archive and normalized aggregate metadata."""
     root = Path(raw_root).resolve() / PROVIDER
     status = liquidation_ingestion_status(raw_root)
     manifests = sorted((root / "_daily_manifests").glob("*.json"))
@@ -919,18 +886,12 @@ def audit_liquidation_history(raw_root: Path) -> Dict[str, Any]:
             continue
         if archive.stat().st_size != int(payload.get("archive_bytes", -1)):
             issues.append({"date": date, "issue": "archive_size_mismatch"})
-        elif _sha256_file(archive) != str(payload.get("archive_sha256", "")):
-            issues.append({"date": date, "issue": "archive_sha256_mismatch"})
         if not aggregate.is_file():
             issues.append({"date": date, "issue": "hourly_aggregate_missing"})
         elif aggregate.stat().st_size != int(
             payload.get("hourly_aggregate_bytes", -1)
         ):
             issues.append({"date": date, "issue": "hourly_aggregate_size_mismatch"})
-        elif _sha256_file(aggregate) != str(
-            payload.get("hourly_aggregate_sha256", "")
-        ):
-            issues.append({"date": date, "issue": "hourly_aggregate_sha256_mismatch"})
         members = payload.get("members", [])
         member_count += int(payload.get("member_count", len(members)))
         member_bytes += int(payload.get("member_bytes", 0))
@@ -1004,7 +965,6 @@ def _aggregate_liquidation_payload(
     *,
     symbol: str,
     source_key: str,
-    source_sha256: str,
 ) -> tuple[List[Dict[str, Any]], int]:
     """Aggregate one small provider object without per-file pandas groupby cost."""
     table = _provider_parquet_table(payload)
@@ -1068,7 +1028,6 @@ def _aggregate_liquidation_payload(
                     int(received_time[selected].max()), unit="ns", utc=True
                 ),
                 "source_key": source_key,
-                "source_sha256": source_sha256,
             }
         )
     return rows, invalid_notional_count
