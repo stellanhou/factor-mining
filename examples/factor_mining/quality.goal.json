@@ -8,5 +8,5 @@
     "min_improvement": 0.01,
     "max_ic_loss": 0.001
   },
-  "max_cycles": 12
+  "max_cycles": null
 }

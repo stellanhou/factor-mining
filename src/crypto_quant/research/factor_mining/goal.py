@@ -57,8 +57,8 @@ class GoalSpec:
                     "quality minimum improvement must be positive")
             require(number(target["max_ic_loss"], "quality maximum IC loss") >= 0,
                     "quality maximum IC loss must be nonnegative")
-            require(type(self.max_cycles) is int and self.max_cycles > 0,
-                    "quality goals require an explicit positive max_cycles budget")
+            require(self.max_cycles is None or (type(self.max_cycles) is int and self.max_cycles > 0),
+                    "quality max_cycles must be a positive integer or null for no cycle limit")
 
     def as_dict(self):
         return {key: value for key, value in asdict(self).items() if value is not None}
@@ -165,13 +165,16 @@ class GoalRunner:
     def __init__(self, root: Path, model: JsonModel):
         self.root, self.model = Path(root), model
         saved = _read(self.root / "goal.json")
-        self.goal = GoalSpec(**saved["goal"])
         self.spec = ResearchSpec.from_dict(saved["research"])
         self.inputs = saved["inputs"]
         self.events = RecordStore(self.root / "events")
         self.research = GoalResearchStore(self.root / "research_records")
         self.receipts = RecordStore(self.root / "completion_records")
         self.state = self.status(self.root)
+        goal = dict(saved["goal"])
+        if "max_cycles" in self.state:
+            goal["max_cycles"] = self.state["max_cycles"]
+        self.goal = GoalSpec(**goal)
         self.model_settings = self.state.get("model_settings", saved["model_settings"])
         self.progress = ProgressLog.for_run(self.root)
 
@@ -694,7 +697,8 @@ class GoalRunner:
                         else len(self.state["qualified_ideas"]) >= self.goal.target_ideas)
             if achieved:
                 self._save(status="complete", phase="complete", error=None)
-            elif self.goal.quality_target is not None and self.state["cycle"] >= self.goal.max_cycles:
+            elif (self.goal.quality_target is not None and self.goal.max_cycles is not None
+                  and self.state["cycle"] >= self.goal.max_cycles):
                 self._save(status="budget_exhausted", phase="budget_exhausted", error=None)
             else:
                 self._save(status="active", phase="select_task", current_run=None, error=None)
@@ -713,8 +717,13 @@ class GoalRunner:
             # OS releases this lock on process exit; a second runner must fail.
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.state = self.status(self.root)
-            if self.state["status"] in {"complete", "budget_exhausted"}:
+            if self.state["status"] == "complete":
                 return self.state
+            if self.state["status"] == "budget_exhausted":
+                require(self.goal.quality_target is not None, "budget_exhausted requires a quality Goal")
+                if self.goal.max_cycles is not None:
+                    return self.state
+                self._save(status="active", phase="select_task", current_run=None, error=None)
             self._save(status="waiting" if self.state["phase"] == "wait_data" else "active", error=None)
             try:
                 graph = StateGraph(dict)
