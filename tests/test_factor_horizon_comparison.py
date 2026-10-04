@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -163,6 +164,64 @@ def _write_prepared_inputs(root: Path, fixture: dict) -> tuple[Path, dict, dict]
 
 
 class HorizonComparisonToolTests(unittest.TestCase):
+    def test_fixed_a_csv_round_trip_preserves_real_ulp_pair_and_rank_displacement(self):
+        # Read-only rows from preregistration.json E2.parents[0],
+        # experiments/factor_revalidation/historical_fm_v6_rerun_20260930/runs/
+        # factor_archive_v2/factor-000153.sqlite3, evaluation_id=1, value_set_id=1.
+        source_pair_csv = (
+            b"timestamp,symbol,factor_value\n"
+            b"2024-06-11 10:00:00+00:00,BNBUSDT,0.17857142857142858\n"
+            b"2024-06-17 15:00:00+00:00,DOGEUSDT,0.17857142857142855\n"
+        )
+        exact_pair = comparison.read_fixed_a_factor_values_csv(source_pair_csv, 2)
+        high = float(exact_pair.iloc[0])
+        low = float(exact_pair.iloc[1])
+        self.assertEqual(high.hex(), "0x1.6db6db6db6db7p-3")
+        self.assertEqual(low.hex(), "0x1.6db6db6db6db6p-3")
+        self.assertNotEqual(high, low)
+
+        default_pair = pd.read_csv(io.BytesIO(source_pair_csv))
+        self.assertEqual(default_pair["factor_value"].iloc[0], default_pair["factor_value"].iloc[1])
+
+        spec = specification()
+        start, end = spec.bounds("A")
+        times = pd.date_range(start, end, freq="h", inclusive="left")
+        symbols = ["ADAUSDT", "AVAXUSDT", "BNBUSDT", "BTCUSDT", "DOGEUSDT", "ETHUSDT"]
+        base = dict(zip(symbols, (0.05, 0.10, 0.15, 0.20, 0.25, 0.30)))
+        rows = []
+        for timestamp in times:
+            current = dict(base)
+            if timestamp == times[1]:
+                current["BNBUSDT"] = high
+                current["DOGEUSDT"] = low
+            rows.extend(current[symbol] for symbol in symbols)
+        index = pd.MultiIndex.from_product([times, symbols], names=["timestamp", "symbol"])
+        original_values = pd.Series(rows, index=index, name="factor_value", dtype=float)
+        values_csv = original_values.to_csv().encode("utf-8")
+
+        imported_values = comparison.read_fixed_a_factor_values_csv(values_csv, len(original_values))
+        default_rows = pd.read_csv(io.BytesIO(values_csv))
+        default_values = pd.Series(default_rows["factor_value"].to_numpy(dtype=float),
+                                   index=index, name="factor_value")
+        self.assertTrue(imported_values.equals(original_values))
+        self.assertEqual(default_values.loc[(times[1], "BNBUSDT")],
+                         default_values.loc[(times[1], "DOGEUSDT")])
+        self.assertNotEqual(imported_values.loc[(times[1], "BNBUSDT")],
+                            imported_values.loc[(times[1], "DOGEUSDT")])
+
+        universe = pd.Series(True, index=index, name="eligible")
+        from crypto_quant.research.factor_mining.evaluation import evaluate_rank_displacement
+        original_d = evaluate_rank_displacement(original_values, universe, spec, "A")
+        imported_d = evaluate_rank_displacement(imported_values, universe, spec, "A")
+        default_d = evaluate_rank_displacement(default_values, universe, spec, "A")
+        self.assertEqual(imported_d, original_d)
+        exact_period = imported_d["deltas"]["1"]["periods"][1]
+        default_period = default_d["deltas"]["1"]["periods"][1]
+        self.assertFalse(exact_period["has_ties_t"])
+        self.assertEqual(exact_period["displacement"], 4 / 36)
+        self.assertTrue(default_period["has_ties_t"])
+        self.assertEqual(default_period["displacement"], 3 / 36)
+
     def test_run_worker_imports_fixed_a_then_writes_goal_scoped_card_and_receipts(self):
         class MultiGoalModel(GoalModel):
             def complete(self, messages, *, max_output_tokens, session_id):
@@ -203,6 +262,36 @@ class HorizonComparisonToolTests(unittest.TestCase):
             run_dir = goal_root / "runs" / run_id
             self.assertTrue(run_dir.is_relative_to(goal_root / "runs"))
             self.assertFalse((group_dir / "goal" / "runs").exists())
+            frozen = json.loads((run_dir / "frozen_batch.json").read_text())
+            frozen_candidate = frozen["candidates"]["candidate-0001"]
+            self.assertEqual(frozen_candidate["rank_displacement_version"],
+                             "factor-rank-displacement-v1")
+            self.assertEqual(frozen_candidate["a_rank_displacement"]["definition_version"],
+                             "factor-rank-displacement-v1")
+            imported_evaluation = json.loads(
+                (run_dir / "a_records" / "candidate-0001-evaluation.json").read_text())["data"]
+            self.assertEqual(imported_evaluation["rank_displacement"]["definition_version"],
+                             "factor-rank-displacement-v1")
+            self.assertNotIn("periods", imported_evaluation["rank_displacement"]["deltas"]["1"])
+            source_evaluation = fixture["source_miner"].store._load(
+                fixture["source_miner"].store.root / "candidate-0001-evaluation.json")
+            source_d_locator = source_evaluation["data"]["rank_displacement_archive"]
+            self.assertEqual(imported_evaluation["rank_displacement_archive"]["evaluation_key"]["data_version"],
+                             f"{run_id}/A")
+            self.assertEqual(source_d_locator["evaluation_key"]["data_version"],
+                             f"{fixture['candidate']['source_run_id']}/A")
+            from crypto_quant.research.factor_mining.factor_archive import EvaluationKey, FactorArchive, FactorIdentity
+            marker = json.loads((run_dir / "factor_archive.json").read_text())
+            new_archive_root = (run_dir / marker["archive_root"]).resolve()
+            d_locator = imported_evaluation["rank_displacement_archive"]
+            d_archive = FactorArchive.open_existing(new_archive_root, FactorIdentity(**d_locator["identity"]))
+            d_evidence = d_archive.get_evaluation(EvaluationKey(**d_locator["evaluation_key"]))
+            source = d_evidence["provenance"][0]["source"]
+            self.assertEqual(source["source_run_id"], fixture["candidate"]["source_run_id"])
+            self.assertEqual(source["source_evaluation_id"],
+                             fixture["candidate"]["source_evaluation_id"])
+            self.assertEqual(d_evidence["payload"]["deltas"],
+                             source_evaluation["data"]["rank_displacement"]["deltas"])
             goal_data = json.loads((goal_root / "goal.json").read_text())
             self.assertEqual(goal_data["goal"]["objective"],
                              fixture["scope"]["source_goal_data"]["goal"]["objective"])
@@ -265,6 +354,60 @@ class HorizonComparisonToolTests(unittest.TestCase):
             self.assertTrue(match_requests)
             self.assertEqual(match_requests[-1]["payload"]["goal"]["objective"],
                              fixture["scope"]["source_goal_data"]["goal"]["objective"])
+
+    def test_fixed_a_import_keeps_legacy_engine_without_rank_displacement(self):
+        class LegacyStore:
+            def __init__(self):
+                self.records = {}
+
+            def append(self, record_id, kind, data):
+                self.records[record_id] = {"id": record_id, "kind": kind, "data": data}
+
+        class LegacyMiner:
+            def __init__(self, root):
+                self.root = root
+                self.root.mkdir()
+                self.store = LegacyStore()
+                self.frozen = None
+
+            @staticmethod
+            def _factor_identity(expression, direction):
+                from crypto_quant.research.factor_mining.factor_archive import FactorIdentity
+                return FactorIdentity(expression, str(direction), "expr-v1")
+
+            def _write_evaluation(self, candidate_id, stage, report, identity, *, definition):
+                return {"legacy_archive_locator": candidate_id, "stage": stage}
+
+            @staticmethod
+            def _evaluation_record_data(candidate_id, report, locator):
+                return {"candidate_id": candidate_id, "segment": report["segment"],
+                        "summary": report["summary"], "factor_archive": locator}
+
+            def freeze(self, candidate_ids, b_membership):
+                self.frozen = (candidate_ids, b_membership)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _source_a(root)
+            miner = LegacyMiner(root / "legacy_run")
+
+            def write_json(path, value):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(dumps(value), encoding="utf-8")
+
+            membership = object()
+            imported = comparison.import_fixed_a_batch(
+                miner, fixture["scope"], fixture["scope"]["batches"][0], {}, True,
+                {"provider": "legacy-fixture"}, membership, write_json,
+            )
+            record = miner.store.records["candidate-0001-evaluation"]
+            self.assertEqual(imported, ["candidate-0001"])
+            self.assertNotIn("rank_displacement", record["data"])
+            self.assertNotIn("rank_displacement_archive", record["data"])
+            self.assertEqual((miner.root / "A-universe.csv").read_bytes(),
+                             (Path(fixture["scope"]["source_goal"]) / "runs" /
+                              fixture["candidate"]["source_run_id"] / "A-universe.csv").read_bytes())
+            self.assertEqual(miner.frozen, (imported, membership))
 
     def test_a_review_pages_only_a_evidence_with_budget_below_one_mib(self):
         class PagedReviewModel:

@@ -72,6 +72,42 @@ def _archive_file(run_dir: Path, pointer: dict[str, Any]) -> Path:
     return path
 
 
+def _rank_displacement_section(lines: list[str], run_dir: Path, report: dict[str, Any] | None,
+                               locator: dict[str, Any] | None) -> None:
+    lines += ["### 信号持续性与换手倾向代理", ""]
+    if report is None:
+        if locator is not None:
+            raise ValueError("rank-displacement archive locator has no diagnostic report")
+        lines += ["未计算：该次运行没有保存排名变化诊断。", ""]
+        return
+    if locator is None:
+        raise ValueError("rank-displacement report has no archive locator")
+    deltas = report["deltas"]
+    lines += [f"定义版本：`{report['definition_version']}`；评价段：{report['segment']}；"
+              f"统计网格：每 {report['sample_hours']} 小时。", "",
+              "排名变化 D 描述共同合格币种的百分位排序变化；该指标本身不代表手续费或净收益。", "",
+              "| 间隔 Δ | 平均 D | 中位数 | P90 | 有效时点 / 应评时点 | 有效比例 | 边界排除 | 缺精确小时 | 共同币种不足 |",
+              "|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for delta in ("1", "4", "24"):
+        result = deltas[delta]
+        summary, coverage = result["summary"], result["coverage"]
+        lines.append("| " + " | ".join(_cell(value) for value in (
+            f"{delta}h", summary["mean"], summary["median"], summary["p90"],
+            f"{summary['valid_periods']} / {summary['expected_periods']}",
+            summary["valid_period_share"], coverage["boundary_excluded_periods"],
+            coverage["missing_exact_hour_periods"],
+            coverage["insufficient_common_symbol_periods"])) + " |")
+    lines += ["", "各阶段平均 D："]
+    for delta in ("1", "4", "24"):
+        values = [f"{stage['start']} 至 {stage['end']}：{_cell(stage['mean'])}"
+                  for stage in deltas[delta]["stages"]]
+        lines.append(f"- Δ={delta}h：" + ("；".join(values) if values else "无有效阶段"))
+    archive_path = _archive_file(run_dir, locator)
+    relative_archive = Path(os.path.relpath(archive_path, run_dir.resolve())).as_posix()
+    lines += ["", f"逐时指标、阶段明细和覆盖记录：SQLite evaluation `{locator['evaluation_id']}`，"
+              f"[排名变化诊断归档]({relative_archive})。", ""]
+
+
 def write_research_report(path: Path, run_id: str, purpose: str, records: list[dict[str, Any]], stage: str,
                           *, replace: bool = False) -> None:
     lines = [f"# 因子挖掘 {run_id}：{stage} 段", "",
@@ -145,6 +181,33 @@ def write_research_report(path: Path, run_id: str, purpose: str, records: list[d
                           f"- 暂停条件：{design['pause_condition']}",
                           f"- 依据：{refs}", "",
                           f"[完整建议](a_records/{record_id}.json)", ""]
+        displacement_comparisons = [record for record in records
+                                    if record["kind"] == "experiment_result"
+                                    and record["data"].get("plan", {}).get("experiment_design", {}).get("metric")
+                                    == "rank_displacement"]
+        if displacement_comparisons:
+            lines += ["## 排名变化受控修改配对结果", "",
+                      "程序在原候选与修改版的共同币种、时点和有效标签上重算 D 与方向 Rank IC。", "",
+                      "| 候选 / 对照 | H / Δ | D 改善均值及区间 | 有向 IC 变化及区间 | 配对有效时点 | 路线程序状态 |",
+                      "|---|---:|---:|---:|---:|---|"]
+            for record in displacement_comparisons:
+                data = record["data"]
+                coverage = data["coverage"]
+                improvement, ic_change = data["paired_improvement"], data["paired_ic_change"]
+                h_delta = f"{data['horizon_hours']}h / {data['displacement_hours']}h"
+                paired_periods = (f"{coverage['paired_valid_periods']} / {coverage['expected_periods']}"
+                                  f"（{_cell(coverage['paired_valid_period_share'])}）")
+                lines.append("| " + " | ".join(_cell(value) for value in (
+                    f"{data['candidate_id']} / {data['plan']['control_id']}", h_delta,
+                    f"{_cell(improvement['mean'])} [{_cell(improvement['ci'])}]",
+                    f"{_cell(ic_change['mean'])} [{_cell(ic_change['ci'])}]",
+                    paired_periods, data["route_decision"])) + " |")
+                lines += ["", f"{data['candidate_id']}：{data['reason']}。",
+                          f"主指标决定：{data['decision']}；路线状态：{data['route_decision']}。",
+                          f"覆盖：边界排除 {coverage['boundary_excluded_periods']} 期，"
+                          f"缺精确小时 {coverage['missing_exact_hour_periods']} 期，"
+                          f"共同币种不足 {coverage['insufficient_common_symbol_periods']} 期。",
+                          f"[逐期配对证据与合同](a_records/{record['id']}.json)", ""]
     for record in records:
         if record["kind"] != "evaluation":
             continue
@@ -251,6 +314,8 @@ def write_research_report(path: Path, run_id: str, purpose: str, records: list[d
                 lines += [f"- {horizon}h：" + ("；".join(horizon_results[str(horizon)]["reasons"])
                           or "无未通过原因")]
             lines += ["", f"[完整程序判定](b_records/{validations[cid]['id']}.json)。模型解释不改变此结果。", ""]
+        _rank_displacement_section(lines, path.parent, data.get("rank_displacement"),
+                                   data.get("rank_displacement_archive"))
         if cid in reports:
             model = reports[cid]
             lines += ["### 模型解释", "", model["analysis"], "", "适用及失效条件：", ""]

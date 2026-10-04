@@ -41,6 +41,10 @@
 
 计算、评估解释和优化决定分别保存。A 报告并列展示 1h、4h、24h 的共同样本结果。只有完整解释且明确 retain 的候选可以冻结；Optimizer 必须同时给出该候选的 `retained_horizons`。冻结后不能重开 A 或扩大期限。B 对冻结的每个期限分别评估，报告所有通过与未通过结果，并对全部“候选 × 期限”统一进行 BH 校正。
 
+新运行同时展示三个观测间隔 Δ=1h、4h、24h 的排名变化 D，包括覆盖、缺失及阶段差异。D 越低表示共同币种的相对排序越稳定，不等于实际成交费用越低。预测期限 H 与 Δ 分开使用；所有 Δ 均保留，不自动选择最小值作为总分。旧记录缺少该诊断时明确显示“未计算”。
+
+Optimizer 可提出 `rank_displacement` 受控修改：在生成变体公式前明确 H、Δ、D 的绝对改善下限与允许的方向 IC 损失。新旧因子必须在两端及标签均有效的共同样本上配对比较，程序根据区间决定继续、停止或暂停；停止一条修改路线不会自动淘汰原候选。该能力不默认给所有公式平滑，不改变 B 准入，也不自动恢复已暂停的 Goal。完整定义见[模块说明](../../src/crypto_quant/research/factor_mining/README.md#信号持续性与受控修改)。
+
 创意卡要求 A 保留期限与 B 通过期限有交集。卡片按候选生成，一项多期限研究仍只写一张卡；卡片保存逐期限摘要、覆盖、程序判定和归档引用。正式 B 门槛逐期限执行：校正通过、固定方向 IC 达到新合同的 `min_abs_ic`（研究示例为 0.01）、有向平均价差大于零；Plan3 轨道只作诊断标签。
 
 2026-10-02 的 [IC 门槛调整](../plans/FM-v6_IC门槛调整Plan.md)使用全部 44 个原始 A 候选标定 0.02、0.015、0.01，选用 0.01 作为弱信号研究门槛。旧冻结合同及结果仍按原规则解释。复现标定与保存 B 数值对照：
@@ -53,6 +57,14 @@ PYTHONPATH=src .venv/bin/python scripts/calibrate_fm_v6_ic.py compare --comparis
 
 该离线对照只统计数值合格身份，不写卡；新门槛在未参与选择的数据上的独立验证尚未完成。
 
+## 构想时查看因子树
+
+新的构想轮次会自动收到 A 段因子图谱，无需增加命令参数。成员来自当前运行此前的 A 研究和该 Goal 已传入的 A 历史，包含未成功的尝试；不会自动扫描正式卡片池或所有历史目录。首轮没有历史时显示空图谱。
+
+图谱用当前 A 面板重算已执行公式的信号相关性，提供完整层次树、分支成员、代表公式、字段覆盖和历史 A 证据。数量较多只说明该分支已有较多研究，不能据此禁止继续构想；字段使用较少也不等于存在有效信号。无法可靠计算相关性的候选保留状态和原因，不会被误标为新方向。
+
+每轮快照保存在 A 记录中，并在模型请求里引用。恢复未完成的构想请求会复用对应快照；原研究记录仍可回查。该改造帮助识别重复与提出差异假设，是否提高有效因子产出仍需相同预算下的研究对照。计算方法及数据边界见[模块说明](../../src/crypto_quant/research/factor_mining/README.md#hac-因子研究上下文)。
+
 ## 历史研究工具
 
 | 工具 | 固定范围与依赖 |
@@ -62,11 +74,13 @@ PYTHONPATH=src .venv/bin/python scripts/calibrate_fm_v6_ic.py compare --comparis
 
 这两个入口是固定历史研究工具，主目录常规挖掘不依赖旧源码。多期限重放须显式提供已保存的旧 24h 源码路径，例如 [baseline_source/src](/Users/stellan/.codex/worktrees/e535/量化投资/experiments/factor_mining/horizon_comparison_20261001_v3/baseline_source/src)：使用 `--baseline-engine-root`，运行 old24 组时同时设置对应的 `--engine-root`。脚本原默认值指向当次临时源码目录，不应作为长期复现入口。
 
+使用当前引擎导入固定历史 A 证据时，工具从原评估对应的归档因子值及同源 A 币池计算排名变化，写入新运行的诊断归档。归档 CSV 的数值列使用 `float_precision="round_trip"` 读取，保留原浮点值的区别，避免解析产生额外并列排名。缺少原值集时直接报错；不改写源评价，也不换库补齐。旧源码引擎仍使用其原评价定义。
+
 多期限工具的 `prepare` 会调用模型审阅 A 证据，`freeze-inputs` 会读取 B 行情，`run-group` 会生成隔离 Goal、报告和卡片；`recheck-completion` 会再次调用模型核验目标匹配。已有 [多期限对照证据](/Users/stellan/.codex/worktrees/e535/量化投资/experiments/factor_mining/horizon_comparison_20261001_v3/comparison.md)及 [IC 标定证据](/Users/stellan/.codex/worktrees/e535/量化投资/experiments/factor_mining/ic_calibration_20261002/)保留在 e535，本次主目录整合未复制实验产物或重跑研究。
 
 ## Goal 模式
 
-Goal 由优化角色安排 A 研究任务，程序管理等待、恢复和计数。目标文件必须显式给出目标及成果数量，例如：
+Goal 由优化角色安排 A 研究任务，程序管理等待、恢复和验收。数量目标显式给出 `target_ideas`，已有目标继续沿用原计数规则，例如：
 
 ```json
 {
@@ -75,6 +89,30 @@ Goal 由优化角色安排 A 研究任务，程序管理等待、恢复和计数
   "target_ideas": 2
 }
 ```
+
+本轮[质量目标](../../examples/factor_mining/quality.goal.json)使用 `quality_target`，与 `target_ideas` 二选一：预测期限 H=4h、排名变化间隔 Δ=4h，配对 D 改善的区间下界至少 0.01，方向 IC 变化的区间下界不低于 −0.001。区间置信度来自研究合同，正式合同为 95%。这些数值是本轮事先声明的验收要求，没有从历史实验中确定为最优门槛。
+
+只有候选完成预声明的 A 段受控修改、程序配对判定 `continue`、满足上述区间要求、通过同一 4h 期限的原有 B 准入，并经目标内容核验，质量 Goal 才完成。普通 B 合格卡和模型肯定意见不能单独完成质量目标。图谱用于支持差异化构想，实际组合增量仍留待后续检验。B 的 BH、IC 下限和正价差规则不变，B 的 D 继续只作诊断。
+
+质量目标必须给出 `max_cycles`。本轮上限为 12 个研究批次；全部处理完仍未达到质量要求时，状态为 `budget_exhausted`，表示预算用尽且目标未达成。`goal-resume` 对该状态只返回保存结果，不会自动追加预算。
+
+四角色模型可用 `--role-models` 指定。[本轮配置](../../examples/factor_mining/role-models.json)为构想 Astra/max、计算 Luna/max、评估 6.1 Sol/high/Fast、优化 6.1 Sol/max/Fast。Sol 两项的 `service_tier="priority"` 是当前 Codex 模型目录中的 Fast 档位标识，与推理强度分开设置。请求显式指定档位并核对运行时接受结果；不支持或未接受 Fast 时直接停止，不自动降档。Fast 设置仅作用于这两个角色的研究进程，保存在 Goal 模型设置及调用留档中。计算角色的模型仅负责报错后的公式修复；因子值和数值检验由程序计算。四角色必须全部配置；纠正和证据补读继续使用原角色的模型，不自动切换。Goal 保存每个模型的完整接口及运行时设置，恢复时逐项核验。
+
+本轮启动方式如下；先复制研究合同并填写新的 `run_id`，币池沿用已核验的输入。当前项目随 SDK 的旧运行时尚不列出完整 GPT-6 模型，因此通过 `--codex-bin` 显式使用已核验的桌面运行时，不修改全局配置：
+
+```bash
+.venv/bin/python -m crypto_quant.cli factor-mine goal-start \
+  --goal examples/factor_mining/quality.goal.json \
+  --contract path/to/new-research-contract.json \
+  --universe experiments/factor_mining/long_history_20260919_setup/universe.csv \
+  --provider codex \
+  --role-models examples/factor_mining/role-models.json \
+  --codex-bin "$(command -v codex)"
+```
+
+使用角色配置时不再指定共享 `--model` 或 `--reasoning-effort`。单模型入口仍使用原参数。
+
+2026-10-04 本轮扩展为六组并发：H=1h、4h、24h，每个期限分别使用混合模型与全 Luna；各组的排名变化间隔 Δ 与 H 一致。全 Luna 组仅替换模型名，保留相同角色的推理强度及评估、优化角色的 Fast 档位。六组使用相同的 A/B 数据、币池、质量门槛和每组 12 批预算，独立保存研究历史、归档及卡片。配置、源码快照、数据来源与比较范围保存于[本轮清单](../../experiments/factor_mining/quality_comparison_20261004/six-arms-125251/manifest.json)。配置检查在真实模型启动前完成；当前 A 输入另行预检，B 行情在各组冻结后才读取。原 `quality.goal.json` 保留为 4h 单组示例，六组实际目标分别位于本轮各组目录的 `goal.input.json`。
 
 将目标与合同保存在自己的运行输入目录，并填写真实路径：
 
@@ -93,7 +131,7 @@ Goal 由优化角色安排 A 研究任务，程序管理等待、恢复和计数
 
 `goal-status` 不调用模型或行情。`goal-resume` 复用保存的目标、数据和模型设置。已完成 Goal 不再新增研究；`Ctrl+C` 保存暂停。A 研究、成果核验与 B 解释使用独立上下文，B 结果不回流到下一轮研究选择。
 
-Goal 的 cycle 采用当前引用格式，已有 cycle 复用原记录；不从旧版内嵌 JSON 恢复。目标只有在实际写卡、程序准入及目标匹配齐备后才计数。`waiting`、`paused`、`error` 和 `complete` 分别留存事件。
+Goal 的 cycle 采用当前引用格式，已有 cycle 复用原记录；不从旧版内嵌 JSON 恢复。数量目标只有在实际写卡、程序准入及目标匹配齐备后才计数；质量目标另外保存 A 配对证据引用、目标及区间结果。`waiting`、`paused`、`error`、`budget_exhausted` 和 `complete` 分别留存事件。
 
 ## 中断与补报告
 

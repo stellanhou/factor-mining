@@ -1,0 +1,12 @@
+{
+  "goal_id": "fm-v6-quality-20261004",
+  "objective": "利用A段因子图谱提出有明确差异假设、可为后续多因子组合补充候选的研究方向。找到通过既有B准入的4h预测候选，并在公式生成前声明的共同样本配对实验中证明：相对父因子，4h排名变化D的改善区间下界至少0.01，方向Rank IC变化区间下界不低于-0.001。由程序按质量证据验收，卡片数量不作为完成目标。图谱差异是研究依据，实际组合增量留待后续验证。",
+  "quality_target": {
+    "metric": "rank_displacement",
+    "horizon_hours": 4,
+    "displacement_hours": 4,
+    "min_improvement": 0.01,
+    "max_ic_loss": 0.001
+  },
+  "max_cycles": 12
+}

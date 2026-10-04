@@ -40,7 +40,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     reports.add_argument("--stage", choices=("A", "B"), required=True)
     reports.add_argument("--idea-pool", type=Path, default=Path("experiments/idea_pool"))
     goal = actions.add_parser("goal-start", help="优化Agent负责成果目标，持续研究直至完成；Ctrl+C暂停")
-    goal.add_argument("--goal", type=Path, required=True, help="goal_id、objective、target_ideas的JSON文件")
+    goal.add_argument("--goal", type=Path, required=True, help="数量或质量成果目标的JSON文件")
     goal.add_argument("--contract", type=Path, required=True)
     goal.add_argument("--output-root", type=Path, default=Path("experiments/factor_mining/goals"))
     goal.add_argument("--idea-pool", type=Path, default=Path("experiments/idea_pool"))
@@ -54,7 +54,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         action.add_argument("--universe", type=Path, required=True, help="timestamp,symbol,eligible的完整小时CSV")
         action.add_argument("--include-liquidations", action="store_true")
     for action in (explore, validate, reports, goal):
-        add_model_arguments(action)
+        add_model_arguments(action, include_roles=True)
 
 
 def load_membership(universe_path: Path, spec: ResearchSpec, stage: str) -> pd.Series:

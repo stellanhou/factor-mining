@@ -4,7 +4,8 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from .contracts import identifier, modification_plan, require, text, _object_schema, _text_schema, _array_schema, _nullable
+from .contracts import (identifier, modification_plan, number, require, text,
+                        _object_schema, _text_schema, _array_schema, _nullable)
 
 MODIFICATION_TASK_SCHEMA = _object_schema({
     "core_hypothesis": _text_schema("原候选的核心金融假设"),
@@ -14,15 +15,26 @@ MODIFICATION_TASK_SCHEMA = _object_schema({
     "fixed_components": _text_schema("除被检验改动外必须保持不变的定义部分"),
 })
 
-EXPERIMENT_DESIGN_SCHEMA = _object_schema({
+_EXPERIMENT_DESIGN_FIELDS = {
     "question": _text_schema("新候选与原候选的配对检验问题"),
-    "metric": {"type": "string", "enum": ["rank_ic", "directional_spread"]},
-    "min_improvement": {"type": "number", "exclusiveMinimum": 0, "description": "配对改善最低要求"},
+    "min_improvement": {"type": "number", "exclusiveMinimum": 0,
+                        "description": "配对改善最低要求；rank_displacement时为D_control−D_trial的绝对下降量"},
     "max_ic_loss": {"type": "number", "minimum": 0, "description": "允许的有向IC损失"},
     "expected_outcome": _text_schema("修改假设得到支持时预期出现的可观测变化"),
     "stop_condition": _text_schema("预定改善或IC损失区间上限不足时的停止条件"),
     "pause_condition": _text_schema("证据不精确或缺数据时的暂停条件"),
-})
+}
+
+EXPERIMENT_DESIGN_SCHEMA = {"anyOf": [
+    _object_schema({**_EXPERIMENT_DESIGN_FIELDS,
+        "metric": {"type": "string", "enum": ["rank_ic", "directional_spread"]}}),
+    _object_schema({**_EXPERIMENT_DESIGN_FIELDS,
+        "metric": {"type": "string", "enum": ["rank_displacement"]},
+        "horizon_hours": {"type": "integer", "enum": [1, 4, 24],
+                           "description": "配对Rank IC使用的预测期限H，必须显式选择"},
+        "displacement_hours": {"type": "integer", "enum": [1, 4, 24],
+                               "description": "待降低排名变化D的间隔Δ，必须显式选择"}}),
+]}
 
 PROPOSAL_SCHEMA = _object_schema({
     "proposal_id": _text_schema("唯一英文ID"),
@@ -88,6 +100,45 @@ class OptimizerRole:
                 and isinstance(report["periods"], list) and isinstance(report["stages"], list)
                 and isinstance(report["per_symbol"], list),
                 f"retained {horizon}h A detail evidence is incomplete")
+
+    @staticmethod
+    def _check_rank_displacement_evidence(candidate: dict[str, Any], experiment: dict[str, Any]) -> None:
+        evaluation = candidate.get("evaluation")
+        require(isinstance(evaluation, dict) and evaluation.get("segment") == "A",
+                "rank-displacement route requires control A evaluation evidence")
+        comparison = evaluation.get("horizon_comparison")
+        require(isinstance(comparison, dict) and isinstance(comparison.get("horizons"), dict),
+                "rank-displacement route requires A horizon-comparison evidence")
+        horizon = experiment["horizon_hours"]
+        horizon_report = comparison["horizons"].get(str(horizon))
+        OptimizerRole._check_retained_horizon_evidence(
+            horizon_report, horizon, candidate["definition"]["direction"])
+
+        displacement = candidate.get("rank_displacement") or evaluation.get("rank_displacement")
+        require(isinstance(displacement, dict) and displacement.get("segment") == "A"
+                and isinstance(displacement.get("definition_version"), str)
+                and bool(displacement["definition_version"])
+                and isinstance(displacement.get("deltas"), dict)
+                and set(displacement["deltas"]) == {"1", "4", "24"},
+                "rank-displacement route requires complete A displacement diagnostics")
+        selected = displacement["deltas"][str(experiment["displacement_hours"])]
+        require(isinstance(selected, dict)
+                and isinstance(selected.get("summary"), dict)
+                and isinstance(selected.get("coverage"), dict)
+                and isinstance(selected.get("periods"), list)
+                and isinstance(selected.get("stages"), list),
+                "rank-displacement route requires selected-interval A coverage and stage evidence")
+        summary = selected["summary"]
+        summary_fields = {"mean", "median", "p90", "valid_periods", "expected_periods", "valid_period_share"}
+        require(summary_fields <= summary.keys()
+                and type(summary["valid_periods"]) is int and summary["valid_periods"] > 0
+                and type(summary["expected_periods"]) is int
+                and summary["expected_periods"] >= summary["valid_periods"],
+                "rank-displacement route requires available A interval observations")
+        for field in ("mean", "median", "p90"):
+            number(summary[field], f"rank-displacement {field}")
+        share = number(summary["valid_period_share"], "rank-displacement valid_period_share")
+        require(0 < share <= 1, "rank-displacement A valid-period share must lie in (0, 1]")
 
     def _check_optimization(self, optimization: dict[str, Any], review_ids: list[str]):
         require(set(optimization) == {"analysis", "decisions", "diagnostics", "proposals"}, "invalid optimizer schema")
@@ -185,6 +236,19 @@ class OptimizerRole:
         plan = modification_plan(plan)
         control = plan["control_id"]
         require(control in self.candidates and "evaluation" in self.candidates[control], "experiment control must have A evidence")
+        if plan["experiment_design"]["metric"] == "rank_displacement":
+            self._check_rank_displacement_evidence(
+                self.candidates[control], plan["experiment_design"])
+            goal_context = next((record["data"] for record in self.store.all()
+                                 if record["kind"] == "goal_context"), None)
+            target = goal_context["goal"].get("quality_target") if goal_context else None
+            if target is not None:
+                design = plan["experiment_design"]
+                require(design["horizon_hours"] == target["horizon_hours"]
+                        and design["displacement_hours"] == target["displacement_hours"]
+                        and design["min_improvement"] >= target["min_improvement"]
+                        and design["max_ic_loss"] <= target["max_ic_loss"],
+                        "rank-displacement proposal must respect the frozen Goal quality target")
         records = {record["id"] for record in self.store.all()}
         require(all(ref in records for ref in plan["evidence_refs"]), "modification evidence must reference existing records")
         require(f"{control}-evaluation" in plan["evidence_refs"],
@@ -225,12 +289,24 @@ class OptimizerRole:
             "并为该候选提供至少一条proposal；false时禁止proposal。"
             "依据不足先给diagnostics，不强行生成修改任务。不得输出新候选定义、名称、最终公式、"
             "公式含义或方向；这些由下一轮Ideator首次生成。"
+            "如果A评估包含rank_displacement证据，阅读其中1h、4h、24h的D、覆盖和分阶段结果，"
+            "据此判断是否有具体的排序变化问题；D只表示排名变化，不是成交、手续费或实际换手金额。"
+            "只有有明确A证据支持的修改任务才可选择metric=rank_displacement；不得默认平滑所有因子。"
+            "rank_displacement任务必须显式指定horizon_hours和displacement_hours，二者分别表示预测期限H与排名变化间隔Δ，"
+            "各自只能是1、4或24小时；不得从最优结果倒选。该路线min_improvement是D_control−D_trial的绝对下降量，"
+            "没有Goal预声明要求时，必须依据A证据给出正值，不得套用示例或统一默认值。"
+            "Goal若含quality_target，rank_displacement路线沿用其H、Δ，最低改善不得降低，允许IC损失不得放宽；"
+            "研究目标已预声明数值不代表数据能达到，缺乏修改依据仍可暂停，不强造提案。"
+            "max_ic_loss保持现有的允许有向IC损失含义。"
+            "明确说明预测证据与D的两目标取舍：预测能力保持且D下降、预测增强且D未增、两者同时上升、"
+            "稳定但预测证据弱、或覆盖缩小后表面改善；需要覆盖不同时先要求共同样本配对比较。"
             "每条proposal只输出：精确证据引用、原核心假设、已观察问题、修改假设、语义改动目标和固定部分；"
             "以及与原候选的配对检验问题、主指标、最低改善、允许IC损失、预期、停止和暂停条件。"
             "同一假设下可在change_target中指定多个相互关联的语义改动，但不写可执行表达式。"
             "判断条件须与experiment_design.metric、最低改善和允许IC损失一致。"
             "control_id必须是获准继续的已评估候选；evidence_refs必须包含该候选的评估记录。"
-            "程序配对比较的决定不能覆盖；已停止路线若重新启动必须使用新路线并说明新增依据及旧路线。",
+            "程序配对比较的decision与route_decision是唯一的路线状态，不可在分析或建议中覆盖、改写或当作模型判定；"
+            "已停止路线若重新启动必须使用新路线并说明新增依据及旧路线。",
             {"round_candidate_ids": round_ids, "review_candidate_ids": review_ids,
              "candidate_decisions": self.decisions, "route_states": self.routes},
             _object_schema({"analysis": _text_schema("完整研究反馈"),

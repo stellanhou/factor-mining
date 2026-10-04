@@ -1,0 +1,6 @@
+{
+  "ideator": {"model": "gpt-6-astra", "reasoning_effort": "max"},
+  "calculator": {"model": "gpt-6-luna", "reasoning_effort": "max"},
+  "evaluator": {"model": "gpt-6.1-sol", "reasoning_effort": "high", "service_tier": "priority"},
+  "optimizer": {"model": "gpt-6.1-sol", "reasoning_effort": "max", "service_tier": "priority"}
+}

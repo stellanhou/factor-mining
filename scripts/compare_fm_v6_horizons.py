@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import sqlite3
@@ -161,6 +162,115 @@ def load_archive_payload(archive_path: Path, evaluation_id: str,
         "segment", "horizon", "value_set_id", "factor_value_count",
     )}
     return payload, meta
+
+
+def read_fixed_a_factor_values_csv(values_csv: bytes, expected_rows: int):
+    """Reconstruct archived binary64 values exactly from their CSV round-trip text."""
+    import pandas as pd
+
+    value_rows = pd.read_csv(io.BytesIO(values_csv), float_precision="round_trip")
+    require(list(value_rows.columns) == ["timestamp", "symbol", "factor_value"]
+            and len(value_rows) == expected_rows,
+            "source A factor values CSV shape or row count differs")
+    value_index = pd.MultiIndex.from_arrays([
+        pd.to_datetime(value_rows["timestamp"], utc=True, errors="raise"),
+        value_rows["symbol"].astype(str),
+    ], names=["timestamp", "symbol"])
+    require(value_index.is_unique, "source A factor values contain duplicate rows")
+    return pd.Series(pd.to_numeric(value_rows["factor_value"], errors="raise").to_numpy(dtype=float),
+                     index=value_index, name="factor_value")
+
+
+def imported_a_rank_displacement(miner: Any, fixed: dict[str, Any], source_meta: dict[str, Any],
+                                 source_run_dir: Path, source_calculation: dict[str, Any]
+                                 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Recompute D from the fixed A value set only when the target engine requires it."""
+    version = getattr(miner, "rank_displacement_version", None)
+    if version is None:
+        return None, None
+
+    from crypto_quant.features.factor_inputs import validate_universe
+    from crypto_quant.research.factor_mining.evaluation import (
+        RANK_DISPLACEMENT_VERSION, evaluate_rank_displacement,
+    )
+    from crypto_quant.research.factor_mining.factor_archive import (
+        EvaluationKey, FactorArchive, FactorIdentity,
+    )
+    import pandas as pd
+
+    require(version == RANK_DISPLACEMENT_VERSION,
+            f"target engine declares unsupported rank-displacement version: {version}")
+    require(source_run_dir.name == fixed["source_run_id"],
+            f"source A run differs for {fixed['factor_key']}")
+    archive_path = Path(fixed["source_archive"])
+    identity = FactorIdentity(**fixed["identity"])
+    target_identity = miner._factor_identity(identity.expanded_expression, identity.direction)
+    require(target_identity.as_dict() == identity.as_dict(),
+            f"target A factor identity differs for {fixed['factor_key']}")
+    require(load_archive_identity(archive_path) == identity.as_dict(),
+            f"source A factor archive identity differs for {fixed['factor_key']}")
+    source_locator = fixed["a_evaluation_archive"]
+    source_id = str(fixed["source_evaluation_id"])
+    require(source_locator["identity"] == identity.as_dict()
+            and str(source_locator["evaluation_id"]) == source_id
+            and str(source_meta["evaluation_id"]) == source_id
+            and source_meta["segment"] == "A"
+            and source_meta["data_version"] == f"{fixed['source_run_id']}/A"
+            and source_meta["horizon"] == "24h",
+            f"source A evaluation identity differs for {fixed['factor_key']}")
+    source_key = {field: source_meta[field] for field in (
+        "data_version", "contract_version", "evaluator_version", "segment", "horizon")}
+    require(source_locator["evaluation_key"] == source_key
+            and str(source_meta["value_set_id"]) == str(source_locator["value_set_id"]),
+            f"source A evaluation key or value set differs for {fixed['factor_key']}")
+
+    values_artifact = source_calculation.get("values_artifact")
+    require(isinstance(values_artifact, dict)
+            and values_artifact.get("identity") == identity.as_dict()
+            and values_artifact.get("data_version") == source_meta["data_version"]
+            and values_artifact.get("computation_semantics") == source_meta["evaluator_version"]
+            and source_meta["value_set_id"] is not None
+            and str(values_artifact.get("value_set_id")) == str(source_meta["value_set_id"])
+            and type(values_artifact.get("rows")) is int and values_artifact["rows"] > 0,
+            f"source A calculation does not point to the evaluated value set for {fixed['factor_key']}")
+
+    source_archive = FactorArchive.open_existing(archive_path.parent, identity)
+    evaluation_key = EvaluationKey(**source_key)
+    values_csv = source_archive.get_factor_values_csv(evaluation_key)
+    try:
+        factor_values = read_fixed_a_factor_values_csv(values_csv, values_artifact["rows"])
+    except ComparisonError as exc:
+        raise ComparisonError(f"source A factor values are invalid for {fixed['factor_key']}: {exc}") from exc
+
+    universe_path = source_run_dir / "A-universe.csv"
+    universe_csv = universe_path.read_bytes()
+    universe_rows = pd.read_csv(io.BytesIO(universe_csv))
+    require(list(universe_rows.columns) == ["timestamp", "symbol", "eligible"]
+            and pd.api.types.is_bool_dtype(universe_rows["eligible"])
+            and not universe_rows["eligible"].isna().any(),
+            f"source A universe shape or membership differs for {fixed['factor_key']}")
+    universe_index = pd.MultiIndex.from_arrays([
+        pd.to_datetime(universe_rows["timestamp"], utc=True, errors="raise"),
+        universe_rows["symbol"].astype(str),
+    ], names=["timestamp", "symbol"])
+    universe = validate_universe(pd.Series(universe_rows["eligible"].to_numpy(dtype=bool),
+                                            index=universe_index, name="eligible"))
+    require(factor_values.index.equals(universe.index),
+            f"source A factor values and universe indices differ for {fixed['factor_key']}")
+    report = evaluate_rank_displacement(factor_values, universe, miner.spec, "A")
+    require(report["definition_version"] == version and report["segment"] == "A",
+            f"computed A rank-displacement evidence differs for {fixed['factor_key']}")
+    provenance = {
+        "source_run_id": fixed["source_run_id"],
+        "source_candidate_id": fixed["candidate_id"],
+        "source_evaluation_id": source_id,
+        "source_evaluation_key": source_key,
+        "source_value_set_id": str(source_meta["value_set_id"]),
+        "source_archive": str(archive_path),
+        "source_values_csv_sha256": hashlib.sha256(values_csv).hexdigest(),
+        "source_a_universe_sha256": hashlib.sha256(universe_csv).hexdigest(),
+    }
+    return report, provenance
 
 
 def validate_a_payload(payload: dict[str, Any], identity: dict[str, Any], label: str) -> None:
@@ -1104,25 +1214,33 @@ def import_fixed_a_batch(miner: Any, scope: dict[str, Any], batch: dict[str, Any
     for fixed in batch["candidates"]:
         candidate_id = fixed["candidate_id"]
         candidate_ids.append(candidate_id)
+        source_a_records = {}
         for suffix, expected_kind in (("definition", "candidate"),
                                       ("calculation", "calculation"),
                                       ("report", "model_report")):
             source_record = read_json(source_run_dir / "a_records" / f"{candidate_id}-{suffix}.json")
             require(source_record.get("kind") == expected_kind,
                     f"source A {expected_kind} record differs for {fixed['factor_key']}")
+            source_a_records[suffix] = source_record
             miner.store.append(source_record["id"], source_record["kind"], source_record["data"])
 
         archive_path = Path(fixed["source_archive"])
         verify_signature(fixed["source_archive_signature"], "source A factor archive")
-        a_payload, _ = load_archive_payload(archive_path, fixed["source_evaluation_id"])
+        a_payload, source_meta = load_archive_payload(archive_path, fixed["source_evaluation_id"])
         validate_a_payload(a_payload, fixed["identity"], fixed["factor_key"])
-        locator = miner._write_evaluation(
-            candidate_id, "A", a_payload,
-            miner._factor_identity(fixed["identity"]["expanded_expression"],
-                                   fixed["identity"]["direction"]),
-            definition=fixed["definition"],
-        )
-        evaluation_data = miner._evaluation_record_data(candidate_id, a_payload, locator)
+        factor_identity = miner._factor_identity(fixed["identity"]["expanded_expression"],
+                                                  fixed["identity"]["direction"])
+        locator = miner._write_evaluation(candidate_id, "A", a_payload, factor_identity,
+                                          definition=fixed["definition"])
+        rank_displacement, displacement_source = imported_a_rank_displacement(
+            miner, fixed, source_meta, source_run_dir, source_a_records["calculation"]["data"])
+        if rank_displacement is None:
+            evaluation_data = miner._evaluation_record_data(candidate_id, a_payload, locator)
+        else:
+            displacement_locator = miner._write_rank_displacement(
+                candidate_id, "A", rank_displacement, factor_identity, source=displacement_source)
+            evaluation_data = miner._evaluation_record_data(
+                candidate_id, a_payload, locator, rank_displacement, displacement_locator)
         miner.store.append(f"{candidate_id}-evaluation", "evaluation", evaluation_data)
 
         decision = json.loads(json.dumps(fixed["source_decision"]))

@@ -62,19 +62,33 @@ class IdeatorRole:
             require(definition["proposal_id"] is None or index in experiments, "proposal has no adopted experiment")
         return definitions, experiments, routes, proposals
 
-    def _ask_ideator(self, pending: dict[str, Any]) -> dict[str, Any]:
-        return self.gateway.ask("ideator",
+    def _ask_ideator(self, pending: dict[str, Any], *, ideation_id: str,
+                     factor_landscape_ref: dict[str, str],
+                     allowed_record_ids: set[str]) -> dict[str, Any]:
+        task = (
             "构造当前有研究依据的一组可证伪候选公式，写清计算含义，不为凑数量生成候选。"
             "阅读全部历史及优化任务，逐条记录采用或放弃。"
+            "读取payload.factor_landscape_ref对应的本轮A段因子树和分支证据；树用于提示相似度与研究覆盖，拥挤分支不是禁入条件。"
+            "对每个新增候选，在change_reason或analysis中说明与相似已有公式的差异，以及新增的可证伪价值。"
+            "尚未尝试的方向须结合字段库存和A研究记录判断；树只描述已有信号，不能凭分支数量推断经济机制空白。"
+            "新公式计算前的相似性判断只是字段与表达式层面的假设；跨分支组合的实际相关性须在A段计算后确认，不保证低相关或收益改善。"
+            "树不能替代历史记录中的失败原因、A段评价或既有优化任务。"
             "Optimizer只给出修改任务和配对检验合同；最终候选定义和可执行公式必须由你首次生成。"
             "采用任务时，候选parent_id必须引用control_id，proposal_id必须引用当前任务，"
             "预测方向保持不变；change_reason须具体说明公式如何实现change_target并遵守fixed_components。"
             "不得改写Optimizer预先声明的修改任务或判断标准；无法一致实现时放弃，由Optimizer另立新任务。"
+            "对于metric=rank_displacement的pending任务，只生成该明确任务要求的对应版本；不得将平滑自动应用于其他因子，"
+            "也不得额外生成未获准的同类窗口变体。其horizon_hours和displacement_hours只是配对评价的H与Δ，"
+            "不代表持有期或公式变换，不得擅自改动。"
             "遵守candidate_decisions：暂停或淘汰的候选不自动重启；保留但未获准优化的版本不修改。"
             "不可重复已停止路线且不给新增依据。"
-            "说明候选公式的跨币比较含义；可考虑收益率、比值或相对变化，程序不按量纲拦截。",
-            {"catalog_record_id": "inputs", "pending_proposals": pending,
-             "candidate_decisions": self.decisions},
+            "说明候选公式的跨币比较含义；可考虑收益率、比值或相对变化，程序不按量纲拦截。"
+        )
+        payload = {"catalog_record_id": "inputs", "pending_proposals": pending,
+                   "candidate_decisions": self.decisions, "ideation_id": ideation_id,
+                   "factor_landscape_ref": factor_landscape_ref}
+        return self.gateway.ask("ideator",
+            task, payload,
             _object_schema({"candidates": _array_schema(CANDIDATE_SCHEMA),
                 "dispositions": _array_schema(_object_schema({
                     "proposal_id": _text_schema("每条pending建议的ID"),
@@ -83,4 +97,5 @@ class IdeatorRole:
                     "candidate_index": _nullable({"type": "integer", "minimum": 0})}),
                     minItems=len(pending), maxItems=len(pending)),
                 "analysis": _text_schema("本轮构想依据")}),
-            validate=lambda response: self._check_ideation(response, pending))
+            validate=lambda response: self._check_ideation(response, pending),
+            allowed_record_ids=allowed_record_ids)

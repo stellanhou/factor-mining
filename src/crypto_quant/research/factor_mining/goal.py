@@ -16,7 +16,7 @@ import pandas as pd
 
 from crypto_quant.features.factor_inputs import FactorInputPanel, INPUT_COLUMNS
 from crypto_quant.research.progress import ProgressLog
-from .contracts import (ResearchSpec, digest, identifier, require, text, without_hash_metadata,
+from .contracts import (ResearchSpec, digest, identifier, number, require, text, without_hash_metadata,
                         _array_schema, _object_schema, _text_schema)
 from .runtime import GRAPH_CONFIG
 from langgraph.graph import StateGraph, START, END
@@ -30,13 +30,38 @@ from .workflow import FactorMiner, _panel_metadata, validate_panel
 class GoalSpec:
     goal_id: str
     objective: str
-    target_ideas: int
+    target_ideas: int | None = None
+    quality_target: dict[str, Any] | None = None
+    max_cycles: int | None = None
 
     def __post_init__(self):
         identifier(self.goal_id)
         text(self.objective, "goal objective")
-        require(type(self.target_ideas) is int and self.target_ideas > 0,
-                "target_ideas must be an explicitly supplied positive integer")
+        require((self.target_ideas is None) != (self.quality_target is None),
+                "declare either target_ideas or quality_target")
+        if self.target_ideas is not None:
+            require(type(self.target_ideas) is int and self.target_ideas > 0,
+                    "target_ideas must be an explicitly supplied positive integer")
+            require(self.max_cycles is None, "max_cycles belongs to quality goals")
+        else:
+            target = self.quality_target
+            require(isinstance(target, dict) and set(target) == {
+                "metric", "horizon_hours", "displacement_hours", "min_improvement", "max_ic_loss"},
+                "quality_target must declare the complete rank-displacement comparison")
+            require(target["metric"] == "rank_displacement",
+                    "quality goals use paired rank-displacement evidence")
+            for key in ("horizon_hours", "displacement_hours"):
+                require(type(target[key]) is int and target[key] in {1, 4, 24},
+                        f"quality_target {key} must be 1, 4 or 24")
+            require(number(target["min_improvement"], "quality minimum improvement") > 0,
+                    "quality minimum improvement must be positive")
+            require(number(target["max_ic_loss"], "quality maximum IC loss") >= 0,
+                    "quality maximum IC loss must be nonnegative")
+            require(type(self.max_cycles) is int and self.max_cycles > 0,
+                    "quality goals require an explicit positive max_cycles budget")
+
+    def as_dict(self):
+        return {key: value for key, value in asdict(self).items() if value is not None}
 
 
 TASK_SCHEMA = _object_schema({
@@ -155,7 +180,7 @@ class GoalRunner:
                *, inputs: dict[str, Any], model_settings: dict[str, Any]) -> GoalRunner:
         root = Path(output_root) / goal.goal_id
         root.mkdir(parents=True, exist_ok=False)
-        contract = {"goal": asdict(goal), "research": spec.as_dict(), "inputs": inputs,
+        contract = {"goal": goal.as_dict(), "research": spec.as_dict(), "inputs": inputs,
                     "model_settings": model_settings}
         write_json(root / "goal.json", contract)
         RecordStore(root / "events").append("event-00000001", "goal_state", {
@@ -239,7 +264,7 @@ class GoalRunner:
             "evidence_refs只能从payload.allowed_evidence_refs原样选择Goal顶层记录ID；"
             "research_cycle内部的candidate、evaluation、calculation或round记录ID不能直接放入evidence_refs。"
             "不要将单个候选暂停当成整个Goal必须等待。B验收规则由程序执行，不能修改或请求B/C结果。",
-            {"goal_phase": "select_task", "goal": asdict(self.goal), "catalog_record_id": catalog_id,
+            {"goal_phase": "select_task", "goal": self.goal.as_dict(), "catalog_record_id": catalog_id,
              "allowed_evidence_refs": sorted({r["id"] for r in records} | {catalog_id})},
             TASK_SCHEMA, validate=lambda value: self._check_task(value, panel))
         self.research.append(f"task-{index:08d}", "goal_task", decision)
@@ -256,7 +281,7 @@ class GoalRunner:
                 archived_cycles.append(int(sequence))
             cycle = max([self.state["cycle"], *archived_cycles]) + 1
             # Keep identifiers independent of the length of the user's goal ID.
-            run_id = f"goal-{digest(asdict(self.goal))[:12]}-{cycle:06d}"
+            run_id = f"goal-{digest(self.goal.as_dict())[:12]}-{cycle:06d}"
             self._save(status="active", phase="explore", cycle=cycle, current_run=run_id, task=decision)
 
     @staticmethod
@@ -274,6 +299,33 @@ class GoalRunner:
             calculation = source.get(f"{cid}-calculation")
             evaluation = source.get(f"{cid}-evaluation")
             comparison = source.get(f"{cid}-comparison")
+            a_evaluation = None
+            if evaluation is not None:
+                require(evaluation["data"].get("segment") == "A",
+                        "Goal cycle context can include A evaluation evidence only")
+                displacement = evaluation["data"].get("rank_displacement")
+                if displacement is None:
+                    displacement_context = {"status": "not_calculated"}
+                else:
+                    require(isinstance(displacement, dict)
+                            and displacement.get("segment") == "A"
+                            and isinstance(displacement.get("definition_version"), str)
+                            and isinstance(displacement.get("deltas"), dict)
+                            and set(displacement["deltas"]) == {"1", "4", "24"},
+                            "Goal cycle rank-displacement evidence is incomplete or not A-only")
+                    displacement_context = {
+                        "status": "available",
+                        "definition_version": displacement["definition_version"],
+                        "deltas": {delta: {
+                            "summary": displacement["deltas"][delta]["summary"],
+                            "coverage": displacement["deltas"][delta]["coverage"],
+                        } for delta in ("1", "4", "24")},
+                    }
+                a_evaluation = {
+                    "summary": evaluation["data"]["summary"],
+                    "coverage": evaluation["data"]["coverage"],
+                    "rank_displacement": displacement_context,
+                }
             executed = calculation["data"]["executed_expression"] if calculation else None
             if executed:
                 previous.append({"expression": executed["expanded_expression"],
@@ -287,10 +339,7 @@ class GoalRunner:
                     "status": calculation["data"]["status"],
                     "executed_expression": executed,
                 },
-                "A_evaluation": None if evaluation is None else {
-                    "summary": evaluation["data"]["summary"],
-                    "coverage": evaluation["data"]["coverage"],
-                },
+                "A_evaluation": a_evaluation,
                 "final_decision": None if decision is None else {
                     key: decision[key] for key in (
                         "disposition", "continue_optimization", "reason", "resume_condition")
@@ -313,7 +362,7 @@ class GoalRunner:
             cycles.append({key: value for key, value in context.items() if key != "previous_expressions"})
         tasks = [{"source_record_id": record["id"], **record["data"]}
                  for record in history if record["kind"] == "goal_task"]
-        return {"goal": asdict(self.goal), "research_task": self.state["task"],
+        return {"goal": self.goal.as_dict(), "research_task": self.state["task"],
                 "prior_A_research": {"tasks": tasks, "cycles": cycles},
                 "previous_expressions": []}
 
@@ -349,10 +398,55 @@ class GoalRunner:
                 "records": {"run_path": str(run_path), "items": items}}
         self.research.append(record_id, "research_cycle", data)
 
+    def _quality_evidence(self, miner: FactorMiner, cid: str, retained_horizons: list[int]) -> dict[str, Any]:
+        target = self.goal.quality_target
+        require(target is not None, "quality evidence requires a quality goal")
+        result = {"passed": False, "target": target, "segment": "A"}
+        candidate = miner.candidates[cid]
+        if candidate["experiment"] is None:
+            return {**result, "reason": "candidate has no predeclared paired experiment"}
+        ref = {"record_id": f"{cid}-comparison"}
+        record = load_record_reference(miner.store.root, ref)
+        comparison = record["data"]
+        require(record["kind"] == "experiment_result" and comparison["candidate_id"] == cid
+                and comparison["plan"] == candidate["experiment"],
+                "quality comparison differs from its candidate's predeclared experiment")
+        design = comparison["plan"]["experiment_design"]
+        if design["metric"] != target["metric"]:
+            return {**result, "comparison_ref": ref, "reason": "paired metric differs from quality target"}
+        require(comparison["horizon_hours"] == design["horizon_hours"]
+                and comparison["displacement_hours"] == design["displacement_hours"],
+                "quality comparison intervals differ from its plan")
+        result.update(comparison_ref=ref, control_id=comparison["plan"]["control_id"],
+                      experiment_design=design, paired_improvement=comparison["paired_improvement"],
+                      paired_ic_change=comparison["paired_ic_change"])
+        if (design["horizon_hours"] != target["horizon_hours"]
+                or design["displacement_hours"] != target["displacement_hours"]
+                or target["horizon_hours"] not in retained_horizons
+                or design["min_improvement"] < target["min_improvement"]
+                or design["max_ic_loss"] > target["max_ic_loss"]):
+            return {**result, "reason": "predeclared experiment does not meet the frozen quality target"}
+        improvement, ic = comparison["paired_improvement"], comparison["paired_ic_change"]
+        if improvement["status"] != "estimated" or ic["status"] != "estimated":
+            return {**result, "reason": "paired uncertainty is unavailable"}
+        bounds = []
+        for metric in (improvement, ic):
+            require(isinstance(metric["ci"], list) and len(metric["ci"]) == 2,
+                    "estimated quality evidence requires two confidence bounds")
+            lower, upper = (number(value, "quality confidence bound") for value in metric["ci"])
+            require(lower <= upper, "quality confidence bounds are reversed")
+            bounds.append(lower)
+        passed = (comparison["route_decision"] == "continue"
+                  and bounds[0] >= target["min_improvement"] and bounds[1] >= -target["max_ic_loss"])
+        return {**result, "passed": passed,
+                "reason": "paired lower bounds meet quality target" if passed
+                          else "paired lower bounds do not meet quality target"}
+
     def _review_completion(self, miner: FactorMiner, validation: dict[str, Any]) -> None:
         require(validation["status"] == "complete", "Goal admission requires complete B reports")
         ideas = []
         delivery_ideas = []
+        quality_eligible_ids = set()
         frozen = miner._checked_frozen()
         receipt_id = f"admission-{self.state['cycle']:08d}"
         records = {r["id"]: r["data"] for r in self.receipts.all()}
@@ -473,6 +567,12 @@ class GoalRunner:
                                    "b_validation_ref": {"record_id": b_validation["id"]},
                                    "horizon_evidence": horizon_evidence,
                                    "admission_evidence": program})
+            if self.goal.quality_target is not None:
+                quality = self._quality_evidence(miner, cid, retained_horizons)
+                ideas[-1]["quality_evidence"] = quality
+                delivery_ideas[-1]["quality_evidence"] = quality
+                if quality["passed"] and self.goal.quality_target["horizon_hours"] in passed_horizons:
+                    quality_eligible_ids.add(card["id"])
         if not ideas:
             return
         require(len({idea["idea_id"] for idea in ideas}) == len(ideas),
@@ -507,17 +607,21 @@ class GoalRunner:
                 "你是优化Agent，当前只核验已获程序准入的成果是否符合Goal文本。"
                 "只根据Goal中的研究目标，逐卡核对候选定义和A段研究证据是否研究了目标所述问题；不把运行流程、批次数量或收据状态当作研究内容要求。"
                 "GoalId标识外层Goal，run_id标识它runs目录中的一次研究运行，二者无需相同；程序已核对运行归属。"
-                "target_ideas由程序累计计数，单张卡或单批数量低于目标数量不能据此判该卡不匹配。"
+                "数量Goal由程序累计target_ideas；质量Goal由程序核对预声明配对目标与同期限B准入。"
+                "不以单张卡或单批数量判断研究内容匹配。质量Goal同时阅读quality_evidence，"
+                "不得把只通过B或模型评分高当作质量目标达标。"
                 "程序已经核验准入、完整报告和卡片落盘；本请求正在生成Goal匹配收据，不得要求匹配收据预先存在。"
                 "不能仅以A段统计不显著判为不匹配；仍须依据目标、候选定义和A证据判断研究内容是否符合目标。"
                 "研究内容确实不符合Goal时应判false并说明具体差异；不得无条件判true。不能更改Goal或B标准。"
                 "程序已检查B准入；这里没有B数值或失败反馈，不得推测这些结果。"
-                "此上下文只作成果核验，不能生成或修改后续研究任务。程序按匹配的合格创意数量判断完成。",
-                {"goal_phase": "verify_completion", "goal": asdict(self.goal), "idea_ids": sorted(ids)},
+                "此上下文只作成果核验，不能生成或修改后续研究任务。最终完成条件由程序判断。",
+                {"goal_phase": "verify_completion", "goal": self.goal.as_dict(), "idea_ids": sorted(ids)},
                 MATCH_SCHEMA, validate=check)
             self.receipts.append(match_id, "goal_match", result)
         qualified = list(dict.fromkeys(self.state["qualified_ideas"] +
-                                      [m["idea_id"] for m in result["matches"] if m["matches_goal"]]))
+                                      [m["idea_id"] for m in result["matches"] if m["matches_goal"]
+                                       and (self.goal.quality_target is None
+                                            or m["idea_id"] in quality_eligible_ids)]))
         self._save(qualified_ideas=qualified)
 
     def _phase_actions(self, load_A, load_B, load_B_membership, idea_pool):
@@ -586,8 +690,12 @@ class GoalRunner:
                 # Recheck frozen evidence and card contents before issuing receipts.
                 validation = miner.complete_reports("B", idea_pool)
                 self._review_completion(miner, validation)
-            if len(self.state["qualified_ideas"]) >= self.goal.target_ideas:
+            achieved = (bool(self.state["qualified_ideas"]) if self.goal.quality_target is not None
+                        else len(self.state["qualified_ideas"]) >= self.goal.target_ideas)
+            if achieved:
                 self._save(status="complete", phase="complete", error=None)
+            elif self.goal.quality_target is not None and self.state["cycle"] >= self.goal.max_cycles:
+                self._save(status="budget_exhausted", phase="budget_exhausted", error=None)
             else:
                 self._save(status="active", phase="select_task", current_run=None, error=None)
 
@@ -605,7 +713,7 @@ class GoalRunner:
             # OS releases this lock on process exit; a second runner must fail.
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.state = self.status(self.root)
-            if self.state["status"] == "complete":
+            if self.state["status"] in {"complete", "budget_exhausted"}:
                 return self.state
             self._save(status="waiting" if self.state["phase"] == "wait_data" else "active", error=None)
             try:
@@ -620,7 +728,7 @@ class GoalRunner:
                     return execute
 
                 def route(state):
-                    if state["status"] == "complete":
+                    if state["status"] in {"complete", "budget_exhausted"}:
                         return END
                     return "poll" if state["status"] == "waiting" else state["phase"]
 

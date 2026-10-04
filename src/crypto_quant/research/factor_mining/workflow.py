@@ -24,7 +24,10 @@ from .agent_evaluator import EvaluatorRole
 from .agent_ideator import IdeatorRole
 from .agent_optimizer import OptimizerRole
 from .contracts import ResearchSpec, dumps, require, without_hash_metadata
-from .evaluation import build_labels, compare_experiment, correct_batch, evaluate_factor, evaluate_horizon_comparison
+from .evaluation import (build_labels, compare_experiment, compare_rank_displacement_experiment,
+                         correct_batch, evaluate_factor, evaluate_horizon_comparison,
+                         RANK_DISPLACEMENT_VERSION,
+                         evaluate_rank_displacement)
 from .factor_archive import EvaluationKey, FactorArchive, FactorIdentity
 from .model import JsonModel
 from .records import AgentGateway, RecordStore, load_record_reference, record_reference, write_json
@@ -119,7 +122,8 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
         write_json(self.root / "contract.json", spec.as_dict())
         archive_root = RecordStore._expected_archive_root(self.root.resolve())
         marker = {"format": "one-factor-one-file-v2",
-                  "archive_root": os.path.relpath(archive_root, self.root.resolve())}
+                  "archive_root": os.path.relpath(archive_root, self.root.resolve()),
+                  "rank_displacement_version": RANK_DISPLACEMENT_VERSION}
         write_json(self.root / "factor_archive.json", marker)
         self._attach()
 
@@ -135,6 +139,10 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
         resolved_root = self.root.resolve()
         self.archive_root = RecordStore._marked_archive_root(resolved_root)
         require(self.archive_root is not None, "FM-v6 requires a current factor archive marker")
+        marker = json.loads((resolved_root / "factor_archive.json").read_text(encoding="utf-8"))
+        self.rank_displacement_version = marker.get("rank_displacement_version")
+        require(self.rank_displacement_version in {None, RANK_DISPLACEMENT_VERSION},
+                "run uses an unsupported rank-displacement definition")
         self.progress = ProgressLog.for_run(self.root)
         self.store = RecordStore(self.root / "a_records", run_root=resolved_root,
                                  archive_root=self.archive_root)
@@ -151,6 +159,40 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
     def _evaluation_key(self, stage: str, horizon_hours: int) -> EvaluationKey:
         return EvaluationKey(f"{self.spec.run_id}/{stage}", dumps(self.spec.as_dict()),
                              "factor-eval-v1", stage, f"{horizon_hours}h")
+
+    @staticmethod
+    def _rank_displacement_summary(report: dict[str, Any]) -> dict[str, Any]:
+        require(isinstance(report, dict)
+                and report.get("definition_version") == RANK_DISPLACEMENT_VERSION
+                and report.get("segment") in {"A", "B"}
+                and isinstance(report.get("deltas"), dict)
+                and set(report["deltas"]) == {"1", "4", "24"},
+                "rank-displacement report is incomplete or uses another definition")
+        return {"definition_version": report["definition_version"],
+                "segment": report["segment"],
+                "deltas": {delta: {"summary": report["deltas"][delta]["summary"],
+                                    "coverage": report["deltas"][delta]["coverage"]}
+                           for delta in ("1", "4", "24")}}
+
+    def _write_rank_displacement(self, candidate_id: str, stage: str,
+                                 report: dict[str, Any], identity: FactorIdentity,
+                                 *, source: dict[str, Any]) -> dict[str, Any]:
+        require(self.rank_displacement_version == RANK_DISPLACEMENT_VERSION
+                and report.get("segment") == stage,
+                "rank-displacement report does not match its run definition or segment")
+        key = EvaluationKey(f"{self.spec.run_id}/{stage}", dumps(self.spec.as_dict()),
+                            self.rank_displacement_version, stage, "rank-displacement")
+        archive = FactorArchive.open_for(self.archive_root, identity)
+        result = archive.append_evaluation(
+            key, report,
+            provenance={"run_id": self.spec.run_id, "candidate_id": candidate_id,
+                        "segment": stage, "definition_version": report["definition_version"],
+                        "expanded_expression": identity.expanded_expression,
+                        "direction": identity.direction, "source": source})
+        return {"root": os.path.relpath(self.archive_root.resolve(), self.root.resolve()),
+                "identity": identity.as_dict(), "evaluation_key": key.as_dict(),
+                "evaluation_id": result["evaluation_id"], "value_set_id": result["value_set_id"],
+                "factor_value_count": 0}
 
     def _write_evaluation(self, candidate_id: str, stage: str,
                           report: dict[str, Any], identity: FactorIdentity,
@@ -172,16 +214,26 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
 
     @staticmethod
     def _evaluation_record_data(candidate_id: str, report: dict[str, Any],
-                                locator: dict[str, Any]) -> dict[str, Any]:
-        return {"candidate_id": candidate_id, "segment": report["segment"],
+                                locator: dict[str, Any],
+                                rank_displacement: dict[str, Any] | None = None,
+                                rank_displacement_locator: dict[str, Any] | None = None) -> dict[str, Any]:
+        data = {"candidate_id": candidate_id, "segment": report["segment"],
                 "direction": report["direction"], "horizon_hours": report["horizon_hours"],
                 "summary": report["summary"], "coverage": report["coverage"],
                 "factor_archive": locator}
+        if rank_displacement is not None:
+            require(rank_displacement_locator is not None,
+                    "rank-displacement evidence requires an archive locator")
+            data["rank_displacement"] = FactorMiner._rank_displacement_summary(rank_displacement)
+            data["rank_displacement_archive"] = rank_displacement_locator
+        return data
 
     @staticmethod
     def _multi_horizon_evaluation_record_data(
             candidate_id: str, reports: dict[int, dict[str, Any]],
-            locators: dict[int, dict[str, Any]], retained_horizons: list[int]) -> dict[str, Any]:
+            locators: dict[int, dict[str, Any]], retained_horizons: list[int],
+            rank_displacement: dict[str, Any] | None = None,
+            rank_displacement_locator: dict[str, Any] | None = None) -> dict[str, Any]:
         require(bool(reports) and set(reports) == set(locators),
                 "each B horizon report requires one archive locator")
         require(bool(retained_horizons) and all(type(horizon) is int for horizon in retained_horizons)
@@ -195,12 +247,160 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                     and locators[horizon]["evaluation_key"]["horizon"] == f"{horizon}h"
                     for horizon, report in reports.items()),
                 "B horizon reports must share a segment and frozen direction")
-        return {"candidate_id": candidate_id, "segment": "B", "direction": first["direction"],
+        data = {"candidate_id": candidate_id, "segment": "B", "direction": first["direction"],
                 "retained_horizons": list(retained_horizons),
                 "horizons": {str(horizon): {"summary": reports[horizon]["summary"],
                                              "coverage": reports[horizon]["coverage"],
                                              "factor_archive": locators[horizon]}
                              for horizon in retained_horizons}}
+        if rank_displacement is not None:
+            require(rank_displacement_locator is not None,
+                    "rank-displacement evidence requires an archive locator")
+            data["rank_displacement"] = FactorMiner._rank_displacement_summary(rank_displacement)
+            data["rank_displacement_archive"] = rank_displacement_locator
+        return data
+
+    @staticmethod
+    def _landscape_evaluation_context(evaluation: dict[str, Any] | None) -> dict[str, Any] | None:
+        if evaluation is None:
+            return None
+        require(isinstance(evaluation, dict) and evaluation.get("segment") == "A",
+                "factor landscape can include A evaluation evidence only")
+        result = {"summary": evaluation["summary"], "coverage": evaluation["coverage"]}
+        displacement = evaluation.get("rank_displacement")
+        if displacement is not None:
+            require(isinstance(displacement, dict) and displacement.get("segment") == "A",
+                    "factor landscape can include A rank-displacement evidence only")
+            result["rank_displacement"] = FactorMiner._rank_displacement_summary(displacement)
+        return result
+
+    def _landscape_members(self, round_no: int, saved: dict[str, Any]) -> list[dict[str, Any]]:
+        """Collect only candidates reached before this ideation in the A replay."""
+        members = []
+        record_ids = {record["id"] for record in self.store.all()}
+        for cid, item in self.candidates.items():
+            if item["round"] >= round_no:
+                continue
+            require(f"{cid}-definition" in record_ids,
+                    "factor landscape source candidate definition record is missing")
+            calculation = item.get("calculation")
+            if calculation is not None:
+                require(f"{cid}-calculation" in record_ids,
+                        "factor landscape source calculation record is missing")
+            if item.get("evaluation") is not None:
+                require(f"{cid}-evaluation" in record_ids,
+                        "factor landscape source A evaluation record is missing")
+            if "duplicate_of" in item:
+                require(f"{cid}-duplicate" in record_ids,
+                        "factor landscape source duplicate record is missing")
+            if calculation is None:
+                calculation_context = {
+                    "status": "duplicate" if "duplicate_of" in item else "not_calculated",
+                    "executed_expression": None,
+                    **({"duplicate_of": item["duplicate_of"]} if "duplicate_of" in item else {}),
+                }
+            else:
+                calculation_context = {
+                    "status": calculation["status"],
+                    "executed_expression": calculation.get("executed_expression"),
+                }
+                if calculation.get("status") != "computed" and calculation.get("checks"):
+                    calculation_context["checks"] = calculation["checks"]
+            decision = self.decisions.get(cid)
+            evidence_refs = [f"{cid}-definition"]
+            evidence_refs.extend(record_id for record_id in (
+                f"{cid}-calculation", f"{cid}-evaluation", f"{cid}-duplicate",
+                f"round-{item['round']:03d}-optimization") if record_id in record_ids)
+            members.append({
+                "candidate_ref": f"{self.spec.run_id}/{cid}",
+                "definition": item["definition"],
+                "calculation": calculation_context,
+                "A_evaluation": self._landscape_evaluation_context(item.get("evaluation")),
+                "final_decision": None if decision is None else {
+                    key: decision[key] for key in (
+                        "disposition", "continue_optimization", "reason", "resume_condition")
+                },
+                "evidence_refs": evidence_refs,
+            })
+
+        goal_context = saved.get("goal-context", {})
+        require(isinstance(goal_context, dict), "saved Goal context must be an object")
+        prior = goal_context.get("prior_A_research", {})
+        require(isinstance(prior, dict), "saved prior A research context must be an object")
+        cycles = prior.get("cycles", [])
+        require(isinstance(cycles, list), "prior A research cycles must be a complete saved list")
+        for cycle_index, cycle in enumerate(cycles):
+            require(isinstance(cycle, dict) and "candidates" in cycle
+                    and isinstance(cycle["candidates"], list),
+                    "prior A research cycle candidates are invalid")
+            for candidate_index, candidate in enumerate(cycle["candidates"]):
+                require(isinstance(candidate, dict) and isinstance(candidate.get("candidate_ref"), str),
+                        "prior A candidate reference is invalid")
+                require("definition" in candidate and "calculation" in candidate
+                        and "A_evaluation" in candidate and "final_decision" in candidate,
+                        "prior A candidate summary is incomplete for the factor landscape")
+                member = {"candidate_ref": candidate["candidate_ref"],
+                          "definition": candidate["definition"],
+                          "calculation": candidate["calculation"],
+                          "A_evaluation": candidate["A_evaluation"],
+                          "final_decision": candidate["final_decision"],
+                          "evidence_refs": [
+                              f"goal-context#/prior_A_research/cycles/{cycle_index}/candidates/{candidate_index}",
+                              candidate["candidate_ref"],
+                          ]}
+                if "paired_comparison" in candidate:
+                    member["paired_comparison"] = candidate["paired_comparison"]
+                members.append(member)
+        return members
+
+    def _has_ideator_transcript(self, ideation_id: str) -> bool:
+        for path in sorted((self.root / "model_calls").glob("*-request.json")):
+            request = json.loads(path.read_text(encoding="utf-8"))
+            for message in request["messages"]:
+                if message["role"] != "user":
+                    continue
+                content = json.loads(message["content"])
+                if (content.get("role") == "ideator"
+                        and content.get("payload", {}).get("ideation_id") == ideation_id):
+                    return True
+        return False
+
+    def _landscape_snapshot(self, panel: FactorInputPanel, round_no: int,
+                            ideation_id: str, saved: dict[str, Any]) -> tuple[dict[str, str], set[str]]:
+        record_id = f"round-{round_no:03d}-factor-landscape"
+        members = self._landscape_members(round_no, saved)
+        source_refs = [member["candidate_ref"] for member in members]
+        existing = next((record for record in self.store.all() if record["id"] == record_id), None)
+        if existing is not None:
+            data = existing["data"]
+            require(data.get("ideation_id") == ideation_id and data.get("round_no") == round_no,
+                    "saved factor landscape belongs to a different ideation round")
+            require(data.get("source_candidate_refs") == source_refs,
+                    "saved factor landscape source candidates differ from the replayed A prefix")
+            require(isinstance(data.get("context_record_ids"), list)
+                    and len(data["context_record_ids"]) == len(set(data["context_record_ids"])),
+                    "saved factor landscape context record list is invalid")
+            return {"record_id": record_id, "pointer": "/snapshot"}, set(data["context_record_ids"])
+
+        require(not self._has_ideator_transcript(ideation_id),
+                "ideator transcript exists without its pre-request factor landscape snapshot")
+        context_record_ids = [record["id"] for record in self.store.all()]
+        from .landscape import build_factor_landscape
+        snapshot = build_factor_landscape(panel, self.spec, members)
+        data = {"round_no": round_no, "ideation_id": ideation_id,
+                "source_segment": "A", "source_candidate_refs": source_refs,
+                "context_record_ids": context_record_ids, "snapshot": snapshot}
+        self.store.append(record_id, "factor_landscape", data)
+        saved[record_id] = data
+        return {"record_id": record_id, "pointer": "/snapshot"}, set(context_record_ids)
+
+    def _ideator_visible_record_ids(self, landscape_record_id: str,
+                                    context_record_ids: set[str]) -> set[str]:
+        """Use the A record prefix frozen before this landscape was saved."""
+        visible = set(context_record_ids) | {landscape_record_id}
+        known = {record["id"] for record in self.store.all()}
+        require(visible <= known, "factor landscape references missing A context records")
+        return visible
 
     def _validate_panel(self, panel: FactorInputPanel, stage: str) -> None:
         validate_panel(panel, self.spec, stage)
@@ -265,10 +465,26 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
             round_no = state["round_no"] + 1
             pending = {pid: p for pid, p in self.proposals.items() if p["status"] == "pending"}
             ideation_id = f"round-{round_no:03d}-ideation"
-            response = saved[ideation_id] if ideation_id in saved else self._ask_ideator(pending)
+            if ideation_id in saved:
+                response = saved[ideation_id]
+                landscape_record_id = f"round-{round_no:03d}-factor-landscape"
+                if landscape_record_id in saved:
+                    self._landscape_snapshot(panel, round_no, ideation_id, saved)
+                else:
+                    require(not self._has_ideator_transcript(ideation_id),
+                            "ideator transcript exists without its pre-request factor landscape snapshot")
+            else:
+                landscape_ref, context_record_ids = self._landscape_snapshot(
+                    panel, round_no, ideation_id, saved)
+                visible_ids = self._ideator_visible_record_ids(landscape_ref["record_id"], context_record_ids)
+                response = self._ask_ideator(
+                    pending, ideation_id=ideation_id,
+                    factor_landscape_ref=landscape_ref,
+                    allowed_record_ids=visible_ids)
             definitions, experiments, self.routes, self.proposals = self._check_ideation(response, pending)
             if ideation_id not in saved:
                 self.store.append(ideation_id, "ideation", response)
+                saved[ideation_id] = response
             return {"round_no": round_no, "definitions": definitions, "experiments": experiments,
                     "round_ids": [], "index": 0}
 
@@ -327,11 +543,30 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                 expression = item["calculation"]["executed_expression"]["expanded_expression"]
                 identity = self._factor_identity(expression, definition["direction"])
                 values_artifact = item["calculation"]["values_artifact"]
+                displacement = None
+                displacement_locator = None
+                if self.rank_displacement_version is not None:
+                    displacement = evaluate_rank_displacement(values, panel.universe, self.spec, "A")
+                    require(displacement["definition_version"] == self.rank_displacement_version,
+                            "rank-displacement implementation differs from the run marker")
+                    displacement_locator = self._write_rank_displacement(
+                        cid, "A", displacement, identity,
+                        source={"calculation_artifact": values_artifact})
+                    item["rank_displacement"] = displacement
+                    item["rank_displacement_archive"] = displacement_locator
                 locator = self._write_evaluation(
                     cid, "A", report, identity, value_set_id=values_artifact["value_set_id"],
                     factor_value_count=values_artifact["rows"], definition=definition)
                 self.store.append(f"{cid}-evaluation", "evaluation",
-                                  self._evaluation_record_data(cid, report, locator))
+                                  self._evaluation_record_data(
+                                      cid, report, locator, displacement, displacement_locator))
+            elif self.rank_displacement_version is not None:
+                require("rank_displacement" in report and "rank_displacement_archive" in report,
+                        "new-definition A evaluation is missing saved rank-displacement evidence")
+                require(report["rank_displacement"]["definition_version"] == self.rank_displacement_version,
+                        "saved A rank-displacement evidence differs from the run marker")
+                item["rank_displacement"] = report["rank_displacement"]
+                item["rank_displacement_archive"] = report["rank_displacement_archive"]
             for horizon, horizon_report in report["horizon_comparison"]["horizons"].items():
                 plot = self.root / "plots" / f"{cid}-A-{horizon}h.svg"
                 if not plot.exists():
@@ -400,14 +635,26 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
         plan = item["experiment"]
         control = self.candidates[plan["control_id"]]
         baseline = evaluate_expression(control["calculation"]["executed_expression"]["expression"], panel).values
-        common = values.notna() & baseline.notna()
-        # Both candidates are ranked/grouped again on the identical valid assets.
-        trial = evaluate_factor(values.where(common), labels, self.spec, "A", item["definition"]["direction"])
-        base = evaluate_factor(baseline.where(common), labels, self.spec, "A", control["definition"]["direction"])
-        comparison = compare_experiment(trial, base, plan, self.spec)
-        comparison["common_asset_observations"] = int(common.sum())
-        comparison["trial_on_common_assets"] = trial
-        comparison["control_on_common_assets"] = base
+        design = plan["experiment_design"]
+        if design["metric"] == "rank_displacement":
+            require(self.rank_displacement_version == RANK_DISPLACEMENT_VERSION,
+                    "rank-displacement experiments require the declared evaluator definition")
+            require(item["definition"]["direction"] == control["definition"]["direction"],
+                    "rank-displacement comparisons keep the frozen direction")
+            comparison_labels = build_labels(
+                panel, self.spec, "A", horizon_hours=design["horizon_hours"])
+            comparison = compare_rank_displacement_experiment(
+                values, baseline, comparison_labels, self.spec,
+                item["definition"]["direction"], plan, universe=panel.universe)
+        else:
+            common = values.notna() & baseline.notna()
+            # Both candidates are ranked/grouped again on the identical valid assets.
+            trial = evaluate_factor(values.where(common), labels, self.spec, "A", item["definition"]["direction"])
+            base = evaluate_factor(baseline.where(common), labels, self.spec, "A", control["definition"]["direction"])
+            comparison = compare_experiment(trial, base, plan, self.spec)
+            comparison["common_asset_observations"] = int(common.sum())
+            comparison["trial_on_common_assets"] = trial
+            comparison["control_on_common_assets"] = base
         route = self.routes[plan["route_id"]]
         route["decision"] = comparison["decision"]
         comparison["route_decision"] = route["decision"]
@@ -479,7 +726,7 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                 fields = ("horizon_hours", "label", "direction", "summary", "coverage",
                           "sample_hours", "grouping")
                 a_horizon_evidence[str(horizon)] = {field: report[field] for field in fields}
-            definitions[cid] = {"definition": item["definition"],
+            frozen_candidate = {"definition": item["definition"],
                                 "executed": item["calculation"]["executed_expression"],
                                 "a_evaluation_ref": record_reference(evaluation),
                                 "a_evaluation_archive": evaluation["data"]["factor_archive"],
@@ -488,6 +735,17 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                                 "retained_horizons": retained_horizons,
                                 "a_horizon_evidence": a_horizon_evidence,
                                 "a_model_report": item["model_report"], "a_decision": self.decisions[cid]}
+            if self.rank_displacement_version is not None:
+                displacement = evaluation["data"].get("rank_displacement")
+                displacement_locator = evaluation["data"].get("rank_displacement_archive")
+                require(displacement is not None and displacement_locator is not None,
+                        "freeze requires the saved A rank-displacement evidence")
+                frozen_candidate.update({
+                    "rank_displacement_version": self.rank_displacement_version,
+                    "a_rank_displacement": self._rank_displacement_summary(displacement),
+                    "a_rank_displacement_archive": displacement_locator,
+                })
+            definitions[cid] = frozen_candidate
         frozen = {"contract": self.spec.as_dict(), "candidates": definitions,
                   "frozen_at": datetime.now(timezone.utc).isoformat()}
         write_json(self.root / "frozen_batch.json", frozen)
@@ -547,6 +805,25 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
             require({"summary": record["data"]["summary"], "coverage": record["data"]["coverage"]}
                     == item["a_evaluation_summary"],
                     "frozen A summary differs from the saved evaluation")
+            if item.get("rank_displacement_version") is not None:
+                displacement = record["data"].get("rank_displacement")
+                displacement_locator = record["data"].get("rank_displacement_archive")
+                require(item["rank_displacement_version"] == RANK_DISPLACEMENT_VERSION
+                        and displacement is not None and displacement_locator is not None
+                        and item["a_rank_displacement_archive"] == displacement_locator
+                        and displacement_locator["identity"] == locator["identity"]
+                        and item["a_rank_displacement"] == self._rank_displacement_summary(displacement)
+                        and displacement.get("definition_version") == item["rank_displacement_version"],
+                        "frozen A rank-displacement evidence differs from its archived evaluation")
+                expected_displacement_key = EvaluationKey(
+                    f"{self.spec.run_id}/A", dumps(self.spec.as_dict()),
+                    item["rank_displacement_version"], "A", "rank-displacement").as_dict()
+                require(displacement_locator["evaluation_key"] == expected_displacement_key,
+                        "frozen A rank-displacement archive version differs from its run")
+            else:
+                require(self.rank_displacement_version is None
+                        and "rank_displacement" not in record["data"],
+                        "legacy frozen A evidence cannot be backfilled")
             a_horizons = record["data"]["horizon_comparison"]["horizons"]
             require(set(a_horizons) == {str(horizon) for horizon in self.spec.b_horizons}
                     and set(item["a_horizon_evidence"]) == {str(horizon) for horizon in retained_horizons},
@@ -592,6 +869,15 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
             require(result.definition == item["executed"], "B execution differs from frozen formula")
             identity = self._factor_identity(result.definition["expanded_expression"],
                                              item["definition"]["direction"])
+            displacement = None
+            if item.get("rank_displacement_version") is not None:
+                require(item["rank_displacement_version"] == self.rank_displacement_version
+                        == RANK_DISPLACEMENT_VERSION,
+                        "frozen rank-displacement definition differs from this run")
+                displacement = evaluate_rank_displacement(
+                    result.values, panel.universe, self.spec, "B")
+                require(displacement["definition_version"] == item["rank_displacement_version"],
+                        "B rank-displacement implementation differs from frozen A")
             horizon_reports, locators = {}, {}
             for horizon in item["retained_horizons"]:
                 horizon_report = evaluate_factor(
@@ -601,13 +887,23 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                 locators[horizon] = self._write_evaluation(
                     cid, "B", horizon_report, identity, definition=item["definition"])
                 write_group_plot(self.root / "plots" / f"{cid}-B-{horizon}h.svg", horizon_report)
+            displacement_locator = None
+            if displacement is not None:
+                displacement_locator = self._write_rank_displacement(
+                    cid, "B", displacement, identity,
+                    source={"frozen_A_rank_displacement_archive": item["a_rank_displacement_archive"],
+                            "B_factor_evaluations": locators})
             reports[cid] = {"segment": "B", "direction": item["definition"]["direction"],
                             "retained_horizons": list(item["retained_horizons"]),
                             "horizons": {str(horizon): horizon_reports[horizon]
                                          for horizon in item["retained_horizons"]}}
+            if displacement is not None:
+                reports[cid]["rank_displacement"] = displacement
+                reports[cid]["rank_displacement_archive"] = displacement_locator
             store.append(f"{cid}-evaluation", "evaluation",
                          self._multi_horizon_evaluation_record_data(
-                             cid, horizon_reports, locators, item["retained_horizons"]))
+                             cid, horizon_reports, locators, item["retained_horizons"],
+                             displacement, displacement_locator))
         correction = correct_batch(reports, self.spec)
         store.append("batch-correction", "multiple_testing", correction)
         decisions = {}
@@ -667,11 +963,31 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
         require(json.loads((self.root / "b-numerical-complete.json").read_text()) == expected_checkpoint,
                 "B numerical checkpoint differs from the frozen batch")
         for cid, report in reports.items():
+            frozen_item = frozen["candidates"][cid]
             require(report["segment"] == "B"
                     and report["direction"] == frozen["candidates"][cid]["definition"]["direction"]
                     and report["retained_horizons"] == frozen["candidates"][cid]["retained_horizons"]
                     and set(report["horizons"]) == {str(horizon) for horizon in report["retained_horizons"]},
                     "B evaluation horizons differ from the frozen batch")
+            if frozen_item.get("rank_displacement_version") is not None:
+                displacement = report.get("rank_displacement")
+                displacement_locator = report.get("rank_displacement_archive")
+                expected_displacement_key = EvaluationKey(
+                    f"{self.spec.run_id}/B", dumps(self.spec.as_dict()),
+                    frozen_item["rank_displacement_version"], "B", "rank-displacement").as_dict()
+                require(frozen_item["rank_displacement_version"] == self.rank_displacement_version
+                        == RANK_DISPLACEMENT_VERSION
+                        and displacement is not None and displacement_locator is not None
+                        and displacement.get("definition_version") == frozen_item["rank_displacement_version"]
+                        and displacement.get("segment") == "B"
+                        and displacement_locator["identity"]
+                        == report["horizons"][str(report["retained_horizons"][0])]["factor_archive"]["identity"]
+                        and displacement_locator["evaluation_key"] == expected_displacement_key,
+                        "B rank-displacement diagnostic differs from frozen A definition")
+            else:
+                require("rank_displacement" not in report and "rank_displacement_archive" not in report
+                        and self.rank_displacement_version is None,
+                        "legacy frozen B cannot receive new rank-displacement diagnostics")
             identity = self._factor_identity(
                 frozen["candidates"][cid]["executed"]["expanded_expression"], report["direction"]).as_dict()
             for horizon in report["retained_horizons"]:
@@ -760,13 +1076,22 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                 "admission_evidence": decision, "multiple_testing": {"method": self.spec.fdr_method,
                                                                     "alpha": self.spec.fdr_alpha},
                 "evidence_references": {
-                    "A": {"record_id": item["a_evaluation_ref"]["record_id"]},
+                    "A": {"record_id": item["a_evaluation_ref"]["record_id"],
+                          **({"rank_displacement_archive": item["a_rank_displacement_archive"]}
+                             if "a_rank_displacement_archive" in item else {})},
                     "B": {"record_id": f"{cid}-evaluation",
                           "factor_archives": {str(horizon): report["horizons"][str(horizon)]["factor_archive"]
-                                              for horizon in report["retained_horizons"]}}},
+                                              for horizon in report["retained_horizons"]},
+                          **({"rank_displacement_archive": report["rank_displacement_archive"]}
+                             if "rank_displacement_archive" in report else {})}},
                 "a_research_decision": item["a_decision"],
                 "b_validation_status": decision["validation_status"],
                 "strategy_validation_status": "not_started"}
+        if "rank_displacement" in report:
+            card["signal_persistence"] = {
+                "A": item["a_rank_displacement"],
+                "B": self._rank_displacement_summary(report["rank_displacement"]),
+            }
         labels = [TAG_LABELS[name] for name in decision["tracks"]] or ["基础型"]
         card["title"] = definition["name"] + " · " + "、".join(labels)
         card["classification"] = {"scheme": self.spec.admission_scheme, "tracks": decision["tracks"],

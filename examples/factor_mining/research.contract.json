@@ -25,7 +25,7 @@
   "min_periods": 48,
   "min_stage_share": 0.5,
   "min_symbols": 20,
-  "objective": "在声明的历史币池与 A/B 区间上，按 FM-v6 规则探索并验证因子研究线索；具体研究问题与目标卡片数量由 Goal 输入指定。",
+  "objective": "在声明的历史币池与 A/B 区间上，按 FM-v6 规则探索并验证因子研究线索；具体研究问题与数量或质量验收条件由 Goal 输入指定。",
   "output_tokens": null,
   "purpose": "research",
   "rolling_periods": 168,
