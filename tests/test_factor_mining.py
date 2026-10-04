@@ -1141,7 +1141,8 @@ class WorkflowTests(unittest.TestCase):
             a_json = json.loads(a_path.read_text())
             a_data = a_json["data"]
             self.assertEqual(set(a_data), {"candidate_id", "segment", "direction", "horizon_hours",
-                                           "summary", "coverage", "factor_archive"})
+                                           "summary", "coverage", "factor_archive",
+                                           "rank_displacement", "rank_displacement_archive"})
             a_pointer = a_data["factor_archive"]
             self.assertEqual(a_pointer["identity"]["semantics_version"], "expr-v1")
             self.assertEqual(a_pointer["evaluation_key"]["evaluator_version"], "factor-eval-v1")
@@ -1149,6 +1150,14 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(a_pointer["evaluation_key"]["contract_version"], dumps(spec.as_dict()))
             self.assertGreater(a_pointer["factor_value_count"], 0)
             self.assertNotIn("periods", a_data)
+            displacement_pointer = a_data["rank_displacement_archive"]
+            self.assertEqual(displacement_pointer["evaluation_key"]["evaluator_version"],
+                             "factor-rank-displacement-v1")
+            self.assertEqual(displacement_pointer["evaluation_key"]["horizon"], "rank-displacement")
+            self.assertEqual(a_data["rank_displacement"]["definition_version"],
+                             "factor-rank-displacement-v1")
+            self.assertEqual(set(a_data["rank_displacement"]["deltas"]), {"1", "4", "24"})
+            self.assertNotIn("periods", a_data["rank_displacement"]["deltas"]["1"])
             self.assertFalse((miner.root / "factor_values" / f"{cid}-A.csv").exists())
 
             identity = FactorIdentity(**a_pointer["identity"])
@@ -1166,6 +1175,8 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(set(first_page["items"][0]), {"timestamp", "symbol", "factor_value"})
             full_a = miner.store._load(a_path)
             self.assertEqual(full_a["data"]["periods"], a_evaluation["payload"]["periods"])
+            self.assertIn("periods", full_a["data"]["rank_displacement"]["deltas"]["1"])
+            self.assertEqual(full_a["data"]["rank_displacement_archive"], displacement_pointer)
             report_page = miner.store.read(f"{cid}-evaluation", "/periods", 0, 2)
             self.assertEqual(report_page["items"], a_evaluation["payload"]["periods"][:2])
             reopt_root = Path(directory) / "reopt"
@@ -1191,6 +1202,10 @@ class WorkflowTests(unittest.TestCase):
             b_path = miner.root / "b_records" / f"{cid}-evaluation.json"
             b_json = json.loads(b_path.read_text())
             self.assertNotIn("periods", b_json["data"])
+            self.assertEqual(b_json["data"]["rank_displacement"]["definition_version"],
+                             "factor-rank-displacement-v1")
+            self.assertEqual(b_json["data"]["rank_displacement_archive"]["evaluation_key"]["horizon"],
+                             "rank-displacement")
             b_pointer = b_json["data"]["horizons"]["24"]["factor_archive"]
             self.assertEqual(b_pointer["evaluation_key"]["data_version"], f"{spec.run_id}/B")
             b_archive = FactorArchive.open_existing(archive_root, identity)
@@ -1331,6 +1346,54 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(first["context_mode"], "numeric_tables_paged")
             second_messages = model.complete.call_args_list[1].args[0]
             self.assertEqual(json.loads(second_messages[-1]["content"])["requested_original_evidence"][0]["data"]["items"][-1], {"value": 999})
+
+    def test_duplicate_goal_catalogs_share_context_but_keep_original_record_reads(self):
+        spec = specification(context_tokens=9000, output_tokens=1000)
+        with tempfile.TemporaryDirectory() as directory:
+            store = RecordStore(Path(directory) / "records")
+            catalog = {"catalog": {"description": "x" * 3000}, "valid_A_rows": {"perp_close": 100}}
+            for index in range(3):
+                store.append(f"inputs-{index}", "data_provenance", copy.deepcopy(catalog))
+            changed = {"catalog": {"description": "changed"}, "valid_A_rows": {"perp_close": 99}}
+            store.append("inputs-changed", "data_provenance", changed)
+            model = Mock()
+            model.complete.return_value = ModelReply(dumps({"result": {"checked": True}, "read_records": []}), {}, "fixture")
+            gateway = AgentGateway(model, spec, store, Path(directory) / "calls")
+            self.assertTrue(gateway.ask("optimizer", "核对重复目录", {}, {})["checked"])
+            request = json.loads((Path(directory) / "calls/00001-request.json").read_text())
+            self.assertEqual(request["context_mode"], "shared_provenance_paged")
+            records = {record["id"]: record for record in json.loads(request["messages"][1]["content"])["records"]}
+            self.assertEqual(records["inputs-0"]["data"]["same_data_as"], {"record_id": "inputs-2", "pointer": ""})
+            self.assertEqual(records["inputs-1"]["data"]["same_data_as"], {"record_id": "inputs-2", "pointer": ""})
+            self.assertEqual(records["inputs-2"]["data"], catalog)
+            self.assertEqual(records["inputs-changed"]["data"], changed)
+            self.assertEqual(store.read("inputs-0", "", 0, 1), catalog)
+            self.assertLessEqual(request["input_token_upper_bound"], spec.context_tokens - spec.output_tokens)
+
+    def test_oversized_evidence_read_is_explicitly_rejected_before_context_append(self):
+        spec = specification(context_tokens=9000, output_tokens=1000)
+        with tempfile.TemporaryDirectory() as directory:
+            store = RecordStore(Path(directory) / "records")
+            rows = [{"value": index, "detail": "x" * 1000} for index in range(20)]
+            store.append("evidence", "evaluation", {"summary": {"mean": .2}, "stages": rows})
+            def read(limit):
+                return ModelReply(dumps({"result": None, "read_records": [{
+                    "record_id": "evidence", "pointer": "/stages", "offset": 0, "limit": limit}]}), {}, "fixture")
+            model = Mock()
+            model.complete.side_effect = [read(20), read(2),
+                ModelReply(dumps({"result": {"checked": True}, "read_records": []}), {}, "fixture")]
+            gateway = AgentGateway(model, spec, store, Path(directory) / "calls")
+            self.assertTrue(gateway.ask("optimizer", "核对阶段证据", {}, {})["checked"])
+            requests = [json.loads(path.read_text()) for path in sorted((Path(directory) / "calls").glob("*-request.json"))]
+            self.assertEqual(len(requests), 3)
+            feedback = json.loads(requests[1]["messages"][-1]["content"])
+            self.assertIn("requested evidence exceeds remaining context budget", feedback["response_error"])
+            self.assertNotIn("requested_original_evidence", feedback)
+            accepted = json.loads(requests[2]["messages"][-1]["content"])["requested_original_evidence"][0]["data"]
+            self.assertEqual(accepted["total"], 20)
+            self.assertEqual(accepted["items"], rows[:2])
+            self.assertTrue(all(request["input_token_upper_bound"] <= 8000 for request in requests))
+            self.assertEqual(store.read("evidence", "/stages", 18, 2)["items"], rows[18:])
 
     def test_context_pages_stage_rows_as_numeric_evidence(self):
         record = {"id": "evaluation", "kind": "evaluation", "data": {
