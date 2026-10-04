@@ -72,12 +72,55 @@ class QualityGoalTests(unittest.TestCase):
     def test_quality_contract_is_explicit_and_exclusive(self):
         goal = GoalSpec("quality", "配对质量", quality_target=TARGET, max_cycles=12)
         self.assertNotIn("target_ideas", goal.as_dict())
-        for changes in ({"target_ideas": 1}, {"max_cycles": None},
+        unlimited = GoalSpec("quality", "配对质量", quality_target=TARGET)
+        self.assertIsNone(unlimited.max_cycles)
+        self.assertNotIn("max_cycles", unlimited.as_dict())
+        for changes in ({"target_ideas": 1}, {"max_cycles": 0}, {"max_cycles": -1},
+                        {"max_cycles": True}, {"max_cycles": 1.5},
                         {"quality_target": {**TARGET, "max_ic_loss": -0.1}},
                         {"quality_target": {**TARGET, "min_improvement": float("nan")}},
                         {"quality_target": {**TARGET, "horizon_hours": 3}}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 GoalSpec("quality", "配对质量", **{"quality_target": TARGET, "max_cycles": 12, **changes})
+
+    def test_unlimited_quality_goal_completes_on_program_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, a, b = self.create(directory, cycles=None)
+            result = self.run_goal(runner, a, b)
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(len(result["qualified_ideas"]), 1)
+            forbidden = lambda: self.fail("completed unlimited Goal must not read data")
+            self.assertEqual(GoalRunner(runner.root, runner.model).run(
+                forbidden, forbidden, forbidden, runner.root / "ideas", poll_seconds=1), result)
+
+    def test_cancelled_limit_resumes_next_cycle_without_replaying_finished_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, a, b = self.create(directory, stable=True)
+            result = self.run_goal(runner, a, b)
+            self.assertEqual(result["status"], "budget_exhausted")
+            original_goal = (runner.root / "goal.json").read_bytes()
+            old_run = runner.root / "runs" / result["current_run"]
+            b_checkpoint = (old_run / "b-numerical-complete.json").read_bytes()
+            runner._save(max_cycles=None)
+            resumed = GoalRunner(runner.root, runner.model)
+            self.assertIsNone(resumed.goal.max_cycles)
+
+            def load_A():
+                if resumed.state["phase"] == "explore":
+                    self.assertEqual(resumed.state["cycle"], 2)
+                    self.assertNotEqual(resumed.state["current_run"], old_run.name)
+                    raise KeyboardInterrupt()
+                self.assertEqual(resumed.state["phase"], "select_task")
+                self.assertIsNone(resumed.state["current_run"])
+                return a
+
+            forbidden_B = lambda: self.fail("continuation must not replay the finished B cycle")
+            with self.assertRaises(KeyboardInterrupt):
+                resumed.run(load_A, forbidden_B, forbidden_B, runner.root / "ideas", poll_seconds=1)
+            self.assertEqual(resumed.state["status"], "paused")
+            self.assertEqual(resumed.state["cycle"], 2)
+            self.assertEqual((old_run / "b-numerical-complete.json").read_bytes(), b_checkpoint)
+            self.assertEqual((runner.root / "goal.json").read_bytes(), original_goal)
 
     def test_actual_pairing_achieves_quality_and_resumes_without_new_reads(self):
         with tempfile.TemporaryDirectory() as directory:
