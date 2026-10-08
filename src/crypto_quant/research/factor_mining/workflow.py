@@ -19,7 +19,7 @@ import pandas as pd
 from crypto_quant.features.factor_expressions import compile_expression, evaluate_expression
 from crypto_quant.features.factor_inputs import FactorInputPanel, INPUT_COLUMNS, validate_universe
 from crypto_quant.research.progress import ProgressLog
-from .agent_calculator import CalculatorRole
+from .agent_calculator import CalculatorRole, FormulaBudgetError
 from .agent_evaluator import EvaluatorRole
 from .agent_ideator import IdeatorRole
 from .agent_optimizer import OptimizerRole
@@ -406,10 +406,13 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
         validate_panel(panel, self.spec, stage)
 
     def _compile(self, expression: str):
-        require(len(expression) <= self.spec.max_formula_nodes * 100, "formula exceeds complexity budget")
+        if len(expression) > self.spec.max_formula_nodes * 100:
+            raise FormulaBudgetError("formula exceeds complexity budget")
         compiled = compile_expression(expression)
-        require(sum(1 for _ in ast.walk(compiled.tree)) <= self.spec.max_formula_nodes, "formula exceeds node budget")
-        require(compiled.lookback_hours <= self.spec.max_lookback_hours, "formula exceeds declared history budget")
+        if sum(1 for _ in ast.walk(compiled.tree)) > self.spec.max_formula_nodes:
+            raise FormulaBudgetError("formula exceeds node budget")
+        if compiled.lookback_hours > self.spec.max_lookback_hours:
+            raise FormulaBudgetError("formula exceeds declared history budget")
         return compiled
 
 

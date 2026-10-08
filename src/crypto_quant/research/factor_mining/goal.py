@@ -65,9 +65,10 @@ class GoalSpec:
 
 
 TASK_SCHEMA = _object_schema({
-    "action": {"type": "string", "enum": ["explore_new", "wait_data"]},
-    "task": _text_schema("下一项研究任务；只给研究问题和方向，不给最终公式"),
-    "reason": _text_schema("相对已有研究的新增价值；等待时说明为什么现有数据无法推进其他方向"),
+    "action": {"type": "string", "enum": ["explore_new", "wait_data", "review_required"],
+               "description": "explore_new生成候选；wait_data等待缺失字段；review_required记录无法在现有证据与执行能力下解决的审查阻塞"},
+    "task": _text_schema("explore_new给出可生成候选的研究问题和方向，不给最终公式；review_required列出缺失的A执行证据及可核验的解除条件"),
+    "reason": _text_schema("相对已有研究的新增价值；等待或审查阻塞时说明为什么现有证据无法推进其他方向"),
     "evidence_refs": _array_schema(_text_schema("当前records中的精确记录ID"), minItems=1),
     "dependencies": _array_schema(_object_schema({
         "field": {"type": "string", "enum": list(INPUT_COLUMNS)},
@@ -108,10 +109,53 @@ class GoalResearchStore(RecordStore):
             if path.name.startswith("cycle-"):
                 summary = self.index / path.name
                 require(summary.is_file(), f"missing saved cycle context index: {summary}")
-                records.append(self._load(summary))
+                records.append(self._complete_historical_context(self._load(summary)))
             else:
                 records.append(self._load(path))
         return records
+
+    def _complete_historical_context(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Enrich legacy cycle summaries from their immutable A records, in memory only."""
+        data = record["data"]
+        context = data["context"]
+        items = data["records"]["items"]
+        run = None
+        updated_candidates = []
+        changed = False
+        for candidate in context["candidates"]:
+            evaluation = candidate.get("A_evaluation")
+            if evaluation is None or "horizon_comparison" in evaluation:
+                updated_candidates.append(candidate)
+                continue
+            candidate_id = candidate["candidate_ref"].rsplit("/", 1)[-1]
+            item = next((item for item in items if item["kind"] == "evaluation"
+                         and item["candidate_id"] == candidate_id), None)
+            require(item is not None,
+                    f"historical A evaluation reference is missing for {candidate['candidate_ref']}")
+            run = run or self._source_run(data)
+            source = load_record_reference(run / "a_records", item["ref"])
+            require(source["kind"] == "evaluation" and source["data"].get("segment") == "A",
+                    "historical Goal horizon evidence must come from an A evaluation")
+            evaluation = {**evaluation,
+                          "horizon_comparison": _horizon_summary(source["data"]["horizon_comparison"])}
+            updated_candidates.append({**candidate, "A_evaluation": evaluation})
+            changed = True
+        route_states = context.get("route_states")
+        if route_states is None:
+            optimization_items = [item for item in items if item["kind"] == "optimization"]
+            if optimization_items:
+                run = run or self._source_run(data)
+                route_states = {}
+                for item in optimization_items:
+                    source = load_record_reference(run / "a_records", item["ref"])
+                    require(source["kind"] == "optimization",
+                            "historical Goal route states must come from A optimization records")
+                    route_states.update(source["data"].get("route_states", {}))
+                changed = True
+        if not changed:
+            return record
+        return {**record, "data": {**data, "context": {
+            **context, "candidates": updated_candidates, "route_states": route_states}}}
 
     def _source_run(self, data: dict[str, Any]) -> Path:
         run_path = Path(data["records"]["run_path"])
@@ -131,10 +175,11 @@ class GoalResearchStore(RecordStore):
             require(record["kind"] == item["kind"], "saved research record kind changed")
             records.append(record)
         return records
-
     def read(self, record_id: str, pointer: str, offset: int, limit: int) -> Any:
         if record_id.startswith("cycle-") and pointer.startswith("/context"):
-            return RecordStore(self.index).read(record_id, pointer, offset, limit)
+            record = self._complete_historical_context(
+                RecordStore(self.index)._load(self.index / f"{identifier(record_id)}.json"))
+            return read_pointer(record["data"], pointer.removeprefix("/data"), offset, limit)
         if record_id.startswith("cycle-") and pointer.startswith("/records"):
             cycle = self._load(self.root / f"{identifier(record_id)}.json")["data"]
             items = cycle["records"]["items"]
@@ -159,6 +204,21 @@ class GoalResearchStore(RecordStore):
             return read_pointer(source_record, "/" + "/".join(parts[3:]) if len(parts) > 3 else "",
                                 offset, limit)
         return super().read(record_id, pointer, offset, limit)
+
+
+def _horizon_summary(comparison: dict[str, Any]) -> dict[str, Any]:
+    horizons = comparison["horizons"]
+    require(set(horizons) == {"1", "4", "24"},
+            "A horizon comparison must contain 1h, 4h and 24h results")
+    result = {}
+    for key in ("1", "4", "24"):
+        report = horizons[key]
+        require(report.get("segment") == "A" and report.get("horizon_hours") == int(key)
+                and report.get("label") == f"perp_next_open_{key}h",
+                f"A horizon {key}h label or horizon evidence is inconsistent")
+        result[key] = {name: report[name] for name in
+                       ("horizon_hours", "label", "direction", "summary", "coverage")}
+    return result
 
 
 class GoalRunner:
@@ -204,6 +264,21 @@ class GoalRunner:
         self.events.append(f"event-{sequence:08d}", "goal_state", state)
         self.state = state
 
+    def resume_blocked_after_review(self) -> dict[str, Any]:
+        """Explicitly resume after a person has reviewed and addressed the block report."""
+        with (self.root / "runner.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.state = self.status(self.root)
+            require(self.state["status"] == "blocked"
+                    and self.state["error"]["type"] in {
+                        "repeated_empty_A_cycles", "research_review_required"},
+                    "only a Goal blocked by empty A cycles or research review can be manually resumed")
+            changes = {"status": "active", "phase": "select_task", "current_run": None, "error": None}
+            if self.state["error"]["type"] == "repeated_empty_A_cycles":
+                changes["empty_cycle_reviewed_through"] = self.state["cycle"]
+            self._save(**changes)
+        return self.state
+
     def _gateway(self, store: RecordStore) -> AgentGateway:
         return AgentGateway(self.model, replace(self.spec, run_id=self.goal.goal_id),
                             store, self.root / "model_calls", progress=self.progress)
@@ -220,7 +295,7 @@ class GoalRunner:
         return all(counts[d["field"]] >= d["min_valid_rows"] for d in dependencies)
 
     def _check_task(self, value: dict[str, Any], panel: FactorInputPanel) -> None:
-        require(value["action"] in {"explore_new", "wait_data"}, "unknown goal action")
+        require(value["action"] in {"explore_new", "wait_data", "review_required"}, "unknown goal action")
         for key in ("task", "reason"):
             text(value[key], key)
         refs = value["evidence_refs"]
@@ -245,7 +320,7 @@ class GoalRunner:
                     "waiting requires an unmet, program-checkable data dependency")
         else:
             require(not dependencies,
-                    "explore_new requires dependencies=[]; do not list fields that are already available")
+                    f"{value['action']} requires dependencies=[]; only wait_data uses field dependencies")
 
     def _select(self, panel: FactorInputPanel) -> None:
         records = self.research.all()
@@ -256,23 +331,50 @@ class GoalRunner:
         self.research.append(catalog_id, "data_provenance", catalog)
         decision = self._gateway(self.research).ask("optimizer",
             "你继续担任优化Agent，现在负责Goal层的下一项研究决策，不新增角色。"
-            "对照goal和全部A研究记录，选择新的有依据的研究方向，或等待明确缺失的数据。"
+            "对照goal和全部A研究记录，选择可执行的候选研究方向、等待明确缺失的数据，或报告无法解决的审查阻塞。"
             "已有候选的优化仍由候选Loop按四问和配对合同执行。当前候选无修改提案只结束该候选Loop，"
-            "不代表Goal完成。尚未想到新方向时继续梳理未回答问题，不能输出结束或完成。"
+            "不代表Goal完成。尚未想到新方向时，在本次选题中梳理未回答问题，不能输出结束或完成。"
+            "explore_new会启动候选生成Loop，必须允许并预期生成候选，不能下达只审查归档、不生成公式的任务。"
+            "纯归档审查在本次选题中通过read_records完成：先读取cycle记录的/records目录，再按其中pointer读取原始A记录的/data及所需字段。"
+            "limit仅对数组分页，/records/N/data配limit=1仍会读取整份记录；配对结果先读/data/plan、/data/coverage、"
+            "/data/paired_improvement或/data/paired_ic_change，逐期诊断读/data/paired_periods并分页，不能整份加载大型报告。"
+            "候选Loop没有独立的历史执行审计器，不能把核验原配对配置、逐期掩码或重算诊断交给一个禁止生成候选的explore_new任务。"
+            "若所需证据仍无法取得，先判断能否基于已有A证据研究其他独立方向；只有无法推进时选择review_required，"
+            "在task中写明缺失的具体A证据、要核验的问题及解除条件，在reason中说明其他方向也无法推进的原因。"
+            "review_required直接进入blocked，不创建研究run，不计为空候选轮次；这不代表Goal完成。"
+            "历史task或diagnostics中的未执行建议不等于已冻结定义，也不能升级成所有后续研究的合同前置条件。"
+            "新方向须说明已有A观察、机制假设与可证伪的检验价值，但不要求尚未生成的新定义提前提供它自己的执行结果。"
+            "具体定义由构想Agent生成；候选修改仍须先由Optimizer按四问预声明，再执行配对检验。"
+            "若一个诊断超出现有执行能力，只阻塞依赖它的路线；独立方向仍按已有A依据判断，不能仅因旧诊断未完成而全部拒绝。"
             "explore_new须说明新增研究价值，不重复已经检验的相同公式；不输出候选定义或最终公式，"
             "交给构想Agent生成。新数据可以支持重查旧问题，但需说明新增依据。"
+            "quality_target.horizon_hours是本Goal的预测期限H，displacement_hours是排名变化间隔Δ。"
+            "contract.label只是默认24h标签；按期限的实际A证据以evaluation horizon_comparison中逐项标明的horizon_hours和label为准。"
+            "执行边界以payload.prediction_horizon中的程序规则为准：单版A多期限比较共同剔除末端25h；"
+            "rank_displacement配对按H标签剔除末端H+1小时（1h为2、4h为5、24h为25），D两端同时限定在A内。"
+            "配对没有自定义末端掩码接口，不得把单版25h边界写成1h/4h配对的固定条件，也不能要求候选Loop修改执行程序。"
+            "历史计划文字与实际coverage矛盾时保留该未决证据，不宣称旧试验按原计划达标；新任务须使用可执行的程序口径。"
+            "若后续任务要把历史候选作为配对对照，历史candidate_ref只作公式和方向来源；它不属于当前run，不能直接用作control_id。"
+            "下一项任务应明确先在当前run重算历史表达式与固定方向的A基准，再由候选Loop针对这个本轮control正式预声明proposal，之后才生成配对child。"
+            "重算基准不会恢复旧路线或清零旧路线状态；已暂停/停止的历史修改路线不得靠重算control继续。"
+            "restart_of只引用当前run中已暂停/停止的路线；若提出独立新路线，须有当前A段新增依据。"
             "只有缺少具体A段字段观测且无法推进其他方向时才wait_data，列出字段、最低有效观测数及依据。"
-            "action=explore_new时dependencies必须严格为空数组[]，不得列出已有或覆盖充足的字段；"
+            "action为explore_new或review_required时dependencies必须严格为空数组[]，不得列出已有或覆盖充足的字段；"
             "dependencies只在action=wait_data且字段当前确实不足时填写。"
             "evidence_refs只能从payload.allowed_evidence_refs原样选择Goal顶层记录ID；"
             "research_cycle内部的candidate、evaluation、calculation或round记录ID不能直接放入evidence_refs。"
             "不要将单个候选暂停当成整个Goal必须等待。B验收规则由程序执行，不能修改或请求B/C结果。",
-            {"goal_phase": "select_task", "goal": self.goal.as_dict(), "catalog_record_id": catalog_id,
+            {"goal_phase": "select_task", "goal": self.goal.as_dict(),
+             "prediction_horizon": self._prediction_horizon(), "catalog_record_id": catalog_id,
              "allowed_evidence_refs": sorted({r["id"] for r in records} | {catalog_id})},
             TASK_SCHEMA, validate=lambda value: self._check_task(value, panel))
         self.research.append(f"task-{index:08d}", "goal_task", decision)
         if decision["action"] == "wait_data":
             self._save(status="waiting", phase="wait_data", task=decision)
+        elif decision["action"] == "review_required":
+            self._save(status="blocked", phase="blocked", current_run=None, task=decision,
+                       error={"type": "research_review_required", "reason": decision["reason"],
+                              "task": decision})
         else:
             archived_cycles = []
             for record in records:
@@ -327,6 +429,8 @@ class GoalRunner:
                 a_evaluation = {
                     "summary": evaluation["data"]["summary"],
                     "coverage": evaluation["data"]["coverage"],
+                    "horizon_comparison": _horizon_summary(
+                        evaluation["data"]["horizon_comparison"]),
                     "rank_displacement": displacement_context,
                 }
             executed = calculation["data"]["executed_expression"] if calculation else None
@@ -348,12 +452,29 @@ class GoalRunner:
                         "disposition", "continue_optimization", "reason", "resume_condition")
                 },
                 "paired_comparison": None if comparison is None else {
-                    key: comparison["data"][key] for key in (
-                        "route_decision", "reason", "paired_ic_change", "paired_improvement")
+                    **{key: comparison["data"][key] for key in (
+                        "route_decision", "reason", "paired_ic_change", "paired_improvement")},
+                    "route_id": comparison["data"]["plan"]["route_id"],
                 },
             })
+        route_states = {}
+        for record in source.values():
+            if record["kind"] == "optimization":
+                route_states.update(record["data"].get("route_states", {}))
         return {"source_record_id": record_id, "run_id": data["run_id"],
-                "candidates": candidates, "previous_expressions": previous}
+                "candidates": candidates, "route_states": route_states,
+                "previous_expressions": previous}
+
+    def _prediction_horizon(self) -> dict[str, Any]:
+        target = self.goal.quality_target
+        return {"goal_horizon_hours": None if target is None else target["horizon_hours"],
+                "displacement_hours": None if target is None else target["displacement_hours"],
+                "contract_default_label": self.spec.label,
+                "A_evaluation_horizons_hours": [1, 4, 24],
+                "A_horizon_comparison_end_exclusion_hours": 25,
+                "paired_rank_displacement_end_exclusion_hours": {"1": 2, "4": 5, "24": 25},
+                "paired_boundary_rule": "Use the selected H next-open label with label_end < A_end; both displacement endpoints must be in A. Custom end masks are not supported.",
+                "evidence_rule": "Use each A evaluation's horizon_hours and label; contract_default_label describes only the default 24h evaluation."}
 
     def _context(self, panel: FactorInputPanel) -> dict[str, Any]:
         history = self.research.all()
@@ -366,6 +487,7 @@ class GoalRunner:
         tasks = [{"source_record_id": record["id"], **record["data"]}
                  for record in history if record["kind"] == "goal_task"]
         return {"goal": self.goal.as_dict(), "research_task": self.state["task"],
+                "prediction_horizon": self._prediction_horizon(),
                 "prior_A_research": {"tasks": tasks, "cycles": cycles},
                 "previous_expressions": []}
 
@@ -381,6 +503,8 @@ class GoalRunner:
             return
         records = [_read(path) for path in sorted(miner.store.root.glob("*.json"))]
         records = [record for record in records if record["kind"] != "goal_context"]
+        records = [load_record_reference(miner.store.root, record_reference(record))
+                   if record["kind"] == "evaluation" else record for record in records]
         context = self._cycle_context(record_id, {"run_id": miner.spec.run_id, "records": records})
         run_path = miner.root.resolve().relative_to(self.root.parent.resolve())
         items = []
@@ -395,10 +519,16 @@ class GoalRunner:
             if record["kind"] == "evaluation":
                 item["factor_archive_ref"] = data["factor_archive"]
             items.append(item)
+        completion_path = miner.root / "a-complete.json"
+        completion = _read(completion_path) if completion_path.exists() else None
         data = {"run_id": miner.spec.run_id, "context": context,
+                "task": self.state["task"],
                 "candidate_ids": [record["data"]["id"] for record in records
                                   if record["kind"] == "candidate"],
                 "records": {"run_path": str(run_path), "items": items}}
+        if completion is not None:
+            data["a_completion"] = {key: completion[key] for key in
+                                    ("completed_rounds", "stop_reason")}
         self.research.append(record_id, "research_cycle", data)
 
     def _quality_evidence(self, miner: FactorMiner, cid: str, retained_horizons: list[int]) -> dict[str, Any]:
@@ -697,11 +827,30 @@ class GoalRunner:
                         else len(self.state["qualified_ideas"]) >= self.goal.target_ideas)
             if achieved:
                 self._save(status="complete", phase="complete", error=None)
-            elif (self.goal.quality_target is not None and self.goal.max_cycles is not None
-                  and self.state["cycle"] >= self.goal.max_cycles):
-                self._save(status="budget_exhausted", phase="budget_exhausted", error=None)
             else:
-                self._save(status="active", phase="select_task", current_run=None, error=None)
+                cycles = [record for record in self.research.all()
+                          if record["kind"] == "research_cycle"]
+                empty_streak = []
+                for record in reversed(cycles):
+                    if int(record["id"].removeprefix("cycle-")) <= self.state.get("empty_cycle_reviewed_through", 0):
+                        break
+                    if record["data"]["candidate_ids"]:
+                        break
+                    empty_streak.append(record)
+                if len(empty_streak) >= 2:
+                    blocked_cycles = [{"cycle_id": record["id"],
+                                       "task": record["data"].get("task"),
+                                       "a_completion": record["data"].get("a_completion")}
+                                      for record in reversed(empty_streak)]
+                    self._save(status="blocked", phase="blocked", current_run=None,
+                               error={"type": "repeated_empty_A_cycles",
+                                      "reason": "two consecutive completed A cycles generated no candidates; inspect the recorded tasks and evidence handoff before resuming",
+                                      "cycles": blocked_cycles})
+                elif (self.goal.quality_target is not None and self.goal.max_cycles is not None
+                      and self.state["cycle"] >= self.goal.max_cycles):
+                    self._save(status="budget_exhausted", phase="budget_exhausted", error=None)
+                else:
+                    self._save(status="active", phase="select_task", current_run=None, error=None)
 
         return {"select_task": select_task, "wait_data": wait_data, "explore": explore, "prepare_validation": prepare_validation, "validate": validate, "finish_cycle": finish_cycle}
 
@@ -717,7 +866,7 @@ class GoalRunner:
             # OS releases this lock on process exit; a second runner must fail.
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.state = self.status(self.root)
-            if self.state["status"] == "complete":
+            if self.state["status"] in {"complete", "blocked"}:
                 return self.state
             if self.state["status"] == "budget_exhausted":
                 require(self.goal.quality_target is not None, "budget_exhausted requires a quality Goal")
@@ -737,7 +886,7 @@ class GoalRunner:
                     return execute
 
                 def route(state):
-                    if state["status"] in {"complete", "budget_exhausted"}:
+                    if state["status"] in {"complete", "budget_exhausted", "blocked"}:
                         return END
                     return "poll" if state["status"] == "waiting" else state["phase"]
 

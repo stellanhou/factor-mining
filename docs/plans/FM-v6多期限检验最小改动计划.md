@@ -120,5 +120,5 @@ SQLite 的评估键已有 horizon 字段，优先使用现有归档格式，不�
 ## 六 依据
 
 - 当前实现：[模块说明](../../src/crypto_quant/research/factor_mining/README.md)、[正式研究合同](../../examples/factor_mining/research.contract.json)、[多期限评估](../../src/crypto_quant/research/factor_mining/evaluation.py)、[优化角色](../../src/crypto_quant/research/factor_mining/agent_optimizer.py)、[冻结及卡片交付](../../src/crypto_quant/research/factor_mining/workflow.py)。
-- 已核验基线：[正式 Goal 完成事件](../../experiments/factor_mining/goals/fm-v6-mimo26-pro-20260929/events/event-00000039.json)及该 Goal 下 7 个研究周期的完成、验证和卡片记录。实验目录仅作为本地证据引用，不进入代码交付。
+- 已核验基线：[正式 Goal 完成事件](/Users/stellan/量化投资/experiments/factor_mining/goals/fm-v6-mimo26-pro-20260929/events/event-00000039.json)及该 Goal 下 7 个研究周期的完成、验证和卡片记录。实验目录仅作为本地证据引用，不进入代码交付。
 - 多期限分析参考：[Alphalens 官方文档](https://quantopian.github.io/alphalens/alphalens.html#alphalens.utils.compute_forward_returns)。统计带宽参考：[statsmodels HAC 文档](https://www.statsmodels.org/stable/generated/statsmodels.stats.sandwich_covariance.cov_hac.html)。

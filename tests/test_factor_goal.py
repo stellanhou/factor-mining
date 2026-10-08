@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from test_factor_mining import ScenarioModel, definition, input_panel, specification
-from crypto_quant.research.factor_mining.contracts import dumps
+from crypto_quant.research.factor_mining.contracts import digest, dumps
 from crypto_quant.research.factor_mining.evaluation import evaluate_factor
 from crypto_quant.research.factor_mining.factor_archive import EvaluationKey, FactorArchive, FactorIdentity
 from crypto_quant.research.factor_mining.goal import GoalRunner, GoalSpec
@@ -29,6 +29,7 @@ class GoalModel:
         self.selections = 0
         self.interrupt_role = None
         self.selection_override = None
+        self.cross_cycle_pair = False
 
     def settings(self):
         return SETTINGS.copy()
@@ -71,6 +72,16 @@ class GoalModel:
                             if f"{cid}-duplicate" in ids:
                                 decision.update(disposition="discard", retained_horizons=[], continue_optimization=False,
                                                 evidence_refs=[f"{cid}-duplicate"], resume_condition=None)
+                        if self.cross_cycle_pair and value["proposals"]:
+                            value["proposals"][0]["experiment_design"] = {
+                                "question": "新窗口是否降低4h预测期限下4h排名变化，同时保持方向IC？",
+                                "metric": "rank_displacement", "horizon_hours": 4,
+                                "displacement_hours": 4, "min_improvement": 0.01,
+                                "max_ic_loss": 0.001,
+                                "expected_outcome": "共同样本配对区间达到Goal阈值",
+                                "stop_condition": "改善区间上界低于阈值或IC损失区间下界越界",
+                                "pause_condition": "区间无法区分改善与恶化或共同样本不足",
+                            }
                 self.miners[run_id] = ScenarioModel(transform=transform, propose_once=self.optimize)
             return self.miners[run_id].complete(messages, max_output_tokens=max_output_tokens, session_id=session_id)
         return ModelReply(dumps({"result": result, "read_records": []}), {"fixture": True}, "scripted-fixture")
@@ -214,10 +225,14 @@ class GoalTests(unittest.TestCase):
             evaluation = miner.store._load(miner.store.root / "candidate-0001-evaluation.json")["data"]
             context = runner._context(a)
             encoded = dumps(context)
-            self.assertLess(len(encoded), 10000)
+            self.assertLess(len(encoded), 20000)  # compact three-horizon summaries, no period tables
             self.assertNotIn('"periods"', encoded)
             candidate = context["prior_A_research"]["cycles"][0]["candidates"][0]
             self.assertEqual(candidate["A_evaluation"]["summary"], evaluation["summary"])
+            for horizon in (1, 4, 24):
+                report = candidate["A_evaluation"]["horizon_comparison"][str(horizon)]
+                self.assertEqual(report["horizon_hours"], horizon)
+                self.assertEqual(report["label"], f"perp_next_open_{horizon}h")
             self.assertEqual(candidate["final_decision"]["disposition"], "retain")
             self.assertEqual(context["previous_expressions"], [])
             cycle = json.loads((runner.research.root / "cycle-00000001.json").read_text())["data"]
@@ -231,6 +246,206 @@ class GoalTests(unittest.TestCase):
             result = miner.explore(a, goal_context=context)
             self.assertIn("candidate-0001", result["evaluated_ids"])
             self.assertFalse((miner.root / "a_records" / "candidate-0001-duplicate.json").exists())
+
+    def test_cross_cycle_control_is_recomputed_then_paired_in_current_run(self):
+        target = {"metric": "rank_displacement", "horizon_hours": 4,
+                  "displacement_hours": 4, "min_improvement": 0.01, "max_ic_loss": 0.001}
+        with tempfile.TemporaryDirectory() as directory:
+            spec = specification(purpose="research")
+            model = GoalModel(optimize=True)
+            model.cross_cycle_pair = True
+            goal = GoalSpec("cross-cycle-quality", "在4h预测期限下研究改善排名稳定性的候选",
+                            quality_target=target, max_cycles=3)
+            runner = GoalRunner.create(goal, spec, model, Path(directory),
+                                       inputs={}, model_settings=SETTINGS)
+            a = input_panel(spec)
+
+            prior_model = GoalModel()
+            prior = FactorMiner(replace(spec, run_id="prior-run"), prior_model,
+                                runner.root / "runs")
+            prior.explore(a)
+            historical = prior.candidates["candidate-0001"]["calculation"][
+                "executed_expression"]["expanded_expression"]
+            runner._save(cycle=1, current_run="prior-run", task={
+                "action": "explore_new", "task": "保留历史候选作研究依据",
+                "reason": "准备后续共同样本比较", "evidence_refs": ["task-00000001"],
+                "dependencies": []})
+            runner._archive_A(prior)
+
+            # Simulate a saved summary from before horizon summaries were added.
+            summary_path = runner.research.index / "cycle-00000001.json"
+            saved = runner.research._load(summary_path)
+            legacy_data = copy.deepcopy(saved["data"])
+            for candidate in legacy_data["context"]["candidates"]:
+                if candidate["A_evaluation"] is not None:
+                    candidate["A_evaluation"].pop("horizon_comparison", None)
+            legacy_data["context"].pop("route_states", None)
+            summary_path.write_text(dumps({**saved, "data": legacy_data,
+                                           "sha256": digest(legacy_data)}) + "\n")
+            legacy_summary_bytes = summary_path.read_bytes()
+            archived_cycle_bytes = (runner.research.root / "cycle-00000001.json").read_bytes()
+
+            def select_prior_baseline(result):
+                result.update(task="在当前run重算历史候选的同一表达式和方向作为A基准，之后对本轮control预声明4h/4h配对实验",
+                              evidence_refs=["cycle-00000001"])
+            model.selection_override = select_prior_baseline
+            runner._select(a)
+            select_request = next(request for request in model.requests
+                                  if request["payload"].get("goal_phase") == "select_task")
+            self.assertEqual(select_request["payload"]["prediction_horizon"]["goal_horizon_hours"], 4)
+            historical_cycle = next(record["data"] for record in select_request["records"]
+                                    if record["kind"] == "research_cycle")
+            old_candidate = historical_cycle["context"]["candidates"][0]
+            self.assertEqual(old_candidate["A_evaluation"]["horizon_comparison"]["4"]["label"],
+                             "perp_next_open_4h")
+            self.assertEqual(summary_path.read_bytes(), legacy_summary_bytes)
+            self.assertEqual((runner.research.root / "cycle-00000001.json").read_bytes(),
+                             archived_cycle_bytes)
+
+            context = runner._context(a)
+            miner = FactorMiner(replace(spec, run_id=runner.state["current_run"]),
+                                model, runner.root / "runs")
+            completion = miner.explore(a, goal_context=context)
+            self.assertEqual(completion["completed_rounds"], 2)
+            control = miner.candidates["candidate-0001"]
+            child = miner.candidates["candidate-0002"]["definition"]
+            self.assertEqual(control["calculation"]["executed_expression"]["expanded_expression"], historical)
+            self.assertEqual(control["definition"]["direction"], old_candidate["definition"]["direction"])
+            self.assertEqual(control["definition"]["parent_id"], None)
+            self.assertEqual(child["parent_id"], "candidate-0001")
+            self.assertEqual(child["proposal_id"], "proposal-1")
+            proposal = miner.store._load(miner.store.root / "round-001-optimization.json")["data"]["proposals"][0]
+            self.assertEqual(proposal["control_id"], "candidate-0001")
+            self.assertEqual(proposal["experiment_design"]["horizon_hours"], 4)
+            comparison = miner.store._load(miner.store.root / "candidate-0002-comparison.json")["data"]
+            self.assertEqual(comparison["plan"]["control_id"], "candidate-0001")
+            self.assertEqual(comparison["plan"]["experiment_design"]["horizon_hours"], 4)
+            self.assertEqual(comparison["plan"]["experiment_design"]["displacement_hours"], 4)
+            protocol = context["prediction_horizon"]
+            self.assertEqual(protocol["A_horizon_comparison_end_exclusion_hours"], 25)
+            self.assertEqual(comparison["coverage"]["label_boundary_excluded_periods"],
+                             protocol["paired_rank_displacement_end_exclusion_hours"]["4"])
+            self.assertNotEqual(comparison["coverage"]["label_boundary_excluded_periods"],
+                                protocol["A_horizon_comparison_end_exclusion_hours"])
+            self.assertIn("paired_improvement", comparison)
+            self.assertIn("paired_ic_change", comparison)
+            self.assertFalse((miner.root / "b-access-started.json").exists())
+
+    def test_archival_review_blocks_before_creating_an_empty_candidate_cycle(self):
+        # These are the review-only instructions that exhausted mixed-4h cycles 54/55.
+        for instruction in (
+            "核对原配对配置及25h共同末端边界；本任务只审查历史归档，不建立新父子对照或生成公式。",
+            "检查共同样本上的IC差序列与尾部分组换位；仅审查历史归档，不生成公式或建立新父子对照。",
+        ):
+            with self.subTest(task=instruction), tempfile.TemporaryDirectory() as directory:
+                model = GoalModel()
+                model.selection_override = lambda result: result.update(
+                    action="review_required", task=instruction + "需提供原配对执行配置及逐期共同掩码后核验。",
+                    reason="已有摘要不能完成执行审计，缺少原配对配置和掩码，尚无证据支持其他独立方向。")
+                runner, a, _ = self.create(directory, model)
+                runner._save(cycle=53, empty_cycle_reviewed_through=51)
+                forbidden = Mock(side_effect=AssertionError("review must not execute a candidate or access B"))
+                with patch.object(FactorMiner, "explore", forbidden):
+                    state = runner.run(lambda: a, forbidden, forbidden, runner.root / "ideas",
+                                       poll_seconds=1, sleep=forbidden)
+                self.assertEqual(state["status"], "blocked")
+                self.assertEqual(state["phase"], "blocked")
+                self.assertEqual(state["error"]["type"], "research_review_required")
+                self.assertEqual(state["error"]["task"], state["task"])
+                self.assertEqual(state["cycle"], 53)
+                self.assertIsNone(state["current_run"])
+                self.assertEqual(state["qualified_ideas"], [])
+                self.assertFalse((runner.root / "runs").exists())
+                self.assertFalse(any(r["kind"] == "research_cycle" for r in runner.research.all()))
+                forbidden.assert_not_called()
+
+                restarted = GoalRunner(runner.root, model)
+                event_count, request_count = len(restarted.events.all()), len(model.requests)
+                self.assertEqual(restarted.run(forbidden, forbidden, forbidden, runner.root / "ideas",
+                                               poll_seconds=1), state)
+                self.assertEqual(len(restarted.events.all()), event_count)
+                self.assertEqual(len(model.requests), request_count)
+
+                resumed = restarted.resume_blocked_after_review()
+                # Reviewing an evidence block must not erase earlier empty-cycle history.
+                self.assertEqual(resumed["empty_cycle_reviewed_through"], 51)
+                self.assertEqual(resumed["phase"], "select_task")
+                self.assertIsNone(resumed["error"])
+                model.selection_override = None
+                restarted._select(a)
+                self.assertEqual(restarted.state["phase"], "explore")
+                self.assertEqual(restarted.state["cycle"], 54)
+
+    def test_review_block_does_not_accept_field_wait_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, a, _ = self.create(directory)
+            runner.research.append("inputs-test", "data_provenance", {})
+            with self.assertRaisesRegex(ValueError, "review_required requires dependencies"):
+                runner._check_task({
+                    "action": "review_required", "task": "核验缺失的执行配置", "reason": "缺少执行证据",
+                    "evidence_refs": ["inputs-test"], "dependencies": [
+                        {"field": "premium_index", "min_valid_rows": 1, "reason": "不是归档证据依赖"}],
+                }, a)
+
+    def test_repeated_empty_A_cycles_block_until_explicit_reviewed_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, a, b = self.create(directory)
+
+            def empty_ideation(request, result):
+                if request["role"] == "ideator" and not request["payload"]["pending_proposals"]:
+                    result["candidates"] = []
+
+            for cycle in (1, 2):
+                run_id = f"empty-run-{cycle}"
+                task = {"action": "explore_new", "task": f"空产出方向{cycle}",
+                        "reason": "脚本复现重复无候选", "evidence_refs": ["inputs-00000001"],
+                        "dependencies": []}
+                runner._save(cycle=cycle, current_run=run_id, phase="explore", task=task)
+                model = ScenarioModel(transform=empty_ideation, propose_once=False)
+                miner = FactorMiner(replace(runner.spec, run_id=run_id), model,
+                                    runner.root / "runs")
+                completion = miner.explore(a, goal_context=runner._context(a))
+                self.assertEqual(completion["candidate_ids"], [])
+                runner._save(phase="finish_cycle")
+                runner._phase_actions(lambda: a, lambda: b, lambda: b.universe,
+                                      runner.root / "ideas")["finish_cycle"]()
+                if cycle == 1:
+                    self.assertEqual(runner.state["status"], "active")
+                    self.assertEqual(runner.state["phase"], "select_task")
+
+            self.assertEqual(runner.state["status"], "blocked")
+            self.assertEqual(runner.state["error"]["type"], "repeated_empty_A_cycles")
+            self.assertEqual([item["cycle_id"] for item in runner.state["error"]["cycles"]],
+                             ["cycle-00000001", "cycle-00000002"])
+            event_count = len(runner.events.all())
+            resumed = runner.run(lambda: self.fail("blocked Goal must not reload A"),
+                                 lambda: self.fail("blocked Goal must not load B"),
+                                 lambda: self.fail("blocked Goal must not load B membership"),
+                                 runner.root / "ideas", poll_seconds=1)
+            self.assertEqual(resumed["status"], "blocked")
+            self.assertEqual(len(runner.events.all()), event_count)
+
+            state = runner.resume_blocked_after_review()
+            self.assertEqual(state["status"], "active")
+            self.assertEqual(state["phase"], "select_task")
+            self.assertIsNone(state["current_run"])
+            self.assertEqual(state["empty_cycle_reviewed_through"], 2)
+
+            # Previously reviewed empty cycles must not immediately block a
+            # repaired workflow again; the threshold is two new empty cycles.
+            for cycle in (3, 4):
+                run_id = f"empty-run-{cycle}"
+                runner._save(cycle=cycle, current_run=run_id, phase="explore", task=task)
+                miner = FactorMiner(replace(runner.spec, run_id=run_id),
+                                    ScenarioModel(transform=empty_ideation, propose_once=False),
+                                    runner.root / "runs")
+                miner.explore(a, goal_context=runner._context(a))
+                runner._save(phase="finish_cycle")
+                runner._phase_actions(lambda: a, lambda: b, lambda: b.universe,
+                                      runner.root / "ideas")["finish_cycle"]()
+                self.assertEqual(runner.state["status"], "active" if cycle == 3 else "blocked")
+            self.assertEqual([item["cycle_id"] for item in runner.state["error"]["cycles"]],
+                             ["cycle-00000003", "cycle-00000004"])
 
     def test_goal_context_uses_saved_cycle_context_without_hash_lookup(self):
         with tempfile.TemporaryDirectory() as directory:

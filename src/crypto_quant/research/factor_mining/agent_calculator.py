@@ -13,6 +13,10 @@ from .model import ApiCallError
 from .records import ModelResponseError
 
 
+class FormulaBudgetError(ValueError):
+    """A valid formula exceeds its contract; simplifying it is new research."""
+
+
 class CalculatorRole:
     def _calculate(self, cid: str, panel: FactorInputPanel) -> pd.Series | None:
         item = self.candidates[cid]
@@ -32,14 +36,15 @@ class CalculatorRole:
                 checks.append({"attempt": attempt, "expression": expression,
                                "actual_steps": compiled.calculation_steps() if compiled else None,
                                "program_error": error})
-                if attempt == self.spec.max_repairs:
+                if isinstance(exc, FormulaBudgetError) or attempt == self.spec.max_repairs:
                     break
                 try:
                     repair = self.gateway.ask(
                         "calculator",
                         "根据程序报错修复因子公式，使其使用允许的字段和算子并可执行。"
                         "只修改公式；无需判断候选的文字解释或金融假设。"
-                        "只依据程序报错修复，不因量纲或跨币尺度修改可执行公式。",
+                        "只依据程序报错修复，不因量纲或跨币尺度修改可执行公式。"
+                        "保留原计算含义，不得删除归一化分母、输入项或改变窗口以简化公式。",
                         {"candidate_id": cid, "current_expression": expression,
                          "program_error": error, "catalog_record_id": "inputs"},
                         _object_schema({

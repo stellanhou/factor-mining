@@ -773,6 +773,38 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(calculation["status"], "computed")
             self.assertEqual(calculation["executed_expression"]["expression"], corrected["repair_expression"])
 
+    def test_formula_budget_failure_does_not_rewrite_weighted_mean(self):
+        # mixed-1h cycle 1: the repair model removed the normalization denominator
+        # after this actual formula exceeded its 80-node contract.
+        weight = ("add(1,max(0,mul("
+                  "ts_mean(sign(sub(div(spot_taker_buy_quote_volume,spot_quote_volume),0.5)),3),"
+                  "ts_mean(sign(sub(div(perp_taker_buy_quote_volume,perp_quote_volume),0.5)),3))))")
+        expression = f"div(ts_sum(mul(sub(div(perp_close,spot_close),1),{weight}),3),ts_sum({weight},3))"
+        spec, model = specification(), Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            miner = FactorMiner(spec, model, Path(directory))
+            miner.candidates["candidate-0001"] = {"definition": definition(expression)}
+            self.assertIsNone(miner._calculate("candidate-0001", input_panel(spec)))
+            model.complete.assert_not_called()
+            calculation = miner.candidates["candidate-0001"]["calculation"]
+            self.assertEqual(calculation["status"], "calculation_failed")
+            self.assertEqual(calculation["original_expression"], expression)
+            self.assertIsNone(calculation["executed_expression"])
+            self.assertEqual(len(calculation["checks"]), 1)
+            self.assertEqual(calculation["checks"][0]["program_error"], "formula exceeds node budget")
+
+    def test_formula_history_budget_does_not_trigger_window_repair(self):
+        spec, model = specification(max_lookback_hours=7), Mock()
+        expression = "ts_mean(perp_close,24)"
+        with tempfile.TemporaryDirectory() as directory:
+            miner = FactorMiner(spec, model, Path(directory))
+            miner.candidates["candidate-0001"] = {"definition": definition(expression)}
+            self.assertIsNone(miner._calculate("candidate-0001", input_panel(spec)))
+            model.complete.assert_not_called()
+            calculation = miner.candidates["candidate-0001"]["calculation"]
+            self.assertEqual(calculation["checks"][0]["program_error"], "formula exceeds declared history budget")
+            self.assertIsNone(calculation["executed_expression"])
+
     def test_B_card_admission_is_independent_of_legacy_evaluator_verdict(self):
         for legacy in ("keep", "discard"):
             for p_value, should_admit in ((0.000001, True), (0.8, False)):
@@ -1394,6 +1426,36 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(accepted["items"], rows[:2])
             self.assertTrue(all(request["input_token_upper_bound"] <= 8000 for request in requests))
             self.assertEqual(store.read("evidence", "/stages", 18, 2)["items"], rows[18:])
+
+    def test_oversized_object_read_with_limit_one_exposes_narrow_field_paths(self):
+        spec = specification(context_tokens=9000, output_tokens=1000)
+        with tempfile.TemporaryDirectory() as directory:
+            store = RecordStore(Path(directory) / "records")
+            comparison = {"coverage": {"paired_valid_periods": 20},
+                          "plan": {"horizon_hours": 4},
+                          "paired_periods": [{"detail": "x" * 1000} for _ in range(20)]}
+            store.append("evidence", "experiment_result", {"comparison": comparison})
+
+            def read(pointer):
+                return ModelReply(dumps({"result": None, "read_records": [{
+                    "record_id": "evidence", "pointer": pointer, "offset": 0, "limit": 1}]}), {}, "fixture")
+
+            model = Mock()
+            model.complete.side_effect = [read("/comparison"), read("/comparison/coverage"),
+                ModelReply(dumps({"result": {"checked": True}, "read_records": []}), {}, "fixture")]
+            gateway = AgentGateway(model, spec, store, Path(directory) / "calls")
+            self.assertTrue(gateway.ask("optimizer", "核验历史配对的有效期数", {}, {})["checked"])
+            requests = [json.loads(path.read_text()) for path in sorted((Path(directory) / "calls").glob("*-request.json"))]
+            feedback = json.loads(requests[1]["messages"][-1]["content"])
+            self.assertIn("limit only pages arrays, not objects", feedback["response_error"])
+            for pointer in ["/comparison/coverage", "/comparison/plan", "/comparison/paired_periods"]:
+                self.assertIn(pointer, feedback["response_error"])
+            self.assertNotIn("requested_original_evidence", feedback)
+            accepted = json.loads(requests[2]["messages"][-1]["content"])["requested_original_evidence"][0]
+            self.assertEqual(accepted["data"], comparison["coverage"])
+            self.assertTrue(all(request["input_token_upper_bound"] <= 8000 for request in requests))
+            self.assertEqual(store.read("evidence", "/comparison/paired_periods", 19, 1)["items"],
+                             comparison["paired_periods"][19:])
 
     def test_context_pages_stage_rows_as_numeric_evidence(self):
         record = {"id": "evaluation", "kind": "evaluation", "data": {

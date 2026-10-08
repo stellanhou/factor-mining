@@ -3,7 +3,7 @@
 - 日期：2026-09-15（首次记录：2026-09-10）
 - 状态：已取消A段轮数、候选数量、单轮数量和路线尝试额度，改由“优化Agent没有获准修改建议”自然终止，见第14.14节。A/B职责分离、最多5次API重试、回复纠正和取消示例单次输出上限继续生效；无限额真实循环尚未复跑。正式研究配置未冻结，五分钟主动买卖比继续暂缓。
 - 2026-09-28更新：新合同已接通跨币可比公式检查和Plan3仅打标签的B段准入；历史合同及冻结结果保持原规则。新规则尚未启动正式Goal或获得新的独立验证证据。
-- 主规划：[PLAN.md](../../PLAN.md)
+- 主规划：[PLAN.md](https://github.com/stellanhou/crypto-quant-research-platform/blob/7f5ddbfb3ce1041ea50157a753c1ecb091a8ec73/PLAN.md)
 - 参考项目：[MASFactorMiner](/Users/stellan/金融项目/个人项目/MASFactorMiner)
 
 ## 1. 模块定位
@@ -188,7 +188,7 @@
 
 2026-09-13用户确认上述长度作为首期划分起点。三段按时间先后连续安排；具体日历日期尚未冻结。
 
-2026-09-19按用户要求扩大本地输入：新建独立的[多年研究配置](../../experiments/factor_mining/long_history_20260919_setup/README.md)，A为`[2022-08-01, 2024-08-01)`，B为`[2024-08-01, 2025-08-01)`，名义C为`[2025-08-01, 2026-08-01)`，均为UTC。沿用历史起点前30日成交额中位数选固定30币、每小时验证成员资格的设计；选币时点为2022-07-25，在A预热开始前仅使用已结束行情，不按后续存活或字段完整度筛币。输入文件只包含A、B和168小时预热；保留缺失，不接入历史不足的清算字段。本次不变更IC、收益差、FDR及阶段门槛，不覆盖旧Goal。
+2026-09-19按用户要求扩大本地输入：新建独立的[多年研究配置](/Users/stellan/量化投资/experiments/factor_mining/long_history_20260919_setup/README.md)，A为`[2022-08-01, 2024-08-01)`，B为`[2024-08-01, 2025-08-01)`，名义C为`[2025-08-01, 2026-08-01)`，均为UTC。沿用历史起点前30日成交额中位数选固定30币、每小时验证成员资格的设计；选币时点为2022-07-25，在A预热开始前仅使用已结束行情，不按后续存活或字段完整度筛币。输入文件只包含A、B和168小时预热；保留缺失，不接入历史不足的清算字段。本次不变更IC、收益差、FDR及阶段门槛，不覆盖旧Goal。
 
 名义C包含此前已经用于开发和筛选的2026年4—7月，**不能作为完整、未触碰的最终测试集**。该事实写入新合同和`data-usage.json`；因子挖掘仍不加载C。完整策略最终测试需另行安排未参与开发的数据，不因扩展日期而恢复独立性。
 
@@ -472,7 +472,7 @@ A段内部按时间分阶段检查，观察因子关系能否在不同时期重�
 - 14个针对性测试通过，覆盖价格倍率、别名重复、部分缺失、过期观测、零分母、清算未知／晚到／异常金额及原文件保留。
 - 当前30币在2026年7月均能生成744行小时因子表，均有28个研究字段获得有效值；TUT与PROM存在部分字段空值，已在覆盖报告中标出，不把“字段存在”当作全时段完整。
 - 全部407个既有清算文件通过研究读取检查：3,461,943行所有清算研究值可用，1,695行来源不明，789行晚到，1行含异常金额。异常金额小时中的3条原始异常记录继续保留。
-- 详细缺口、验证和逐字段结果见[本地数据处理记录](../../market_data/derived/data_input_review_20260912/README.md)及其`verification.json`。
+- 详细缺口、验证和逐字段结果见[本地数据处理记录](/Users/stellan/量化投资/market_data/derived/data_input_review_20260912/README.md)及其`verification.json`。
 
 ## 13. 已确认并实施：构想 Agent 开放字段、单位与算子语义
 
@@ -596,7 +596,7 @@ sub(div(perp_close, spot_close), 1)
 - ACE、ENA、HEMI、ONDO、PROM、PUMP、TAO、TRUMP、TUT、XPL的7天累计费率在7月初各有4个小时因前一周结算事件缺口被标为空；其他本轮开放的非清算基础字段在该月检查范围内均有完整有效值。
 - DOGE 2026-06-15清算样本经新接口与公式计算后，24行中23行名义金额比值有效，1个异常金额小时为空，有效清算次数仍保留。
 
-具体用法见[features接口说明](../../src/crypto_quant/features/README.md)，核对过程与结果见[实施记录](../../market_data/derived/factor_interface_review_20260913/README.md)、[公式及字段验证](../../market_data/derived/factor_interface_review_20260913/verification.json)和[五分钟归档核对](../../market_data/derived/factor_interface_review_20260913/taker_timestamp_audit.json)。
+具体用法见[features接口说明](https://github.com/stellanhou/crypto-quant-research-platform/blob/7f5ddbfb3ce1041ea50157a753c1ecb091a8ec73/src/crypto_quant/features/README.md)，核对过程与结果见[实施记录](/Users/stellan/量化投资/market_data/derived/factor_interface_review_20260913/README.md)、[公式及字段验证](/Users/stellan/量化投资/market_data/derived/factor_interface_review_20260913/verification.json)和[五分钟归档核对](/Users/stellan/量化投资/market_data/derived/factor_interface_review_20260913/taker_timestamp_audit.json)。
 
 ## 14. 已实施：主项目首版因子挖掘循环与创意来源输出
 
@@ -632,7 +632,7 @@ sub(div(perp_close, spot_close), 1)
 - 上述联调使用明确标记的`scripted-fixture`模拟模型回复，共保存12次请求／回复；真实模型调用为0，不作为真实模型能力或因子有效性的证据。工程样例生成的创意卡为0。
 - 原始数据库大小和修改时间保持不变，C段未交给本轮读取流程。运行保存数据／币池哈希、代码与环境指纹、全部模型请求和原始报告。
 
-证据：[离线联调核对结果](../../experiments/factor_mining/engineering_local_20260914_final/engineering-verification.json)、[A段报告](../../experiments/factor_mining/engineering_local_20260914_final/A-report.md)、[B段报告](../../experiments/factor_mining/engineering_local_20260914_final/B-report.md)。后续真实联调见第14.4节，正式合同事项见第11节。
+证据：[离线联调核对结果](/Users/stellan/量化投资/experiments/factor_mining/engineering_local_20260914_final/engineering-verification.json)、[A段报告](/Users/stellan/量化投资/experiments/factor_mining/engineering_local_20260914_final/A-report.md)、[B段报告](/Users/stellan/量化投资/experiments/factor_mining/engineering_local_20260914_final/B-report.md)。后续真实联调见第14.4节，正式合同事项见第11节。
 
 ### 14.4 DeepSeek V4.1 Flash首次真实联调（2026-09-14）
 
@@ -645,7 +645,7 @@ sub(div(perp_close, spot_close), 1)
 - 包含前期诊断尝试，共24次真实模型请求；其中一条空正文响应未保存usage，不能据现有记录精确汇总全部费用。没有追加超预算调用。
 - 完整测试65项通过。原始数据库大小及修改时间保持不变；本次未读取B/C，未生成创意卡。
 
-结果位于[真实运行报告](../../experiments/factor_mining/go_deepseek_v41_flash_20260914_low/A-report.md)、[联调核对记录](../../experiments/factor_mining/go_deepseek_v41_flash_20260914_low/real-model-verification.json)和[收尾恢复记录](../../experiments/factor_mining/go_deepseek_v41_flash_20260914_low/finalization-recovery.json)。这次记录包含开发中的明确恢复操作，不标为完全无人干预的成功运行。
+结果位于[真实运行报告](/Users/stellan/量化投资/experiments/factor_mining/go_deepseek_v41_flash_20260914_low/A-report.md)、[联调核对记录](/Users/stellan/量化投资/experiments/factor_mining/go_deepseek_v41_flash_20260914_low/real-model-verification.json)和[收尾恢复记录](/Users/stellan/量化投资/experiments/factor_mining/go_deepseek_v41_flash_20260914_low/finalization-recovery.json)。这次记录包含开发中的明确恢复操作，不标为完全无人干预的成功运行。
 
 ### 14.5 候选去向决策与优化分流（2026-09-15）
 
@@ -657,7 +657,7 @@ sub(div(perp_close, spot_close), 1)
 - A报告新增候选去向、四问回答、证据链接及恢复条件；运行摘要新增`retained_ids`，冻结批次和最终创意卡关联A决策。代码指纹约束保留，旧报告可读，新流程使用新运行ID。
 - 本次完成工程改造和分流验证；真实模型能否稳定、合理地回答四问仍待联调。正式研究合同事项继续保留在第11节。
 
-证据：[A段报告](../../experiments/factor_mining/decision_routing_local_20260915/A-report.md)、[B段报告](../../experiments/factor_mining/decision_routing_local_20260915/B-report.md)、[工程核对记录](../../experiments/factor_mining/decision_routing_local_20260915/engineering-verification.json)。
+证据：[A段报告](/Users/stellan/量化投资/experiments/factor_mining/decision_routing_local_20260915/A-report.md)、[B段报告](/Users/stellan/量化投资/experiments/factor_mining/decision_routing_local_20260915/B-report.md)、[工程核对记录](/Users/stellan/量化投资/experiments/factor_mining/decision_routing_local_20260915/engineering-verification.json)。
 
 ### 14.6 新流程真实模型试跑：评估阶段停止（2026-09-15）
 
@@ -667,7 +667,7 @@ sub(div(perp_close, spot_close), 1)
 
 本次用量按5次接口usage汇总：输入216648 token、输出34951 token、合计251599 token。数据库未变、B/C未读取、未生成创意卡。代码未因本次失败而改动，真实四问决策的效果仍待验收。
 
-证据：[实际结果与复核](../../experiments/factor_mining/go_deepseek_decisions_20260915_0406/运行结果.md)、[运行核对](../../experiments/factor_mining/go_deepseek_decisions_20260915_0406/real-model-verification.json)、[停止记录](../../experiments/factor_mining/go_deepseek_decisions_20260915_0406/exploration-stopped.json)。
+证据：[实际结果与复核](/Users/stellan/量化投资/experiments/factor_mining/go_deepseek_decisions_20260915_0406/运行结果.md)、[运行核对](/Users/stellan/量化投资/experiments/factor_mining/go_deepseek_decisions_20260915_0406/real-model-verification.json)、[停止记录](/Users/stellan/量化投资/experiments/factor_mining/go_deepseek_decisions_20260915_0406/exploration-stopped.json)。
 
 ### 14.7 评估报告允许附加字段（2026-09-15）
 
@@ -677,7 +677,7 @@ sub(div(perp_close, spot_close), 1)
 
 完整测试75项通过，新增验证覆盖A／B附加字段留痕、原文保留与下游隔离、全部核心字段缺失、错误类型／非法取值，以及核心字段错误时仍停止。
 
-证据：[离线回放记录](../../experiments/factor_mining/report_format_replay_20260915.json)。
+证据：[离线回放记录](/Users/stellan/量化投资/experiments/factor_mining/report_format_replay_20260915.json)。
 
 ### 14.8 再次真实试跑：优化Agent空回复（2026-09-15）
 
@@ -685,7 +685,7 @@ sub(div(perp_close, spot_close), 1)
 
 第6次优化调用已获得两个候选的数值结果、模型报告和四问要求，但返回正文为空，程序停止。未产生四问、最终去向或优化建议；未重试或手动收尾。空响应的原始返回体、结束原因和usage未保存，无法确认空回复的具体成因。已保存的5次回复合计267272 token，不含第6次。数据库未变，B/C未读取，未生成创意卡。
 
-证据：[最新运行结果](../../experiments/factor_mining/go_deepseek_fields_20260915_042406/运行结果.md)、[运行核对](../../experiments/factor_mining/go_deepseek_fields_20260915_042406/real-model-verification.json)。
+证据：[最新运行结果](/Users/stellan/量化投资/experiments/factor_mining/go_deepseek_fields_20260915_042406/运行结果.md)、[运行核对](/Users/stellan/量化投资/experiments/factor_mining/go_deepseek_fields_20260915_042406/real-model-verification.json)。
 
 ### 14.9 清理评估去向残留与B创意卡准入（2026-09-15）
 
@@ -699,7 +699,7 @@ B段移除`narrative.decision == keep`准入条件。程序按既有批次校正
 
 完整测试76项通过，覆盖旧keep/discard不影响准入、A段旧字段隔离、B段数值规则与工程用途限制保留、程序结果进入评估上下文，以及创意卡中A/B/完整策略状态的区分。历史真实回复离线回放确认`decision`和`conditions_note`均排除出六项核心报告，原文未改。
 
-证据：[职责与B准入核对记录](../../experiments/factor_mining/evaluator_role_review_20260915.json)。
+证据：[职责与B准入核对记录](/Users/stellan/量化投资/experiments/factor_mining/evaluator_role_review_20260915.json)。
 
 ### 14.10 API最多5次重试与空回复诊断（2026-09-15）
 
@@ -717,7 +717,7 @@ B段移除`narrative.decision == keep`准入条件。程序按既有批次校正
 
 当前重试只覆盖API临时失败及空正文，不包括非空截断，故重试0次。该次原始返回和usage已保存，确认本次截断为输出上限所致；此前空回复原因仍无足够记录确认。没有自动提高预算或手动收尾，原始数据库未改，B/C未读取，无创意卡。
 
-证据：[最新运行结果](../../experiments/factor_mining/go_deepseek_retry_20260915_051451/运行结果.md)、[运行核对](../../experiments/factor_mining/go_deepseek_retry_20260915_051451/real-model-verification.json)。
+证据：[最新运行结果](/Users/stellan/量化投资/experiments/factor_mining/go_deepseek_retry_20260915_051451/运行结果.md)、[运行核对](/Users/stellan/量化投资/experiments/factor_mining/go_deepseek_retry_20260915_051451/real-model-verification.json)。
 
 ### 14.12 取消人为单次输出上限（2026-09-15）
 
@@ -729,7 +729,7 @@ B段移除`narrative.decision == keep`准入条件。程序按既有批次校正
 
 本次只确认参数可省略，尚未观测默认最大输出长度；附加字段容许目前仅在评估角色生效，构想角色仍有此格式障碍。原始数据库未改，B/C未读取，无创意卡。
 
-证据：[取消上限后的实际结果](../../experiments/factor_mining/go_deepseek_default_output_20260915_052258/运行结果.md)。
+证据：[取消上限后的实际结果](/Users/stellan/量化投资/experiments/factor_mining/go_deepseek_default_output_20260915_052258/运行结果.md)。
 
 ### 14.13 四个Agent统一接收附加字段（2026-09-15）
 
@@ -741,7 +741,7 @@ B段移除`narrative.decision == keep`准入条件。程序按既有批次校正
 
 完整测试86项通过，新增覆盖四角色全部嵌套对象、外层及读取请求附加字段、后续上下文不混入附加字段值，以及必需字段缺失／错误类型仍被拒绝。使用第14.12节原始构想回复离线回放，`/result/read_records`留痕后被排除，两个候选及其声明字段原值完整保留并通过接收。本次真实模型调用为0。
 
-证据：[统一格式检查核对记录](../../experiments/factor_mining/unified_format_verification_20260915.json)。
+证据：[统一格式检查核对记录](/Users/stellan/量化投资/experiments/factor_mining/unified_format_verification_20260915.json)。
 
 ### 14.14 取消A段轮数、候选数量和路线尝试额度（2026-09-15）
 
