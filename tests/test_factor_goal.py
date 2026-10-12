@@ -7,12 +7,15 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import pandas as pd
+
 from test_factor_mining import ScenarioModel, definition, input_panel, specification
 from crypto_quant.research.factor_mining.contracts import digest, dumps
 from crypto_quant.research.factor_mining.evaluation import evaluate_factor
 from crypto_quant.research.factor_mining.factor_archive import EvaluationKey, FactorArchive, FactorIdentity
 from crypto_quant.research.factor_mining.goal import GoalRunner, GoalSpec
 from crypto_quant.research.factor_mining.model import ModelReply
+from crypto_quant.research.factor_mining.records import RecordStore
 from crypto_quant.research.factor_mining.workflow import FactorMiner
 
 
@@ -65,23 +68,23 @@ class GoalModel:
                         value["candidates"] = [definition("div(perp_close,ts_mean(perp_close))")]
                     if req["role"] == "calculator":
                         value["repair_expression"] = f"div(perp_close,ts_mean(perp_close,{window}))"
-                    if req["role"] == "optimizer":
+                    if req["role"] == "evaluator" and "round_no" in req["payload"]:
                         ids = {r["id"] for r in req["records"]}
-                        for decision in value["decisions"]:
+                        for decision in value["candidate_decisions"]:
                             cid = decision["candidate_id"]
                             if f"{cid}-duplicate" in ids:
                                 decision.update(disposition="discard", retained_horizons=[], continue_optimization=False,
                                                 evidence_refs=[f"{cid}-duplicate"], resume_condition=None)
-                        if self.cross_cycle_pair and value["proposals"]:
-                            value["proposals"][0]["experiment_design"] = {
-                                "question": "新窗口是否降低4h预测期限下4h排名变化，同时保持方向IC？",
-                                "metric": "rank_displacement", "horizon_hours": 4,
-                                "displacement_hours": 4, "min_improvement": 0.01,
-                                "max_ic_loss": 0.001,
-                                "expected_outcome": "共同样本配对区间达到Goal阈值",
-                                "stop_condition": "改善区间上界低于阈值或IC损失区间下界越界",
-                                "pause_condition": "区间无法区分改善与恶化或共同样本不足",
-                            }
+                    if req["role"] == "optimizer" and self.cross_cycle_pair and value["proposals"]:
+                        value["proposals"][0]["experiment_design"] = {
+                            "question": "新窗口是否降低4h预测期限下4h排名变化，同时保持方向IC？",
+                            "metric": "rank_displacement", "horizon_hours": 4,
+                            "displacement_hours": 4, "min_improvement": 0.01,
+                            "max_ic_loss": 0.001,
+                            "expected_outcome": "共同样本配对区间达到Goal阈值",
+                            "stop_condition": "改善区间上界低于阈值或IC损失区间下界越界",
+                            "pause_condition": "区间无法区分改善与恶化或共同样本不足",
+                        }
                 self.miners[run_id] = ScenarioModel(transform=transform, propose_once=self.optimize)
             return self.miners[run_id].complete(messages, max_output_tokens=max_output_tokens, session_id=session_id)
         return ModelReply(dumps({"result": result, "read_records": []}), {"fixture": True}, "scripted-fixture")
@@ -93,7 +96,14 @@ class GoalTests(unittest.TestCase):
         runner = GoalRunner.create(GoalSpec("outcome-fixture", "研究价格偏离关系的合格成果", target),
                                    spec, model or GoalModel(), Path(directory),
                                    inputs={}, model_settings=SETTINGS)
-        return runner, input_panel(spec), input_panel(spec, "B")
+        a, b = input_panel(spec), input_panel(spec, "B")
+        start, end = spec.bounds("A")
+        a.diagnostics["data_usage"] = {
+            "use": "engineering_factor_A", "start": start.isoformat(),
+            "end_exclusive": end.isoformat(),
+            "warmup_start": (start - pd.Timedelta(hours=spec.max_lookback_hours)).isoformat(),
+        }
+        return runner, a, b
 
     def test_saved_goal_does_not_bind_code_version(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -195,7 +205,10 @@ class GoalTests(unittest.TestCase):
                     self.assertEqual(idea["factor_archive_ref"], source_evaluation["data"]["factor_archive"])
                     self.assertNotIn("a_evaluation", idea)
             for request in model.requests:
-                if request["role"] in {"ideator", "optimizer"}:
+                if (request["role"] in {"ideator", "optimizer"}
+                        or (request["role"] == "evaluator"
+                            and (request["payload"].get("goal_phase") == "select_task"
+                                 or "round_no" in request["payload"]))):
                     encoded = dumps(request)
                     self.assertNotIn('"batch_correction"', encoded)
                     self.assertNotIn('"validation_status"', encoded)
@@ -208,8 +221,14 @@ class GoalTests(unittest.TestCase):
                                    if r["role"] == "ideator" and r["contract"]["run_id"] == runs[1].name)
             goal_context = next(r["data"] for r in second_ideation["records"] if r["kind"] == "goal_context")
             self.assertNotIn("A_history", goal_context)
-            self.assertEqual(len(goal_context["prior_A_research"]["cycles"]), 1)
-            self.assertTrue(goal_context["prior_A_research"]["cycles"][0]["candidates"])
+            cycle_ref = goal_context["prior_A_research"]["cycles"]
+            self.assertEqual(cycle_ref, {"record_id": "goal-context",
+                                         "pointer": "/prior_A_research/cycles", "rows": 1,
+                                         "read_records": "request an explicit offset and limit to read original prior A cycle summaries"})
+            prior_cycle = RecordStore(runs[1] / "a_records").read(
+                cycle_ref["record_id"], cycle_ref["pointer"], 0, 1)["items"][0]
+            self.assertEqual(prior_cycle["source_record_id"], "cycle-00000001")
+            self.assertTrue(prior_cycle["candidates"])
 
     def test_goal_context_handoff_keeps_summaries_without_copying_numeric_tables(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -467,6 +486,67 @@ class GoalTests(unittest.TestCase):
                              context["candidates"])
             self.assertEqual(runner._context(a)["previous_expressions"], [])
 
+    def test_a_history_tools_can_read_legacy_goal_input_catalog_refs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self.create(directory)
+            catalog = {"catalog": {"data": {"data_usage": {
+                           "use": "factor_development_A", "start": "2026-07-01T00:00:00Z",
+                           "end_exclusive": "2026-07-05T00:00:00Z",
+                           "warmup_start": "2026-06-30T17:00:00Z"}},
+                       "fields": {"perp_close": {"valid_rows": 240}}},
+                       "valid_A_rows": {"perp_close": 240}}
+            catalog_id = "inputs-00001010"
+            runner.research.append(catalog_id, "data_provenance", catalog)
+            b_catalog = copy.deepcopy(catalog)
+            b_catalog["catalog"]["data"]["data_usage"]["use"] = "factor_candidate_validation_B"
+            runner.research.append("inputs-00001011", "data_provenance", b_catalog)
+            runner.research.append("task-00000001", "goal_task", {
+                "task": "核验一个A字段目录", "reason": "历史任务引用输入目录",
+                "evidence_refs": [catalog_id]})
+            runner.research.append("model-00000001-format", "format_deviation", {
+                "role": "evaluator", "extra_fields": ["/result/unused"], "raw_response": "a.json"})
+            runner.research.append("model-00000002-invalid", "invalid_model_response", {
+                "role": "evaluator", "error": "missing field", "raw_response": "b.json"})
+            runner.research.append("model-00000004-invalid", "invalid_model_response", {
+                "role": "optimizer", "error": "legacy Goal selection correction", "raw_response": "d.json"})
+            runner.research.append("model-00000003-invalid", "invalid_model_response", {
+                "role": "ideator", "error": "not Goal task selection", "raw_response": "c.json"})
+            runner.research.append("b-diagnostic", "validation_result", {"segment": "B"})
+            runner.receipts.append("completion-00000001", "program_admission", {"segment": "B"})
+
+            search_index, allowed_ids, reader = runner.research.a_history_tools()
+
+            self.assertEqual(allowed_ids, {catalog_id, "task-00000001",
+                                           "model-00000001-format", "model-00000002-invalid",
+                                           "model-00000004-invalid"})
+            self.assertNotIn("fingerprint", reader(catalog_id, "", 0, 1))
+            self.assertEqual(reader(catalog_id, "", 0, 1), catalog)
+            self.assertTrue(any(item["record_id"] == catalog_id and item["segment"] == "A"
+                                for item in search_index))
+            self.assertNotIn("b-diagnostic", allowed_ids)
+            self.assertNotIn("inputs-00001011", allowed_ids)
+            self.assertNotIn("model-00000003-invalid", allowed_ids)
+            self.assertNotIn("completion-00000001", allowed_ids)
+            with self.assertRaisesRegex(ValueError, "whitelist"):
+                reader("b-diagnostic", "", 0, 1)
+            with self.assertRaisesRegex(ValueError, "whitelist"):
+                reader("inputs-00001011", "", 0, 1)
+
+            miner = FactorMiner(replace(runner.spec, run_id="history-ref-fixture"),
+                                GoalModel(), Path(directory) / "runs")
+            miner.history_index = search_index
+            miner.allowed_history_record_ids = allowed_ids
+            miner.history_reader = reader
+            review = {"round_action": "continue_ideation", "candidate_decisions": [],
+                      "information_request": {"purpose": "读取当前任务引用的数据目录",
+                                              "questions": ["该A字段有哪些有效观测？"],
+                                              "record_refs": [catalog_id]},
+                      "candidate_reports": [], "analysis": "仅检查历史引用权限。"}
+            self.assertEqual(miner._check_round_review(review, [], []), ({}, {}))
+            review["information_request"]["record_refs"] = ["inputs-00001011"]
+            with self.assertRaisesRegex(ValueError, "unauthorized record"):
+                miner._check_round_review(review, [], [])
+
     def test_goal_selection_does_not_deduplicate_catalog_by_fingerprint(self):
         with tempfile.TemporaryDirectory() as directory:
             runner, a, _ = self.create(directory)
@@ -688,7 +768,7 @@ class GoalTests(unittest.TestCase):
             with patch("crypto_quant.research.factor_mining.workflow.evaluate_factor", side_effect=self.passing_B):
                 self.assertEqual(self.run_goal(restarted, a, b)["status"], "complete")
 
-    def test_optimizer_cannot_complete_or_wait_for_already_present_data(self):
+    def test_evaluator_cannot_complete_or_wait_for_already_present_data(self):
         for invalid in ["complete", "wait_data"]:
             with self.subTest(action=invalid), tempfile.TemporaryDirectory() as directory:
                 model = GoalModel()
@@ -793,6 +873,12 @@ class GoalTests(unittest.TestCase):
             root = Path(directory)
             spec = specification(purpose="research")
             a, b = input_panel(spec), input_panel(spec, "B")
+            start, end = spec.bounds("A")
+            a.diagnostics["data_usage"] = {
+                "use": "engineering_factor_A", "start": start.isoformat(),
+                "end_exclusive": end.isoformat(),
+                "warmup_start": (start - pd.Timedelta(hours=spec.max_lookback_hours)).isoformat(),
+            }
             (root / "contract.json").write_text(dumps(spec.as_dict()))
             (root / "goal.json").write_text(dumps({"goal_id": "cli-goal", "objective": "价格偏离研究", "target_ideas": 1}))
             (root / "universe.csv").write_text("fixture")

@@ -4,6 +4,7 @@ import copy
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ from crypto_quant.research.factor_mining.cli import add_arguments
 from crypto_quant.research.factor_mining.goal import GoalRunner, GoalSpec
 from crypto_quant.research.factor_mining.model import FACTOR_ROLES, RoleModels
 from crypto_quant.research.factor_mining.model_config import model_from_args, model_from_settings
+from crypto_quant.research.data_policy import factor_usage
 
 
 class RecordingModel:
@@ -30,10 +32,12 @@ class RecordingModel:
 class RoleModelTests(unittest.TestCase):
     def test_all_four_roles_use_their_models_and_save_complete_configuration(self):
         from test_factor_goal import GoalTests
-        shared = GoalModel()
+        shared = GoalModel(optimize=True)
         roles = RoleModels({role: RecordingModel(f"scripted-{role}", shared) for role in FACTOR_ROLES})
         spec = specification(purpose="research")
         a, b = input_panel(spec), input_panel(spec, "B")
+        # Exercise research admission while identifying the synthetic input as engineering data.
+        a.diagnostics["data_usage"] = factor_usage(replace(spec, purpose="engineering_check"), "A")
         with tempfile.TemporaryDirectory() as directory:
             runner = GoalRunner.create(GoalSpec("roles", "价格偏离研究", 1), spec, roles, Path(directory),
                                        inputs={}, model_settings=roles.settings())
@@ -63,6 +67,9 @@ class RoleModelTests(unittest.TestCase):
             model = model_from_args(parser.parse_args(flags))
             self.assertIsInstance(model, RoleModels)
             self.assertEqual(set(model.models), FACTOR_ROLES)
+            self.assertIs(model.get_model_for_role("ideator"), model.models["ideator"])
+            with self.assertRaises(ValueError):
+                model.get_model_for_role("unknown")
             with self.assertRaises(ValueError):
                 model_from_args(parser.parse_args(flags + ["--model", "scripted-shared"]))
             profile.write_text(json.dumps({"ideator": {"model": "scripted", "reasoning_effort": "max"}}))

@@ -59,7 +59,7 @@ def horizon_evidence(horizon):
                 "grid_periods": 12, "method": "HAC", "lags": 23, "confidence": 0.95,
                 "alternative": "two-sided", "se": 0.01, "ci": [0.01, 0.05],
                 "p_value": 0.01, "status": "computed"}
-    return {"segment": "A", "horizon_hours": horizon, "direction": 1,
+    return {"segment": "A", "horizon_hours": horizon, "label": f"perp_next_open_{horizon}h", "direction": 1,
             "summary": {"rank_ic": inference, "directional_spread": inference,
                         "raw_high_low_spread_mean": 0.001, "ic_direction_share": 0.8,
                         "spread_direction_share": 0.7, "group_means": [0, 1, 2],
@@ -154,11 +154,13 @@ class RankDisplacementContractTests(unittest.TestCase):
 
     def test_optimizer_response_cannot_supply_or_override_program_route_state(self):
         role = object.__new__(OptimizerRole)
-        role._check_decisions = lambda decisions, review_ids: {}
-        result = {"analysis": "review", "decisions": [], "diagnostics": [], "proposals": [],
+        role.routes = {}
+        role.proposals = {}
+        role.decisions = {}
+        result = {"proposals": [],
                   "route_states": {"displacement-route": {"decision": "continue"}}}
-        with self.assertRaisesRegex(ValueError, "invalid optimizer schema"):
-            role._check_optimization(result, [])
+        with self.assertRaisesRegex(ValueError, "modification proposals only"):
+            role._check_proposals(result, [])
 
     def test_rank_displacement_route_requires_selected_a_horizon_and_d_evidence(self):
         design = {**BASE_DESIGN, "metric": "rank_displacement",
@@ -192,6 +194,8 @@ class RankDisplacementContractTests(unittest.TestCase):
                 "id": "candidate-0001", "definition": {"expression": "perp_close", "direction": 1}}},
             {"id": "candidate-0001-evaluation", "kind": "evaluation", "data": {
                 "segment": "A", "summary": {"rank_ic": {"mean": 0.03}}, "coverage": {"valid": 10},
+                "horizon_comparison": {"horizons": {
+                    str(horizon): horizon_evidence(horizon) for horizon in (1, 4, 24)}},
                 "rank_displacement": {
                     "definition_version": "factor-rank-displacement-v1", "segment": "A",
                     "deltas": {delta: {"summary": {"mean": 0.1}, "coverage": {"valid": 8},
@@ -245,7 +249,8 @@ class RankDisplacementContractTests(unittest.TestCase):
                 "id": "candidate-0001", "definition": {"expression": "perp_close", "direction": 1}})
             report = {"candidate_id": "candidate-0001", "segment": "A", "direction": 1,
                       "horizon_hours": 24, "summary": {"rank_ic": {"mean": 0.03}},
-                      "coverage": {"valid": 10}}
+                      "coverage": {"valid": 10}, "horizon_comparison": {"horizons": {
+                          str(horizon): horizon_evidence(horizon) for horizon in (1, 4, 24)}}}
             prediction_locator = miner._write_evaluation(
                 "candidate-0001", "A", report, identity)
             miner.store.append("candidate-0001-evaluation", "evaluation",
@@ -255,7 +260,9 @@ class RankDisplacementContractTests(unittest.TestCase):
 
             runner = object.__new__(GoalRunner)
             runner.root = goal_root
-            runner.state = {"cycle": 1}
+            runner.state = {"cycle": 1, "task": {
+                "action": "explore_new", "task": "Verify archived A rank-displacement evidence",
+                "reason": "Synthetic archive round-trip fixture", "dependencies": [], "evidence_refs": []}}
             runner.research = GoalResearchStore(goal_root / "research_records")
             runner._archive_A(miner)
 

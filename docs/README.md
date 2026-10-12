@@ -12,3 +12,4 @@
 - [LangChain重构Plan](plans/LangChain重构Plan.md)
 - [因子挖掘Agent改造Plan](plans/因子挖掘Agent改造Plan.md)
 - [2026-09-19-factor-mining-goal-v22-deadlock-and-lookback-error](postmortems/2026-09-19-factor-mining-goal-v22-deadlock-and-lookback-error.md)
+- [构想 Agent 信息获取循环改造 Plan（已实现）](plans/构想Agent信息获取循环改造Plan_20261011.md)

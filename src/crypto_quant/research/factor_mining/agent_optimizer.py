@@ -1,4 +1,4 @@
-"""Optimizer role: model request, candidate decisions, and route checks."""
+"""Optimizer role: propose controlled modifications for evaluator-authorized candidates."""
 from __future__ import annotations
 
 import copy
@@ -51,29 +51,6 @@ MODIFICATION_PLAN_FIELDS = (
     "route_id", "control_id", "evidence_refs", "modification_task", "experiment_design",
     "restart_of", "new_evidence",
 )
-
-RESEARCH_QUESTIONS = {
-    "research_basis": "已有结果中什么现象支持继续？引用证据，区分观察与推测，不限定现象类型。",
-    "modification_hypothesis": "准备改什么，为什么可能改善？",
-    "verifiable_improvement": "与谁比较，预期什么变化，什么结果使修改路线停止？",
-    "attempt_value": "是否属于无新增信息的重复失败尝试？继续能否带来新的可验证信息？",
-}
-
-DECISION_SCHEMA = _object_schema({
-    "candidate_id": _text_schema("本次需要决策的候选ID"),
-    "disposition": {"type": "string", "enum": ["optimize", "retain", "pause", "discard"],
-                    "description": "继续优化／保留待B验证／暂停／淘汰；retain可以同时继续优化"},
-    "retained_horizons": _array_schema(
-        {"type": "integer", "enum": [1, 4, 24]}, maxItems=3,
-        description="retain时选择有完整A数值证据的送B期限；其他去向填写空列表"),
-    "continue_optimization": {"type": "boolean"},
-    "answers": _object_schema({key: {**_object_schema({
-        "supported": {"type": "boolean"}, "reason": _text_schema(question)}), "description": question}
-        for key, question in RESEARCH_QUESTIONS.items()}),
-    "evidence_refs": _array_schema(_text_schema("已有records中的精确记录ID，至少包含当前候选的程序结果"), minItems=1),
-    "reason": _text_schema("解释当前版本的保留价值、证据是否充分及去向；不能把单个不显著结果当作无效"),
-    "resume_condition": _nullable(_text_schema("pause时写明恢复研究所需的新数据或诊断；其他去向为null")),
-})
 
 class OptimizerRole:
     @staticmethod
@@ -140,13 +117,9 @@ class OptimizerRole:
         share = number(summary["valid_period_share"], "rank-displacement valid_period_share")
         require(0 < share <= 1, "rank-displacement A valid-period share must lie in (0, 1]")
 
-    def _check_optimization(self, optimization: dict[str, Any], review_ids: list[str]):
-        require(set(optimization) == {"analysis", "decisions", "diagnostics", "proposals"}, "invalid optimizer schema")
-        text(optimization["analysis"], "optimization analysis")
-        require(isinstance(optimization["diagnostics"], list) and isinstance(optimization["proposals"], list), "optimizer lists are required")
-        for diagnostic in optimization["diagnostics"]:
-            text(diagnostic, "diagnostic")
-        decisions = self._check_decisions(optimization["decisions"], review_ids)
+    def _check_proposals(self, optimization: dict[str, Any], authorized_ids: list[str]):
+        require(set(optimization) == {"proposals"}, "optimizer may return modification proposals only")
+        require(isinstance(optimization["proposals"], list), "optimizer proposals must be a list")
         proposal_controls = set()
         routes, proposals = copy.deepcopy(self.routes), copy.deepcopy(self.proposals)
         for proposal in optimization["proposals"]:
@@ -154,83 +127,21 @@ class OptimizerRole:
             pid = identifier(proposal["proposal_id"])
             require(pid not in proposals, "proposal IDs must be unique")
             plan = self._proposal_plan(proposal)
-            require(plan["control_id"] in decisions and decisions[plan["control_id"]]["continue_optimization"],
-                    "proposal is not authorized by the candidate decision")
+            require(plan["control_id"] in authorized_ids,
+                    "proposal control is outside evaluator authorization")
+            require(self.decisions[plan["control_id"]]["continue_optimization"] is True,
+                    "proposal is not authorized by an evaluator candidate decision")
             proposal_controls.add(plan["control_id"])
             self._register_route(plan, routes)
             require(routes[plan["route_id"]]["decision"] == "continue", "cannot propose on a stopped/paused route without new evidence")
             proposals[pid] = {**proposal, "status": "pending"}
-        require(proposal_controls == {cid for cid, decision in decisions.items() if decision["continue_optimization"]},
-                "every continuing candidate requires an experiment proposal")
-        return decisions, routes, proposals
+        require(proposal_controls == set(authorized_ids),
+                "every evaluator-authorized candidate requires a modification proposal")
+        return routes, proposals
 
     @staticmethod
     def _proposal_plan(value: dict[str, Any]) -> dict[str, Any]:
         return modification_plan({name: value[name] for name in MODIFICATION_PLAN_FIELDS})
-
-    def _check_decisions(self, values: Any, review_ids: list[str]) -> dict[str, dict[str, Any]]:
-        require(isinstance(values, list) and len(values) == len(review_ids), "every reviewed candidate needs one decision")
-        records = {record["id"]: record for record in self.store.all()}
-        decisions = {}
-        for value in values:
-            require(isinstance(value, dict) and set(value) == set(DECISION_SCHEMA["properties"]), "invalid candidate decision schema")
-            cid = value["candidate_id"]
-            require(isinstance(cid, str) and cid in review_ids and cid not in decisions, "unknown or repeated candidate decision")
-            disposition, continuing = value["disposition"], value["continue_optimization"]
-            require(disposition in {"optimize", "retain", "pause", "discard"} and type(continuing) is bool, "invalid candidate disposition")
-            retained_horizons = value["retained_horizons"]
-            require(isinstance(retained_horizons, list)
-                    and all(type(horizon) is int and horizon in {1, 4, 24} for horizon in retained_horizons)
-                    and len(retained_horizons) == len(set(retained_horizons)),
-                    "retained_horizons must be a unique list from [1, 4, 24]")
-            if disposition == "retain":
-                require(bool(retained_horizons), "retain requires at least one retained horizon")
-            else:
-                require(not retained_horizons, "only retain decisions may specify retained horizons")
-            require((disposition != "optimize" or continuing) and (disposition not in {"pause", "discard"} or not continuing),
-                    "candidate disposition contradicts optimization decision")
-            text(value["reason"], "candidate decision reason")
-            answers = value["answers"]
-            require(isinstance(answers, dict) and set(answers) == set(RESEARCH_QUESTIONS), "answer all four research questions")
-            for answer in answers.values():
-                require(isinstance(answer, dict) and set(answer) == {"supported", "reason"}
-                        and type(answer["supported"]) is bool, "invalid research answer")
-                text(answer["reason"], "research answer reason")
-            refs = value["evidence_refs"]
-            require(isinstance(refs, list) and refs and all(isinstance(ref, str) and ref in records for ref in refs),
-                    "decision evidence must reference existing records")
-            own_results = [records[ref] for ref in refs if records[ref]["kind"] in {
-                "evaluation", "calculation", "duplicate", "experiment_result"}
-                and records[ref]["data"]["candidate_id"] == cid]
-            require(bool(own_results), "decision requires this candidate's program evidence")
-            if disposition == "retain" or continuing:
-                require("evaluation" in self.candidates[cid] and any(r["kind"] == "evaluation" for r in own_results),
-                        "retention or optimization requires evaluated candidate evidence")
-            if disposition == "retain":
-                evaluation_records = [record for record in own_results if record["kind"] == "evaluation"]
-                require(len(evaluation_records) == 1
-                        and evaluation_records[0]["id"] == f"{cid}-evaluation"
-                        and evaluation_records[0]["data"].get("segment") == "A",
-                        "retained candidate requires its A evaluation record")
-                comparison = evaluation_records[0]["data"].get("horizon_comparison")
-                require(isinstance(comparison, dict) and isinstance(comparison.get("horizons"), dict),
-                        "retained candidate requires A horizon comparison evidence")
-                horizons = comparison["horizons"]
-                definition = self.candidates[cid]["definition"]
-                for horizon in retained_horizons:
-                    self._check_retained_horizon_evidence(horizons.get(str(horizon)), horizon,
-                                                          definition["direction"])
-            if disposition == "discard":
-                require("evaluation" in self.candidates[cid] or "duplicate_of" in self.candidates[cid],
-                        "calculation failure alone cannot discard a candidate; pause for diagnosis")
-            if continuing:
-                require(all(answer["supported"] for answer in answers.values()), "optimization requires support for all four questions")
-            if disposition == "pause":
-                text(value["resume_condition"], "pause resume condition")
-            else:
-                require(value["resume_condition"] is None, "resume condition belongs only to paused candidates")
-            decisions[cid] = value
-        return decisions
 
     def _register_route(self, plan: dict[str, Any], routes: dict[str, Any]) -> None:
         plan = modification_plan(plan)
@@ -267,61 +178,21 @@ class OptimizerRole:
             route = self.routes[item["experiment"]["route_id"]]
             route["decision"] = "pause_insufficient"
 
-    def _ask_optimizer(self, round_ids: list[str], review_ids: list[str]) -> dict[str, Any]:
+    def _ask_optimizer(self, authorized_ids: list[str]) -> dict[str, Any]:
         return self.gateway.ask("optimizer",
-            "先阅读本轮所有候选、失败及完整评估，再判断哪里有值得继续的具体依据。"
-            "评估Agent只提供证据解释，不作候选去向决定；由你独立综合证据回答四问并决定去向。"
-            "先逐个review_candidate_ids回答四个研究问题并决定去向，decisions必须完整且不重复。"
-            "研究依据由你根据证据分析，不限于预设现象；引用真实record ID并说明观察与推测。"
-            "quality_target.horizon_hours是预测期限H，displacement_hours是排名变化间隔Δ；合同默认24h标签不是本Goal期限的证明。"
-            "读取本轮和历史A evidence中的horizon_comparison，按每个报告自己的horizon_hours与label核对实际口径。"
-            "单版A的horizon_comparison使用共同24h边界、末端剔除25h；rank_displacement配对按所选H标签剔除末端H+1h，D两端限定A内。"
-            "配对不支持自定义末端掩码；proposal的fixed_components等文字必须与程序规则一致，不得把25h剔除作为1h/4h配对条件。"
-            "历史candidate_ref只能指明公式和方向来源，不能作为当前run的control_id；需要跨轮配对时，"
-            "先要求当前run重算该公式/方向作为baseline，再只对已评估的当前候选提出正式proposal。"
-            "各历史cycle的route_states彼此独立且属于其run；不得因重算baseline改写历史route状态或沿用其attempt。"
-            "restart_of仅可引用当前run已有的暂停/停止route_id，不能引用历史cycle的route_id。"
-            "不要仅凭重算baseline继续已暂停/停止的历史修改方向；应选择有当前A新增证据支持的独立假设和新路线。"
-            "区分当前版本与修改路线：retain可同时优化；修改路线停止不自动淘汰原版。"
-            "去向决策准则：全批次按研究合同指定方法进行FDR多重校正，样本外独立检验是B段程序的专职职责，"
-            "不得将‘A段未做全批次FDR、未做正交化或A段非独立样本’作为拒绝送B的理由。"
-            "A段判断当前候选是否值得固定送B时，综合预设方向的Rank IC幅度与不确定性、"
-            "ICIR和分阶段结果、分组收益形态及金融假设；微弱但有重复迹象的预测关系可以retain。"
-            "retain必须输出非空retained_horizons，只能从[1,4,24]选择且每个选择都须有完整的A数值证据；"
-            "不要求统计显著，保留微弱但有重复迹象的期限。optimize、pause、discard的retained_horizons必须为空列表。"
-            "不得仅因单因子价差未显著、五组不严格单调或尚未做策略端中性化而拒绝送B。"
-            "ICIR只是稳定性诊断，不设脱离本批历史分布的硬门槛；IC点估计稍正也不能单独证明有效。"
-            "若认为当前候选仍有改进空间，支持在判定retain的同时将continue_optimization设为true继续优化。"
-            "证据不足、IC接近零或修改路线受阻缺乏明确方向时pause并写恢复条件；"
-            "有充分否定证据或无增量的重复才discard；不得仅因单一统计量未达完美而淘汰。"
-            "continue_optimization为true须四个回答均获支持，"
-            "并为该候选提供至少一条proposal；false时禁止proposal。"
-            "依据不足先给diagnostics，不强行生成修改任务。不得输出新候选定义、名称、最终公式、"
-            "公式含义或方向；这些由下一轮Ideator首次生成。"
-            "四问中的修改假设与尝试价值要求已有A观察、可能改善的理由及可证伪检验，不要求新修改在首次实验前已被证明有效。"
-            "历史diagnostics里的未执行建议不自动成为后续实验的准入前提，也不能要求尚未由Ideator生成的定义提前具有执行结果。"
-            "如果A评估包含rank_displacement证据，阅读其中1h、4h、24h的D、覆盖和分阶段结果，"
-            "据此判断是否有具体的排序变化问题；D只表示排名变化，不是成交、手续费或实际换手金额。"
-            "只有有明确A证据支持的修改任务才可选择metric=rank_displacement；不得默认平滑所有因子。"
-            "rank_displacement任务必须显式指定horizon_hours和displacement_hours，二者分别表示预测期限H与排名变化间隔Δ，"
-            "各自只能是1、4或24小时；不得从最优结果倒选。该路线min_improvement是D_control−D_trial的绝对下降量，"
-            "没有Goal预声明要求时，必须依据A证据给出正值，不得套用示例或统一默认值。"
-            "Goal若含quality_target，rank_displacement路线沿用其H、Δ，最低改善不得降低，允许IC损失不得放宽；"
-            "研究目标已预声明数值不代表数据能达到，缺乏修改依据仍可暂停，不强造提案。"
-            "max_ic_loss保持现有的允许有向IC损失含义。"
-            "明确说明预测证据与D的两目标取舍：预测能力保持且D下降、预测增强且D未增、两者同时上升、"
-            "稳定但预测证据弱、或覆盖缩小后表面改善；需要覆盖不同时先要求共同样本配对比较。"
-            "每条proposal只输出：精确证据引用、原核心假设、已观察问题、修改假设、语义改动目标和固定部分；"
-            "以及与原候选的配对检验问题、主指标、最低改善、允许IC损失、预期、停止和暂停条件。"
-            "同一假设下可在change_target中指定多个相互关联的语义改动，但不写可执行表达式。"
-            "判断条件须与experiment_design.metric、最低改善和允许IC损失一致。"
-            "control_id必须是获准继续的已评估候选；evidence_refs必须包含该候选的评估记录。"
-            "程序配对比较的decision与route_decision是唯一的路线状态，不可在分析或建议中覆盖、改写或当作模型判定；"
-            "已停止路线若重新启动必须使用新路线并说明新增依据及旧路线。",
-            {"round_candidate_ids": round_ids, "review_candidate_ids": review_ids,
-             "candidate_decisions": self.decisions, "route_states": self.routes},
-            _object_schema({"analysis": _text_schema("完整研究反馈"),
-                "decisions": _array_schema(DECISION_SCHEMA, minItems=len(review_ids), maxItems=len(review_ids)),
-                "diagnostics": _array_schema(_text_schema("证据缺口和所需诊断")),
-                "proposals": _array_schema(PROPOSAL_SCHEMA)}),
-            validate=lambda response: self._check_optimization(response, review_ids))
+            "只为Evaluator已授权继续优化的control提出修改任务和配对实验计划。"
+            "不评判候选是否保留、暂停、淘汰或继续，不改变retained_horizons和Evaluator的candidate_decisions。"
+            "不得输出新公式、候选名称、公式含义或方向；这些由Ideator生成。"
+            "每个authorized_control_id须恰好有至少一条proposal，control_id必须精确匹配授权候选并引用其A evaluation。"
+            "proposal只描述核心假设、观察到的问题、修改假设、语义change_target与fixed_components，以及配对实验设计；"
+            "设计须与已有A证据和Goal一致，不得篡改数值指标、降低最低改善要求或放宽允许损失门槛。"
+            "rank_displacement须明确写预测期限H和间隔Δ；配对按所选H的下一开盘标签边界剔除末端H+1小时，D两端均须在A内。"
+            "单版A期限对照统一剔除末端25小时；不得把该25小时边界套用于1h/4h配对，也不得要求自定义末端掩码。"
+            "D只是排名变化代理指标，不是实际换手或成本。历史candidate_ref仅作公式和方向来源；control_id必须是当前run已评估候选。"
+            "不得将历史diagnostics中的未执行建议升级成proposal前置条件；可说明当前A证据缺口并设计本次可执行的配对检验。"
+            "终止、暂停与保留由Evaluator发出；程序的route_decision保持唯一，不得覆盖或改写。",
+            {"authorized_control_ids": authorized_ids,
+             "candidate_decisions": {cid: self.decisions[cid] for cid in authorized_ids},
+             "route_states": self.routes},
+            _object_schema({"proposals": _array_schema(PROPOSAL_SCHEMA, minItems=len(authorized_ids))}),
+            validate=lambda response: self._check_proposals(response, authorized_ids))

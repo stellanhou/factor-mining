@@ -102,7 +102,6 @@ class DeterministicModel:
                           "analysis": "脚本生成受控排序平滑版本。"}
         elif role == "optimizer":
             self.optimizations += 1
-            candidate_ids = request["payload"]["review_candidate_ids"]
             record_ids = {record["id"] for record in request["records"]}
             proposals = []
             if self.optimizations == 1 and "candidate-0001-evaluation" in record_ids:
@@ -124,14 +123,26 @@ class DeterministicModel:
                         "stop_condition": "D改善或IC损失上界不满足预设条件时停止。",
                         "pause_condition": "区间无法识别结果或共同样本不足时暂停。"},
                     "restart_of": None, "new_evidence": None}]
-            decisions = [_decision(cid, continuing=bool(proposals and cid == "candidate-0001"))
-                         for cid in candidate_ids]
-            result = {"analysis": "脚本只校验程序边界。", "decisions": decisions,
-                      "diagnostics": ["研究结论待真实数据复验。"], "proposals": proposals}
+            result = {"proposals": proposals}
         elif role == "evaluator":
-            result = {"analysis": "确定性模型解释仅用于流程回放。", "mechanism": "合成信号无金融结论。",
-                      "conditions": ["工程样本。"], "falsifiers": ["不适用于真实预测结论。"],
-                      "limitations": ["未使用真实市场数据。"], "next_steps": ["独立评价固定样本。"]}
+            narrative = {"analysis": "确定性模型解释仅用于流程回放。", "mechanism": "合成信号无金融结论。",
+                         "conditions": ["工程样本。"], "falsifiers": ["不适用于真实预测结论。"],
+                         "limitations": ["未使用真实市场数据。"], "next_steps": ["独立评价固定样本。"]}
+            if "round_no" in request["payload"]:
+                if request["payload"]["round_no"] == 1:
+                    decisions = [_decision("candidate-0001", continuing=True)]
+                    round_action = "continue_optimization"
+                else:
+                    decisions = [_decision(cid, continuing=False)
+                                 for cid in request["payload"]["review_candidate_ids"]]
+                    round_action = "end_direction"
+                result = {"round_action": round_action, "candidate_decisions": decisions,
+                          "information_request": None,
+                          "candidate_reports": [{"candidate_id": cid, **narrative}
+                                                for cid in request["payload"]["report_candidate_ids"]],
+                          "analysis": "脚本只校验程序边界。"}
+            else:
+                result = narrative
         else:
             raise AssertionError(role)
         return ModelReply(dumps({"result": result, "read_records": []}), {"fixture": True}, "scripted")

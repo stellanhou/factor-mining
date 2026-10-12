@@ -17,8 +17,7 @@ from crypto_quant.features.factor_expressions import compile_expression, evaluat
 from crypto_quant.features.factor_inputs import FactorInputPanel, INPUT_COLUMNS
 from crypto_quant.research.factor_mining.contracts import ResearchSpec, digest, dumps, model_fields
 from crypto_quant.research.factor_mining.factor_archive import EvaluationKey, FactorArchive, FactorIdentity
-from crypto_quant.research.factor_mining.agent_evaluator import REPORT_SCHEMA
-from crypto_quant.research.factor_mining.agent_optimizer import RESEARCH_QUESTIONS
+from crypto_quant.research.factor_mining.agent_evaluator import RESEARCH_QUESTIONS, REPORT_SCHEMA
 from crypto_quant.research.factor_mining.evaluation import build_labels, compare_experiment, correct_batch, evaluate_factor, evaluate_horizon_comparison, hac_mean
 from crypto_quant.research.factor_mining.model import ApiCallError, ModelReply, read_api_key
 from crypto_quant.research.factor_mining.records import AgentGateway, EvidenceIntegrityError, ContextBudgetError, RecordStore, compact_record
@@ -162,22 +161,49 @@ class ScenarioModel:
                               if expression == "div(perp_close,ts_mean(perp_close))" else expression),
                           "reason": "脚本只修复第一个公式；第二个保留错误以验证次数限制"}
             elif role == "evaluator":
-                result = narrative()
+                if "round_candidate_ids" not in request["payload"]:
+                    result = narrative()
+                else:
+                    round_ids = request["payload"]["round_candidate_ids"]
+                    review_ids = request["payload"]["review_candidate_ids"]
+                    report_ids = request["payload"]["report_candidate_ids"]
+                    records = {record["id"]: record for record in request["records"]}
+                    decisions = []
+                    for cid in review_ids:
+                        evaluated = f"{cid}-evaluation" in records
+                        calculation = records.get(f"{cid}-calculation", {}).get("data", {})
+                        duplicate = records.get(f"{cid}-duplicate")
+                        comparison = records.get(f"{cid}-comparison", {}).get("data", {})
+                        route_open = comparison.get("route_decision", "continue") == "continue"
+                        continuing = bool(self.propose_once and self.optimizations == 0
+                                          and cid == "candidate-0001" and evaluated and route_open)
+                        disposition = "retain" if evaluated else "pause"
+                        decisions.append({
+                            "candidate_id": cid, "disposition": disposition,
+                            "retained_horizons": [24] if evaluated else [],
+                            "continue_optimization": continuing,
+                            "answers": {key: {"supported": continuing,
+                                              "reason": "脚本场景用于验证评估权限，不代表研究结论。"}
+                                        for key in RESEARCH_QUESTIONS},
+                            "reason": "脚本评估该候选，核对去向是否由Evaluator发出。",
+                            "resume_condition": "补充公式诊断后再评估" if not evaluated else None,
+                            "evidence_refs": [f"{cid}-evaluation" if evaluated
+                                              else f"{cid}-duplicate" if duplicate
+                                              else f"{cid}-calculation"],
+                        })
+                    reports = [{"candidate_id": cid, **narrative()} for cid in report_ids]
+                    round_action = ("continue_optimization" if any(d["continue_optimization"] for d in decisions)
+                                    else "end_direction")
+                    result = {"round_action": round_action, "candidate_decisions": decisions,
+                              "information_request": None, "candidate_reports": reports,
+                              "analysis": "脚本评估记录仅用于验证研究流程，不代表研究结论。"}
             elif role == "optimizer":
                 self.optimizations += 1
                 proposals = []
                 if (self.propose_once and self.optimizations == 1
-                        and any(r["id"] == "candidate-0001-evaluation" for r in request["records"])):
+                        and "candidate-0001" in request["payload"]["authorized_control_ids"]):
                     proposals = [optimization_proposal()]
-                record_ids = {r["id"] for r in request["records"]}
-                decisions = []
-                for cid in request["payload"]["review_candidate_ids"]:
-                    evaluated = f"{cid}-evaluation" in record_ids
-                    decisions.append(research_decision(cid, "retain" if evaluated else "pause",
-                        bool(proposals) and cid == "candidate-0001",
-                        f"{cid}-evaluation" if evaluated else f"{cid}-calculation"))
-                result = {"analysis": "保留完整分析，脚本场景只进行一次有依据的窗口实验", "decisions": decisions,
-                          "diagnostics": ["真实有效性待研究"], "proposals": proposals}
+                result = {"proposals": proposals}
             else:
                 raise AssertionError(role)
             self.responses[cache_key] = copy.deepcopy(result)
@@ -192,11 +218,11 @@ def four_destination_scenario(request, result):
         result["candidates"] = [definition(f"div(perp_close,ts_mean(perp_close,{window}))",
             meaning=f"当前已收盘永续价格除以包含当前小时的{window}小时永续价格均值，无量纲")
             for window in (3, 2, 4, 5)]
-    if request["role"] == "optimizer" and request["payload"]["round_candidate_ids"][0] == "candidate-0001":
-        result["decisions"] = [research_decision("candidate-0001", "optimize", True),
-                               research_decision("candidate-0002", "retain"),
-                               research_decision("candidate-0003", "pause"),
-                               research_decision("candidate-0004", "discard")]
+    if request["role"] == "evaluator" and request["payload"]["round_candidate_ids"][0] == "candidate-0001":
+        result["candidate_decisions"] = [research_decision("candidate-0001", "optimize", True),
+                                          research_decision("candidate-0002", "retain"),
+                                          research_decision("candidate-0003", "pause"),
+                                          research_decision("candidate-0004", "discard")]
 
 
 class EvaluationTests(unittest.TestCase):
@@ -469,7 +495,7 @@ class WorkflowTests(unittest.TestCase):
                          "/result/proposals/0/modification_task/extra_note",
                          "/result/proposals/0/experiment_design/extra_note",
                          "/result/dispositions/0/extra_note",
-                         "/result/decisions/0/answers/research_basis/extra_note"):
+                         "/result/candidate_decisions/0/answers/research_basis/extra_note"):
                 self.assertIn(path, paths)
             for record in records:
                 if record["kind"] != "format_deviation":
@@ -505,7 +531,7 @@ class WorkflowTests(unittest.TestCase):
              '"expected_outcome"', 'missing'),
             ("optimizer", lambda r: r["proposals"][0]["modification_task"].pop("change_target"),
              '"change_target"', 'missing'),
-            ("optimizer", lambda r: r["decisions"][0]["answers"]["research_basis"].pop("reason"), '"reason"', 'missing'),
+            ("evaluator", lambda r: r["candidate_decisions"][0]["answers"]["research_basis"].pop("reason"), '"reason"', 'missing'),
         ]
         for role, mutate, error, error_type in cases:
             mutated = False
@@ -532,8 +558,8 @@ class WorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             miner = FactorMiner(spec, model, Path(directory))
             result = miner.explore(input_panel(spec))
-            optimizer = next(r for r in model.requests if r["role"] == "optimizer")
-            report = next(r["data"] for r in optimizer["records"] if r["kind"] == "model_report")
+            report = next(r["data"] for r in miner.store.all()
+                          if r["id"] == "candidate-0001-report")
             self.assertEqual(set(report), set(narrative()) | {"candidate_id"})
             self.assertNotIn("extra_decision", report)
             self.assertNotIn("decision", report)
@@ -568,7 +594,7 @@ class WorkflowTests(unittest.TestCase):
             nonlocal invalid_once
             if request["role"] == "evaluator" and not invalid_once:
                 invalid_once = True
-                result.update(analysis=None, conditions_note=None)
+                result["candidate_reports"][0].update(analysis=None, extra_note="unused report field")
         spec, model = specification(), ScenarioModel(invalid_report)
         with tempfile.TemporaryDirectory() as directory:
             miner = FactorMiner(spec, model, Path(directory))
@@ -592,7 +618,7 @@ class WorkflowTests(unittest.TestCase):
                              ["optimize", "retain", "pause", "discard"])
             self.assertEqual({p["control_id"] for p in second["payload"]["pending_proposals"].values()},
                              {"candidate-0001"})
-            second_review = [r for r in model.requests if r["role"] == "optimizer"][1]
+            second_review = [r for r in model.requests if r["role"] == "evaluator"][1]
             self.assertEqual(second_review["payload"]["review_candidate_ids"], ["candidate-0005", "candidate-0001"])
             self.assertEqual(len(miner.candidates), 5)
             self.assertEqual(miner.candidates["candidate-0005"]["definition"]["parent_id"], "candidate-0001")
@@ -627,8 +653,8 @@ class WorkflowTests(unittest.TestCase):
                 return {**original(*args), "decision": "stop"}
             with patch.object(workflow, "compare_experiment", side_effect=stopped):
                 result = miner.explore(input_panel(spec))
-            first_optimization = next(r for r in miner.store.all() if r["id"] == "round-001-optimization")
-            first = first_optimization["data"]["decisions"][0]
+            first_review = next(r for r in miner.store.all() if r["id"] == "round-001-review")
+            first = first_review["data"]["candidate_decisions"][0]
             self.assertEqual(first["disposition"], "retain")
             self.assertTrue(first["continue_optimization"])
             self.assertEqual(result["routes"]["window-route"]["decision"], "stop")
@@ -636,9 +662,9 @@ class WorkflowTests(unittest.TestCase):
 
     def test_no_authorized_optimization_ends_loop_naturally(self):
         def pause_all(request, result):
-            if request["role"] == "optimizer":
-                result["proposals"] = []
-                for d in result["decisions"]:
+            if request["role"] == "evaluator":
+                result["round_action"] = "end_direction"
+                for d in result["candidate_decisions"]:
                     d.update(disposition="pause", retained_horizons=[], continue_optimization=False, resume_condition="补充样本和诊断")
         spec, model = specification(), ScenarioModel(pause_all)
         with tempfile.TemporaryDirectory() as directory:
@@ -649,28 +675,57 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(model.ideations, 1)
             self.assertFalse((miner.root / "b-access-started.json").exists())
 
+    def test_legacy_optimizer_checkpoint_reuses_its_saved_completion_reason(self):
+        spec, model = specification(), ScenarioModel(propose_once=False)
+        with tempfile.TemporaryDirectory() as directory:
+            miner = FactorMiner(spec, model, Path(directory))
+            original = miner.explore(input_panel(spec))
+            self.assertIn("决定来源：评估Agent", (miner.root / "A-report.md").read_text())
+            review = next(record for record in miner.store.all()
+                          if record["id"] == "round-001-review")
+            (miner.store.root / "round-001-review.json").unlink()
+            miner.store.append("round-001-optimization", "optimization", {
+                "analysis": "旧运行中由Optimizer写入的决定。",
+                "decisions": review["data"]["candidate_decisions"], "diagnostics": [],
+                "proposals": [], "route_states": original["routes"],
+            })
+            old_stop_reason = "optimizer returned no authorized optimization proposals"
+            completion_path = miner.root / "a-complete.json"
+            completion_path.write_text(dumps({**json.loads(completion_path.read_text()),
+                                              "stop_reason": old_stop_reason}))
+            request_count = len(model.requests)
+
+            resumed = FactorMiner.open(miner.root, model).resume_explore(input_panel(spec))
+
+            self.assertEqual(resumed["stop_reason"], old_stop_reason)
+            self.assertEqual(json.loads(completion_path.read_text())["stop_reason"], old_stop_reason)
+            self.assertEqual(len(model.requests), request_count)
+            legacy_report = (miner.root / "A-report.md").read_text()
+            self.assertIn("决定来源：旧版Optimizer", legacy_report)
+            self.assertNotIn("以下为评估 Agent 的研究决定", legacy_report)
+
     def test_bad_decisions_are_corrected_before_next_round(self):
         cases = [
-            (lambda r: r["decisions"].pop(), r'too_short.*decisions'),
-            (lambda r: r["decisions"].__setitem__(1, copy.deepcopy(r["decisions"][0])), "repeated candidate"),
-            (lambda r: r["decisions"][0]["answers"].pop("research_basis"), r'missing.*research_basis'),
-            (lambda r: r["decisions"][0]["answers"]["research_basis"].update(supported=False), "all four questions"),
-            (lambda r: r["decisions"][0]["answers"]["attempt_value"].update(supported="true"), r'bool_type.*supported'),
-            (lambda r: r["decisions"][0].update(evidence_refs=["invented-evidence"]), "existing records"),
-            (lambda r: r["decisions"][0].update(evidence_refs=["candidate-0002-calculation"]), "this candidate's program evidence"),
-            (lambda r: r["decisions"][1].update(resume_condition=None), "pause resume condition"),
-            (lambda r: r["decisions"][1].update(disposition="retain", retained_horizons=[24], resume_condition=None), "evaluated candidate evidence"),
-            (lambda r: r["decisions"][1].update(disposition="discard", resume_condition=None), "failure alone cannot discard"),
-            (lambda r: r["decisions"][0].update(continue_optimization=False), "proposal is not authorized"),
-            (lambda r: r.update(proposals=[]), "requires an experiment proposal"),
-            (lambda r: r["proposals"][0].update(evidence_refs=["invented-evidence"]), "existing records"),
-            (lambda r: r["proposals"][0].update(evidence_refs=["candidate-0001-report"]), "control evaluation"),
+            ("evaluator", lambda r: r["candidate_decisions"].pop(), r'too_short.*candidate_decisions'),
+            ("evaluator", lambda r: r["candidate_decisions"].__setitem__(1, copy.deepcopy(r["candidate_decisions"][0])), "repeated evaluator candidate"),
+            ("evaluator", lambda r: r["candidate_decisions"][0]["answers"].pop("research_basis"), r'missing.*research_basis'),
+            ("evaluator", lambda r: r["candidate_decisions"][0]["answers"]["research_basis"].update(supported=False), "all four questions"),
+            ("evaluator", lambda r: r["candidate_decisions"][0]["answers"]["attempt_value"].update(supported="true"), r'bool_type.*supported'),
+            ("evaluator", lambda r: r["candidate_decisions"][0].update(evidence_refs=["invented-evidence"]), "existing records"),
+            ("evaluator", lambda r: r["candidate_decisions"][0].update(evidence_refs=["candidate-0002-calculation"]), "this candidate's program evidence"),
+            ("evaluator", lambda r: r["candidate_decisions"][1].update(resume_condition=None), "pause resume condition"),
+            ("evaluator", lambda r: r["candidate_decisions"][1].update(disposition="retain", retained_horizons=[24], resume_condition=None), "evaluated candidate evidence"),
+            ("evaluator", lambda r: r["candidate_decisions"][1].update(disposition="discard", resume_condition=None), "failure alone cannot discard"),
+            ("evaluator", lambda r: r["candidate_decisions"][0].update(continue_optimization=False), "requires evaluator-authorized candidates"),
+            ("optimizer", lambda r: r.update(proposals=[]), r'too_short.*proposals'),
+            ("optimizer", lambda r: r["proposals"][0].update(evidence_refs=["invented-evidence"]), "existing records"),
+            ("optimizer", lambda r: r["proposals"][0].update(evidence_refs=["candidate-0001-report"]), "control evaluation"),
         ]
-        for mutate, error in cases:
+        for role, mutate, error in cases:
             mutated = False
             def transform(request, result):
                 nonlocal mutated
-                if request["role"] == "optimizer" and not mutated:
+                if request["role"] == role and not mutated:
                     mutate(result)
                     mutated = True
             with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
@@ -708,27 +763,30 @@ class WorkflowTests(unittest.TestCase):
     def test_natural_loop_can_exceed_previous_round_and_candidate_caps(self):
         model = None
         def continue_five_times(request, result):
+            if request["role"] == "evaluator":
+                records = {record["id"] for record in request["records"]}
+                control = request["payload"]["round_candidate_ids"][0]
+                continuing = model.optimizations < 5
+                result["candidate_decisions"] = [research_decision(
+                    cid, "optimize" if cid == control and continuing else
+                    "retain" if f"{cid}-evaluation" in records else "pause",
+                    cid == control and continuing,
+                    f"{cid}-evaluation" if f"{cid}-evaluation" in records else f"{cid}-calculation")
+                    for cid in request["payload"]["review_candidate_ids"]]
+                result["round_action"] = "continue_optimization" if continuing else "end_direction"
+                if not continuing:
+                    result["information_request"] = None
+                return
             if request["role"] != "optimizer":
                 return
-            records = {record["id"] for record in request["records"]}
             if model.optimizations <= 5:
-                control = request["payload"]["round_candidate_ids"][0]
+                control = request["payload"]["authorized_control_ids"][0]
                 proposal_id = f"proposal-{model.optimizations}"
                 window = 3 + model.optimizations
                 result["proposals"] = [optimization_proposal(
                     proposal_id, control, f"route-{model.optimizations}",
                     f"将近期价格基准窗口改为{window}小时，其他部分不变",
                     f"{window}小时窗口是否带来新的可验证信息")]
-                result["decisions"] = [research_decision(
-                    cid, "optimize" if cid == control else "retain" if f"{cid}-evaluation" in records else "pause",
-                    cid == control, f"{cid}-evaluation" if f"{cid}-evaluation" in records else f"{cid}-calculation")
-                    for cid in request["payload"]["review_candidate_ids"]]
-            else:
-                result["proposals"] = []
-                result["decisions"] = [research_decision(
-                    cid, "retain" if f"{cid}-evaluation" in records else "pause", False,
-                    f"{cid}-evaluation" if f"{cid}-evaluation" in records else f"{cid}-calculation")
-                    for cid in request["payload"]["review_candidate_ids"]]
         spec = specification()
         model = ScenarioModel(continue_five_times)
         with tempfile.TemporaryDirectory() as directory:
@@ -736,8 +794,8 @@ class WorkflowTests(unittest.TestCase):
             result = miner.explore(input_panel(spec))
             self.assertEqual(result["completed_rounds"], 6)
             self.assertEqual(len(result["candidate_ids"]), 7)
-            self.assertEqual((model.ideations, model.optimizations), (6, 6))
-            self.assertEqual(result["stop_reason"], "optimizer returned no authorized optimization proposals")
+            self.assertEqual((model.ideations, model.optimizations), (6, 5))
+            self.assertEqual(result["stop_reason"], "evaluator ended the current A research direction")
 
     def test_optimization_continues_after_many_prior_model_calls(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -747,7 +805,7 @@ class WorkflowTests(unittest.TestCase):
                 miner.gateway.ask("evaluator", "prior call fixture", {}, {})
             result = miner.explore(input_panel(spec))
             self.assertEqual(result["completed_rounds"], 2)
-            self.assertEqual(len(model.requests), 44)
+            self.assertEqual(len(model.requests), 43)
             for field in ("rounds", "max_candidates", "candidates_per_round", "max_route_attempts", "max_model_calls"):
                 self.assertNotIn(field, spec.as_dict())
             decision_request = next(r for r in model.requests if r["role"] == "optimizer")
@@ -1070,7 +1128,14 @@ class WorkflowTests(unittest.TestCase):
             report_text = (miner.root / "A-report.md").read_text()
             self.assertIn("| 指标 | 未来1h | 未来4h | 未来24h |", report_text)
             self.assertIn("candidate-0001-report", records)
-            self.assertIn("round-001-optimization", records)
+            saved_records = {record["id"]: record["data"] for record in miner.store.all()}
+            proposals = saved_records["round-001-optimization"]["proposals"]
+            self.assertEqual(second["payload"]["pending_proposals"], {
+                proposal["proposal_id"]: {**proposal, "status": "pending"}
+                for proposal in proposals})
+            self.assertEqual(second["payload"]["candidate_decisions"], {
+                decision["candidate_id"]: decision
+                for decision in saved_records["round-001-review"]["candidate_decisions"]})
             third = miner.candidates["candidate-0003"]
             self.assertEqual(third["experiment"], experiment())
             self.assertIn("paired_improvement", third["comparison"])
@@ -1752,7 +1817,7 @@ class ApiRetryTests(unittest.TestCase):
             result = miner.explore(input_panel(spec))
             self.assertEqual(result["completed_rounds"], 1)
             self.assertEqual(scripted.ideations, 1)
-            self.assertEqual(scripted.optimizations, 1)
+            self.assertEqual(scripted.optimizations, 0)
             self.assertEqual(len(list((miner.root / "a_records").glob("*-evaluation.json"))), 1)
             self.assertEqual(len(list((miner.root / "model_calls").glob("*-error.json"))), 1)
             panel = input_panel(spec, "B")
@@ -1799,8 +1864,8 @@ class ResponseRecoveryTests(unittest.TestCase):
         mutations = {
             "ideator": lambda r: r["candidates"][0].update(direction="-1"),
             "calculator": lambda r: r.update(candidate_id="candidate-9999"),
-            "evaluator": lambda r: r.update(limitations=[]),
-            "optimizer": lambda r: r["decisions"][0].update(evidence_refs=["unknown-record"]),
+            "evaluator": lambda r: r["candidate_reports"][0].update(analysis=None),
+            "optimizer": lambda r: r["proposals"][0].update(evidence_refs=["unknown-record"]),
         }
         for role, mutate in mutations.items():
             failed = []
@@ -1815,7 +1880,7 @@ class ResponseRecoveryTests(unittest.TestCase):
                 result = miner.explore(input_panel(miner.spec))
                 self.assertEqual(result["completed_rounds"], 2)
                 self.assertEqual(len(result["candidate_ids"]), 3)
-                self.assertEqual((model.ideations, model.optimizations), (2, 2))
+                self.assertEqual((model.ideations, model.optimizations), (2, 1))
                 self.assertEqual(miner.routes["window-route"]["attempts"], 1)
                 failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
                 self.assertEqual(len(failures), 1)
@@ -1855,9 +1920,9 @@ class ResponseRecoveryTests(unittest.TestCase):
     def test_evaluator_can_record_unavailable_residualization_as_a_limitation(self):
         noted = []
         def transform(request, result):
-            if request["role"] == "evaluator" and not noted:
+            if request["role"] == "evaluator" and "round_no" in request["payload"] and not noted:
                 noted.append(True)
-                result["limitations"].append(
+                result["candidate_reports"][0]["limitations"].append(
                     "当前表达式白名单没有回归或残差算子，未执行正交化或残差化。")
         with tempfile.TemporaryDirectory() as directory:
             miner = FactorMiner(specification(), ScenarioModel(transform), Path(directory))
@@ -1865,6 +1930,9 @@ class ResponseRecoveryTests(unittest.TestCase):
             self.assertEqual(result["completed_rounds"], 2)
             failures = [r for r in miner.store.all() if r["kind"] == "invalid_model_response"]
             self.assertEqual(failures, [])
+            report = miner.store._load(miner.store.root / "candidate-0001-report.json")["data"]
+            self.assertIn("当前表达式白名单没有回归或残差算子，未执行正交化或残差化。",
+                          report["limitations"])
 
     def test_truncated_and_fenced_json_are_corrected_without_accepting_invalid_output(self):
         good = dumps({"result": {"ok": True}, "read_records": []})
@@ -1925,26 +1993,48 @@ class ResponseRecoveryTests(unittest.TestCase):
             self.assertFalse(list(store.root.glob("*-invalid.json")))
 
     @patch("crypto_quant.research.factor_mining.records.time.sleep")
-    def test_exhausted_temporary_api_failure_is_local_to_one_report(self, sleep):
+    def test_exhausted_A_review_api_failure_reuses_saved_numerical_evidence(self, sleep):
         def two_candidates(request, result):
             if request["role"] == "ideator":
                 result["candidates"] = [definition(f"div(perp_close,ts_mean(perp_close,{window}))") for window in (3, 2)]
         scripted = ScenarioModel(two_candidates)
-        empty_calls = []
-        class EmptyFirstReport:
+        failed_reviews = []
+        class EmptyAReview:
             def complete(self, messages, **kwargs):
                 request = json.loads(messages[1]["content"])
-                if request["role"] == "evaluator" and request["payload"]["candidate_id"] == "candidate-0001":
-                    empty_calls.append(request)
+                if request["role"] == "evaluator" and "round_no" in request["payload"]:
+                    failed_reviews.append(request)
                     return ModelReply("", {}, "empty-fixture")
                 return scripted.complete(messages, **kwargs)
         with tempfile.TemporaryDirectory() as directory:
             scripted.propose_once = False
-            miner = FactorMiner(specification(), EmptyFirstReport(), Path(directory))
-            result = miner.explore(input_panel(miner.spec))
-            self.assertEqual(len(empty_calls), 6)
+            miner = FactorMiner(specification(), EmptyAReview(), Path(directory))
+            panel = input_panel(miner.spec)
+            with self.assertRaises(ApiCallError):
+                miner.explore(panel)
+            self.assertEqual(len(failed_reviews), 6)
             self.assertEqual(sleep.call_count, 5)
-            self.assertEqual(result["pending_report_ids"], ["candidate-0001"])
+            self.assertFalse((miner.root / "a-complete.json").exists())
+            self.assertFalse((miner.root / "a_records/round-001-review.json").exists())
+            self.assertEqual({record["id"] for record in miner.store.all()
+                              if record["kind"] == "evaluation"},
+                             {"candidate-0001-evaluation", "candidate-0002-evaluation"})
+            self.assertFalse(any(record["kind"] == "research_review" for record in miner.store.all()))
+            calculation_count = sum(request["role"] == "calculator" for request in scripted.requests)
+            ideation_count = sum(request["role"] == "ideator" for request in scripted.requests)
+
+            restored = FactorMiner.open(miner.root, scripted)
+            with patch("crypto_quant.research.factor_mining.workflow.evaluate_factor",
+                       side_effect=AssertionError("saved A evaluations must be reused")):
+                result = restored.resume_explore(panel)
+
+            self.assertEqual(result["completed_rounds"], 1)
+            self.assertEqual(result["pending_report_ids"], [])
+            self.assertEqual(sum(request["role"] == "calculator" for request in scripted.requests),
+                             calculation_count)
+            self.assertEqual(sum(request["role"] == "ideator" for request in scripted.requests),
+                             ideation_count)
+            self.assertTrue((miner.root / "a_records/candidate-0001-report.json").exists())
             self.assertTrue((miner.root / "a_records/candidate-0002-report.json").exists())
 
     def test_unexpected_validator_bug_is_not_retried(self):
@@ -2000,13 +2090,26 @@ class ResponseRecoveryTests(unittest.TestCase):
             model = ScenarioModel()
             model.propose_once = False
             miner = FactorMiner(specification(), model, Path(directory))
-            with patch.object(miner, "_interpret", side_effect=ContextBudgetError("report context exceeds budget")):
-                done = miner.explore(input_panel(miner.spec))
+            done = miner.explore(input_panel(miner.spec))
+            review = next(record for record in miner.store.all()
+                          if record["id"] == "round-001-review")
+            (miner.store.root / "round-001-review.json").unlink()
+            miner.store.append("round-001-optimization", "optimization", {
+                "analysis": "旧版A checkpoint，Optimizer只保存候选去向。",
+                "decisions": review["data"]["candidate_decisions"], "diagnostics": [],
+                "proposals": [], "route_states": done["routes"],
+            })
+            (miner.store.root / "candidate-0001-report.json").unlink()
             panel_b = input_panel(miner.spec, "B")
             with self.assertRaisesRegex(ValueError, "complete.*report"):
                 miner.freeze(done["retained_ids"], panel_b.universe)
             before = {r["id"]: r["data"] for r in miner.store.all()}
             restored = FactorMiner.open(miner.root, model)
+            with patch.object(restored, "_interpret",
+                              side_effect=ContextBudgetError("report context exceeds budget")):
+                pending = restored.complete_reports("A", Path(directory) / "ideas")
+            self.assertEqual(pending["status"], "reports_pending")
+            self.assertEqual(pending["pending_report_ids"], ["candidate-0001"])
             with patch("crypto_quant.research.factor_mining.workflow.evaluate_expression") as compute:
                 completed = restored.complete_reports("A", Path(directory) / "ideas")
             compute.assert_not_called()

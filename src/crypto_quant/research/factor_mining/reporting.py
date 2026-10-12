@@ -140,18 +140,49 @@ def write_research_report(path: Path, run_id: str, purpose: str, records: list[d
         lines += [""]
     if stage == "A":
         decisions = {}
+        decision_sources = {}
         proposals = []
+        reviews = []
         for record in records:
-            if record["kind"] == "optimization":
-                decisions.update({d["candidate_id"]: d for d in record["data"]["decisions"]})
+            if record["kind"] == "research_review":
+                reviews.append(record)
+                for decision in record["data"]["candidate_decisions"]:
+                    cid = decision["candidate_id"]
+                    decisions[cid] = decision
+                    decision_sources[cid] = {"role": "评估Agent", "record_id": record["id"]}
+            elif record["kind"] == "optimization":
+                # Legacy records keep the old optimizer-authored decisions. New
+                # proposals-only optimizer records have no decisions field.
+                if "decisions" in record["data"]:
+                    for decision in record["data"]["decisions"]:
+                        cid = decision["candidate_id"]
+                        decisions[cid] = decision
+                        decision_sources[cid] = {"role": "旧版Optimizer", "record_id": record["id"]}
                 proposals.extend((record["id"], proposal) for proposal in record["data"]["proposals"])
         labels = {"optimize": "继续优化", "retain": "保留待B验证", "pause": "暂停", "discard": "淘汰"}
         questions = {"research_basis": "有研究依据", "modification_hypothesis": "有具体修改假设",
                      "verifiable_improvement": "能验证改善", "attempt_value": "还有尝试价值"}
+        round_actions = {"continue_ideation": "继续构想/补充取证",
+                         "continue_optimization": "提交已授权候选给Optimizer拟定修改任务",
+                         "end_direction": "结束当前A研究方向"}
+        if reviews:
+            lines += ["## 评估Agent本轮决定", ""]
+            for review in reviews:
+                data = review["data"]
+                lines += [f"### 第{data['round_no']}轮：{round_actions[data['round_action']]}", ""]
+                if data["information_request"] is not None:
+                    request = data["information_request"]
+                    lines += [request["purpose"], ""]
+                    lines += [f"- {question}" for question in request["questions"]]
+                    lines += ["- 参考记录：" + "、".join(
+                        f"`{ref}`" for ref in request["record_refs"]), ""]
+                lines += [data["analysis"], "", f"[完整评估记录](a_records/{review['id']}.json)", ""]
         if decisions:
-            lines += ["## 候选去向", "", "以下为优化 Agent 的研究决定，B验证及创意卡准入另行执行。", ""]
+            lines += ["## 候选去向", "", "逐项标明决定来源；B验证及创意卡准入由程序按冻结规则执行。", ""]
         for cid, decision in decisions.items():
             lines += [f"### {cid}：{labels[decision['disposition']]}", "",
+                      f"决定来源：{decision_sources[cid]['role']} "
+                      f"[记录](a_records/{decision_sources[cid]['record_id']}.json)。", "",
                       f"继续修改：{'是' if decision['continue_optimization'] else '否'}。", "", decision["reason"], ""]
             for key, answer in decision["answers"].items():
                 lines.append(f"- {questions[key]}：{'支持' if answer['supported'] else '不支持'}。{answer['reason']}")

@@ -58,8 +58,8 @@ class HorizonTests(unittest.TestCase):
         def transform(request, result):
             if request["role"] == "ideator":
                 result["candidates"] = [definition("ts_mean(premium_index,3)")]
-            if request["role"] == "optimizer":
-                for decision in result["decisions"]:
+            if request["role"] == "evaluator" and "round_no" in request["payload"]:
+                for decision in result["candidate_decisions"]:
                     if decision["disposition"] == "retain":
                         decision["retained_horizons"] = [1, 4, 24]
         with tempfile.TemporaryDirectory() as directory:
@@ -77,8 +77,8 @@ class HorizonTests(unittest.TestCase):
 
     def _miner(self, directory, horizons, *, model=None):
         def transform(request, result):
-            if request["role"] == "optimizer":
-                for decision in result["decisions"]:
+            if request["role"] == "evaluator" and "round_no" in request["payload"]:
+                for decision in result["candidate_decisions"]:
                     if decision["disposition"] == "retain":
                         decision["retained_horizons"] = list(horizons)
         model = model or ScenarioModel(transform, propose_once=False)
@@ -172,11 +172,11 @@ class HorizonTests(unittest.TestCase):
             decision = research_decision("candidate-0001", "retain")
             decision["retained_horizons"] = [1, 4, 24]
             with patch.object(miner.store, "all", return_value=records):
-                self.assertEqual(miner._check_decisions([decision], ["candidate-0001"]),
+                self.assertEqual(miner._check_candidate_decisions([decision], ["candidate-0001"]),
                                  {"candidate-0001": decision})
                 evidence["horizon_comparison"]["horizons"].pop("4")
                 with self.assertRaisesRegex(ValueError, "4h|horizon"):
-                    miner._check_decisions([decision], ["candidate-0001"])
+                    miner._check_candidate_decisions([decision], ["candidate-0001"])
 
     def test_a_retained_horizons_reject_duplicate_unknown_and_empty_sets(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -186,7 +186,7 @@ class HorizonTests(unittest.TestCase):
                 with self.subTest(horizons=horizons):
                     decision["retained_horizons"] = horizons
                     with self.assertRaisesRegex(ValueError, "horizon"):
-                        miner._check_decisions([decision], ["candidate-0001"])
+                        miner._check_candidate_decisions([decision], ["candidate-0001"])
 
     def test_goal_counts_one_card_and_keeps_b_evidence_out_of_model_context(self):
         class MultiGoalModel(GoalModel):
@@ -194,8 +194,9 @@ class HorizonTests(unittest.TestCase):
                 reply = super().complete(messages, max_output_tokens=max_output_tokens, session_id=session_id)
                 result = json.loads(reply.text)
                 request = json.loads(messages[1]["content"])
-                if request["role"] == "optimizer" and "decisions" in result["result"]:
-                    for decision in result["result"]["decisions"]:
+                if (request["role"] == "evaluator" and "round_no" in request["payload"]
+                        and "candidate_decisions" in result["result"]):
+                    for decision in result["result"]["candidate_decisions"]:
                         if decision["disposition"] == "retain":
                             # Arbitrary unique ordering is allowed by the A contract.
                             decision["retained_horizons"] = [24, 1, 4]
@@ -206,6 +207,12 @@ class HorizonTests(unittest.TestCase):
             runner = GoalRunner.create(GoalSpec("horizons-goal", "研究价格偏离关系的合格成果", 1),
                                        spec, model, Path(directory), inputs={}, model_settings=SETTINGS)
             a, b = input_panel(spec), input_panel(spec, "B")
+            start, end = spec.bounds("A")
+            a.diagnostics["data_usage"] = {
+                "use": "engineering_factor_A", "start": start.isoformat(),
+                "end_exclusive": end.isoformat(),
+                "warmup_start": (start - pd.Timedelta(hours=spec.max_lookback_hours)).isoformat(),
+            }
             with patch("crypto_quant.research.factor_mining.workflow.evaluate_factor",
                        side_effect=self._controlled_evaluation):
                 state = runner.run(lambda: a, lambda: b, lambda: b.universe, runner.root / "ideas",
@@ -219,7 +226,8 @@ class HorizonTests(unittest.TestCase):
             self.assertEqual(delivery["passed_horizons"], [24, 1, 4])
             self.assertEqual(set(delivery["horizon_evidence"]), {"1", "4", "24"})
             for request in model.requests:
-                if request["role"] == "optimizer":
+                if (request["role"] == "optimizer"
+                        or (request["role"] == "evaluator" and "round_no" in request["payload"])):
                     encoded = dumps(request)
                     self.assertNotIn('"passed_horizons"', encoded)
                     self.assertNotIn('"horizon_results"', encoded)

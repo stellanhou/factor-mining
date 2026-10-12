@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from typing import Any
 
 from .contracts import candidate, require, text, _object_schema, _text_schema, _array_schema, _nullable
@@ -64,11 +65,19 @@ class IdeatorRole:
 
     def _ask_ideator(self, pending: dict[str, Any], *, ideation_id: str,
                      factor_landscape_ref: dict[str, str],
-                     allowed_record_ids: set[str]) -> dict[str, Any]:
+                     allowed_record_ids: set[str],
+                     evaluator_review_ref: dict[str, str] | None = None,
+                     history_index: list[dict[str, Any]] | None = None,
+                     allowed_history_record_ids: set[str] | None = None,
+                     history_reader: Callable[[str, str, int, int], Any] | None = None) -> dict[str, Any]:
         task = (
             "构造当前有研究依据的一组可证伪候选公式，写清计算含义，不为凑数量生成候选。"
             "表达式须满足合同的节点和历史长度上限；预算超限会记录计算失败，计算Agent不会删项或缩短窗口替你改写研究假设。"
-            "阅读全部历史及优化任务，逐条记录采用或放弃。"
+            "围绕当前research_task、任务明确引用的父因子及goal-context记录里的research_task_evidence摘要构想。"
+            "只检索与当前假设、父因子和相似路线相关的A历史，不枚举或复述全部历史任务。"
+            "历史周期和因子图谱若只显示分页引用，不等于相关原文不存在；用A证据检索工具搜索精确父因子、历史公式和评价记录。"
+            "先检索，再按record_id、JSON pointer和页码读取所需原始记录；摘要只用于定位，不替代公式与A数值证据。"
+            "若父因子、任务或数值仍无法从获准A记录中查到，在analysis中列明具体缺口及已查范围，不据此判断方向失败或结束研究。"
             "读取payload.factor_landscape_ref对应的本轮A段因子树和分支证据；树用于提示相似度与研究覆盖，拥挤分支不是禁入条件。"
             "对每个新增候选，在change_reason或analysis中说明与相似已有公式的差异，以及新增的可证伪价值。"
             "尚未尝试的方向须结合字段库存和A研究记录判断；树只描述已有信号，不能凭分支数量推断经济机制空白。"
@@ -88,7 +97,8 @@ class IdeatorRole:
             "Optimizer只给出修改任务和配对检验合同；最终候选定义和可执行公式必须由你首次生成。"
             "采用任务时，候选parent_id必须引用control_id，proposal_id必须引用当前任务，"
             "预测方向保持不变；change_reason须具体说明公式如何实现change_target并遵守fixed_components。"
-            "不得改写Optimizer预先声明的修改任务或判断标准；无法一致实现时放弃，由Optimizer另立新任务。"
+            "不得改写Optimizer预先声明的修改任务或判断标准；若无法按任务实现，在dispositions中仅放弃该提案并说明原因。"
+            "构想Agent不决定研究方向的保留、暂停、淘汰或终止；候选为空或存在资料缺口时仍返回analysis，交Evaluator作下一步决策。"
             "对于metric=rank_displacement的pending任务，只生成该明确任务要求的对应版本；不得将平滑自动应用于其他因子，"
             "也不得额外生成未获准的同类窗口变体。其horizon_hours和displacement_hours只是配对评价的H与Δ，"
             "不代表持有期或公式变换，不得擅自改动。"
@@ -99,6 +109,14 @@ class IdeatorRole:
         payload = {"catalog_record_id": "inputs", "pending_proposals": pending,
                    "candidate_decisions": self.decisions, "ideation_id": ideation_id,
                    "factor_landscape_ref": factor_landscape_ref}
+        if evaluator_review_ref is not None:
+            require(isinstance(evaluator_review_ref, dict)
+                    and set(evaluator_review_ref) == {"record_id", "pointer"}
+                    and isinstance(evaluator_review_ref["record_id"], str)
+                    and evaluator_review_ref["record_id"] in allowed_record_ids
+                    and evaluator_review_ref["pointer"] == "/information_request",
+                    "evaluator information request must reference an authorized A review record")
+            payload["evaluator_review_ref"] = dict(evaluator_review_ref)
         return self.gateway.ask("ideator",
             task, payload,
             _object_schema({"candidates": _array_schema(CANDIDATE_SCHEMA),
@@ -110,4 +128,7 @@ class IdeatorRole:
                     minItems=len(pending), maxItems=len(pending)),
                 "analysis": _text_schema("本轮构想依据")}),
             validate=lambda response: self._check_ideation(response, pending),
-            allowed_record_ids=allowed_record_ids)
+            allowed_record_ids=allowed_record_ids,
+            history_index=history_index,
+            allowed_history_record_ids=allowed_history_record_ids,
+            history_reader=history_reader)

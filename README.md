@@ -4,6 +4,8 @@
 
 从 [crypto-quant-research-platform](https://github.com/stellanhou/crypto-quant-research-platform) 拆出，保留相关文件历史及 2026-10-08 本地未提交的研究改动。原仓库继续保存完整历史、数据工具和统一控制台。
 
+2026-10-12 同步当前因子挖掘实现：Codex 构想可在同一任务内检索与分页读取 A 证据；评估 Agent 决定候选去向与本轮动作，优化 Agent 只提出获准的修改任务；Goal 保存多期限证据、审查阻塞及恢复状态。
+
 ## 安装与使用
 
 ```bash
@@ -33,5 +35,7 @@ Python 版本由 `.python-version` 固定。每个仓库使用自己的 `.venv`�
 - [迁移记录](docs/repository-split.md)
 
 ## 验证状态
+
+2026-10-12 当前版本在独立虚拟环境验收：307 项测试及 252 项子检查全部通过；`factor-mine --help` 和 `research-data-policy` 入口通过。
 
 2026-10-08 拆分验收：258 项测试通过、2 项既有测试失败；另有 233 项子测试通过。两项失败均在原仓库复现为 `KeyError: horizon_comparison`，详情见[迁移记录](docs/repository-split.md#拆分验收)。

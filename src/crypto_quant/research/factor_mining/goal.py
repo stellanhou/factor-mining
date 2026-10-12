@@ -1,4 +1,4 @@
-"""Durable outcome goals, owned by the existing optimizer role.
+"""Durable outcome goals with evaluator-led selection and program-verified completion.
 
 Research decisions see A evidence only. Completion review gets A definitions and
 program-issued admission receipts, never B measurements or rejection feedback.
@@ -16,7 +16,7 @@ import pandas as pd
 
 from crypto_quant.features.factor_inputs import FactorInputPanel, INPUT_COLUMNS
 from crypto_quant.research.progress import ProgressLog
-from .contracts import (ResearchSpec, digest, identifier, number, require, text, without_hash_metadata,
+from .contracts import (ResearchSpec, digest, dumps, identifier, number, require, text, without_hash_metadata,
                         _array_schema, _object_schema, _text_schema)
 from .runtime import GRAPH_CONFIG
 from langgraph.graph import StateGraph, START, END
@@ -175,6 +175,133 @@ class GoalResearchStore(RecordStore):
             require(record["kind"] == item["kind"], "saved research record kind changed")
             records.append(record)
         return records
+
+    def a_history_tools(self) -> tuple[list[dict[str, Any]], set[str], Callable[[str, str, int, int], Any]]:
+        """Build a compact index and reader for whitelisted Goal A catalogs, cycles, tasks, and diagnostics."""
+        history = self.all()
+        a_catalog_ids = set()
+        a_diagnostic_ids = set()
+
+        def is_a_input_catalog(data: Any) -> bool:
+            require(isinstance(data, dict) and {"catalog", "valid_A_rows"} <= data.keys(),
+                    "historical inputs catalog is missing its A provenance")
+            catalog = data["catalog"]
+            require(isinstance(catalog, dict) and isinstance(catalog["data"], dict)
+                    and isinstance(catalog["data"]["data_usage"], dict),
+                    "historical inputs catalog is missing its data-use scope")
+            usage = catalog["data"]["data_usage"]
+            require({"use", "start", "end_exclusive", "warmup_start"} <= usage.keys()
+                    and isinstance(usage["use"], str),
+                    "historical inputs catalog is missing its A interval")
+            start, end = pd.Timestamp(usage["start"]), pd.Timestamp(usage["end_exclusive"])
+            warmup = pd.Timestamp(usage["warmup_start"])
+            valid_a_rows = data["valid_A_rows"]
+            require(start.tzinfo is not None and end.tzinfo is not None and warmup.tzinfo is not None
+                    and end > start and warmup <= start
+                    and isinstance(valid_a_rows, dict) and bool(valid_a_rows)
+                    and all(isinstance(field, str) and type(count) is int and count >= 0
+                            for field, count in valid_a_rows.items()),
+                    "historical inputs catalog has invalid A interval or row counts")
+            return usage["use"] in {"factor_development_A", "engineering_factor_A"}
+
+        for record in history:
+            record_id = record["id"]
+            if (record["kind"] == "data_provenance" and record_id.startswith("inputs-")
+                    and len(record_id) == len("inputs-") + 8
+                    and record_id.removeprefix("inputs-").isdigit()):
+                if is_a_input_catalog(record["data"]):
+                    a_catalog_ids.add(record_id)
+            elif (record["kind"] in {"format_deviation", "invalid_model_response"}
+                  and record_id.startswith("model-")
+                  and record["data"]["role"] in {"evaluator", "optimizer"}):
+                require(isinstance(record["data"]["raw_response"], str),
+                        "Goal A diagnostic is missing its source response")
+                a_diagnostic_ids.add(record_id)
+        allowed_ids = {record["id"] for record in history
+                       if record["kind"] in {"research_cycle", "goal_task"}} | a_catalog_ids | a_diagnostic_ids
+        search_index: list[dict[str, Any]] = []
+        for record in history:
+            if record["id"] not in allowed_ids:
+                continue
+            if record["id"] in a_catalog_ids:
+                data = record["data"]
+                summary = dumps({"catalog": data["catalog"], "valid_A_rows": data["valid_A_rows"]})
+                search_index.append({"record_id": record["id"], "pointer": "", "kind": "data_provenance",
+                                    "segment": "A", "summary": summary, "search_text": summary})
+                continue
+            if record["id"] in a_diagnostic_ids:
+                data = record["data"]
+                summary = dumps({key: data[key] for key in ("role", "error", "extra_fields") if key in data})
+                search_index.append({"record_id": record["id"], "pointer": "", "kind": record["kind"],
+                                    "segment": "A", "summary": summary, "search_text": summary})
+                continue
+            if record["kind"] == "goal_task":
+                data = record["data"]
+                summary = dumps({key: data.get(key) for key in ("task", "reason", "evidence_refs")})
+                search_index.append({"record_id": record["id"], "pointer": "", "kind": "goal_task",
+                                    "summary": summary, "search_text": summary})
+                continue
+            data = record["data"]
+            candidates = {item["candidate_ref"]: item for item in data["context"].get("candidates", [])
+                          if isinstance(item, dict) and isinstance(item.get("candidate_ref"), str)}
+            run_id = data["run_id"]
+            for index, item in enumerate(data["records"]["items"]):
+                candidate_id = item.get("candidate_id")
+                candidate_ref = f"{run_id}/{candidate_id}" if candidate_id else None
+                candidate = candidates.get(candidate_ref, {})
+                compact = {key: candidate.get(key) for key in
+                           ("definition", "calculation", "A_evaluation", "final_decision", "paired_comparison")
+                           if key in candidate}
+                summary = dumps({"cycle_id": record["id"], "candidate_id": candidate_id,
+                                 "kind": item["kind"], "candidate": compact})
+                search_item = {"record_id": record["id"], "pointer": f"/records/{index}/data",
+                               "kind": item["kind"], "segment": "A", "summary": summary,
+                               "search_text": summary}
+                if candidate_ref:
+                    search_item["candidate_ref"] = candidate_ref
+                search_index.append(search_item)
+
+        def reader(record_id: str, pointer: str, offset: int, limit: int) -> Any:
+            record_id = identifier(record_id)
+            require(record_id in allowed_ids, "historical record ID is outside the A-history whitelist")
+            history_record = self._load(self.root / f"{record_id}.json")
+            if history_record["kind"] == "research_cycle":
+                cycle = history_record["data"]
+                if pointer.startswith("/records/"):
+                    parts = pointer.split("/")
+                    require(len(parts) >= 3 and parts[2].isdigit(),
+                            "historical A evidence must select a saved record index")
+                    items = cycle["records"]["items"]
+                    index = int(parts[2])
+                    require(index < len(items), "historical A record index is out of range")
+                    item = items[index]
+                    source_run = self._source_run(cycle)
+                    source_record = load_record_reference(source_run / "a_records", item["ref"])
+                    require(source_record["kind"] == item["kind"],
+                            "historical A record kind differs from the saved cycle index")
+                    source_data = source_record["data"]
+                    if source_record["kind"] == "evaluation":
+                        require(source_data.get("segment") == "A",
+                                "historical evaluation source is not A evidence")
+                    elif "segment" in source_data:
+                        require(source_data["segment"] == "A",
+                                "historical record source is not A evidence")
+                elif pointer and not pointer.startswith("/context") and pointer != "/records":
+                    raise ValueError("historical A reader accepts only cycle context or saved-record pointers")
+            elif history_record["kind"] == "data_provenance":
+                require(record_id in a_catalog_ids and is_a_input_catalog(history_record["data"]),
+                        "historical data-provenance source is not an A input catalog")
+            elif history_record["kind"] in {"format_deviation", "invalid_model_response"}:
+                require(record_id in a_diagnostic_ids
+                        and history_record["data"]["role"] in {"evaluator", "optimizer"},
+                        "historical model diagnostic is not from A task selection")
+            else:
+                require(history_record["kind"] == "goal_task",
+                        "historical A reader accepts only A catalogs, Goal tasks, A diagnostics, and research cycles")
+            return self.read(record_id, pointer, offset, limit)
+
+        return search_index, allowed_ids, reader
+
     def read(self, record_id: str, pointer: str, offset: int, limit: int) -> Any:
         if record_id.startswith("cycle-") and pointer.startswith("/context"):
             record = self._complete_historical_context(
@@ -329,10 +456,11 @@ class GoalRunner:
                    "catalog": panel.ideation_context(), "valid_A_rows": self._counts(panel)}
         catalog_id = f"inputs-{index:08d}"
         self.research.append(catalog_id, "data_provenance", catalog)
-        decision = self._gateway(self.research).ask("optimizer",
-            "你继续担任优化Agent，现在负责Goal层的下一项研究决策，不新增角色。"
+        decision = self._gateway(self.research).ask("evaluator",
+            "你是评估Agent，现在负责Goal层的下一项研究方向与资料条件判断。"
             "对照goal和全部A研究记录，选择可执行的候选研究方向、等待明确缺失的数据，或报告无法解决的审查阻塞。"
-            "已有候选的优化仍由候选Loop按四问和配对合同执行。当前候选无修改提案只结束该候选Loop，"
+            "已有候选去向由候选Loop的评估Agent根据A证据判定；获准继续优化的任务由优化Agent按配对合同提出。"
+            "当前候选无修改提案只结束该候选Loop，"
             "不代表Goal完成。尚未想到新方向时，在本次选题中梳理未回答问题，不能输出结束或完成。"
             "explore_new会启动候选生成Loop，必须允许并预期生成候选，不能下达只审查归档、不生成公式的任务。"
             "纯归档审查在本次选题中通过read_records完成：先读取cycle记录的/records目录，再按其中pointer读取原始A记录的/data及所需字段。"
@@ -344,7 +472,7 @@ class GoalRunner:
             "review_required直接进入blocked，不创建研究run，不计为空候选轮次；这不代表Goal完成。"
             "历史task或diagnostics中的未执行建议不等于已冻结定义，也不能升级成所有后续研究的合同前置条件。"
             "新方向须说明已有A观察、机制假设与可证伪的检验价值，但不要求尚未生成的新定义提前提供它自己的执行结果。"
-            "具体定义由构想Agent生成；候选修改仍须先由Optimizer按四问预声明，再执行配对检验。"
+            "具体定义由构想Agent生成；Evaluator先按四问授权继续优化，再由Optimizer提出修改任务和配对实验。"
             "若一个诊断超出现有执行能力，只阻塞依赖它的路线；独立方向仍按已有A依据判断，不能仅因旧诊断未完成而全部拒绝。"
             "explore_new须说明新增研究价值，不重复已经检验的相同公式；不输出候选定义或最终公式，"
             "交给构想Agent生成。新数据可以支持重查旧问题，但需说明新增依据。"
@@ -396,7 +524,11 @@ class GoalRunner:
                        for record in source.values() if record["kind"] == "candidate"}
         decisions = {}
         for record in source.values():
-            if record["kind"] == "optimization":
+            if record["kind"] == "research_review":
+                decisions.update({decision["candidate_id"]: decision
+                                  for decision in record["data"]["candidate_decisions"]})
+            elif record["kind"] == "optimization" and "decisions" in record["data"]:
+                # Legacy A cycles kept candidate decisions in optimizer records.
                 decisions.update({decision["candidate_id"]: decision
                                   for decision in record["data"]["decisions"]})
         candidates, previous = [], []
@@ -449,7 +581,8 @@ class GoalRunner:
                 "A_evaluation": a_evaluation,
                 "final_decision": None if decision is None else {
                     key: decision[key] for key in (
-                        "disposition", "continue_optimization", "reason", "resume_condition")
+                        "disposition", "retained_horizons", "continue_optimization",
+                        "reason", "resume_condition")
                 },
                 "paired_comparison": None if comparison is None else {
                     **{key: comparison["data"][key] for key in (
@@ -496,6 +629,10 @@ class GoalRunner:
         require(miner.spec == replace(self.spec, run_id=self.state["current_run"]),
                 "research run differs from the saved Goal contract")
         return miner
+
+    def _ideator_history_tools(self):
+        """Return fresh A-only history tools for both new and resumed ideation calls."""
+        return self.research.a_history_tools()
 
     def _archive_A(self, miner: FactorMiner) -> None:
         record_id = f"cycle-{self.state['cycle']:08d}"
@@ -736,8 +873,8 @@ class GoalRunner:
             result = records[match_id]
             check(result)
         else:
-            result = self._gateway(self.receipts).ask("optimizer",
-                "你是优化Agent，当前只核验已获程序准入的成果是否符合Goal文本。"
+            result = self._gateway(self.receipts).ask("evaluator",
+                "你是评估Agent，当前只核验已获程序准入的成果是否符合Goal文本。"
                 "只根据Goal中的研究目标，逐卡核对候选定义和A段研究证据是否研究了目标所述问题；不把运行流程、批次数量或收据状态当作研究内容要求。"
                 "GoalId标识外层Goal，run_id标识它runs目录中的一次研究运行，二者无需相同；程序已核对运行归属。"
                 "数量Goal由程序累计target_ideas；质量Goal由程序核对预声明配对目标与同期限B准入。"
@@ -769,6 +906,7 @@ class GoalRunner:
 
         def explore():
             panel = load_A()
+            history_index, allowed_history_record_ids, history_reader = self._ideator_history_tools()
             run_dir = self.root / "runs" / self.state["current_run"]
             if not run_dir.exists():
                 miner = FactorMiner(replace(self.spec, run_id=self.state["current_run"]), self.model,
@@ -776,6 +914,7 @@ class GoalRunner:
                 write_json(miner.root / "model-settings.json", self.model_settings)
             else:
                 miner = self._miner()
+            goal_context = self._context(panel)
             if not (miner.root / "a-complete.json").exists():
                 if miner.store.all():
                     records = {r["id"] for r in miner.store.all()}
@@ -783,10 +922,14 @@ class GoalRunner:
                         require(records == {"inputs"}, "partial Goal run is missing its research instructions")
                         require((miner.root / "A-universe.csv").read_text() == panel.universe.rename("eligible").to_csv(),
                                 "A membership changed during Goal initialization")
-                        miner.store.append("goal-context", "goal_context", self._context(panel))
-                    miner.resume_explore(panel)
+                        miner.store.append("goal-context", "goal_context", goal_context)
+                    miner.resume_explore(panel, history_index=history_index,
+                                         allowed_history_record_ids=allowed_history_record_ids,
+                                         history_reader=history_reader)
                 else:
-                    miner.explore(panel, goal_context=self._context(panel))
+                    miner.explore(panel, goal_context=goal_context, history_index=history_index,
+                                  allowed_history_record_ids=allowed_history_record_ids,
+                                  history_reader=history_reader)
             self._save(phase="prepare_validation")
             return
         def prepare_validation():

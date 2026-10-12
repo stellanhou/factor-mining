@@ -46,6 +46,10 @@ class ApiCallError(RuntimeError):
         self.diagnostics = diagnostics
 
 
+class RecoverableToolError(RuntimeError):
+    """A tool request the model can correct and retry within the same turn."""
+
+
 class JsonModel(Protocol):
     def complete(self, messages: list[dict[str, str]], *, max_output_tokens: int | None,
                  session_id: str) -> ModelReply: ...
@@ -65,8 +69,12 @@ class RoleModels:
         return {"provider": "factor-role-models",
                 "roles": {role: model.settings() for role, model in self.models.items()}}
 
+    def get_model_for_role(self, role: str) -> JsonModel:
+        require(role in self.models, "unknown factor model role")
+        return self.models[role]
+
     def complete(self, messages, *, max_output_tokens, session_id):
         role = json.loads(messages[1]["content"])["role"]
-        require(role in self.models, "unknown factor model role")
-        return self.models[role].complete(messages, max_output_tokens=max_output_tokens,
-                                          session_id=session_id)
+        return self.get_model_for_role(role).complete(
+            messages, max_output_tokens=max_output_tokens, session_id=session_id
+        )

@@ -20,7 +20,7 @@ from crypto_quant.features.factor_expressions import compile_expression, evaluat
 from crypto_quant.features.factor_inputs import FactorInputPanel, INPUT_COLUMNS, validate_universe
 from crypto_quant.research.progress import ProgressLog
 from .agent_calculator import CalculatorRole, FormulaBudgetError
-from .agent_evaluator import EvaluatorRole
+from .agent_evaluator import EvaluatorRole, ROUND_REVIEW_SCHEMA
 from .agent_ideator import IdeatorRole
 from .agent_optimizer import OptimizerRole
 from .contracts import ResearchSpec, dumps, require, without_hash_metadata
@@ -116,6 +116,9 @@ def b_candidate_decision(candidate_id: str, report: dict[str, Any], correction: 
 class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
     def __init__(self, spec: ResearchSpec, model: JsonModel, output_root: Path):
         self.spec, self.model = spec, model
+        self.history_index = []
+        self.allowed_history_record_ids = set()
+        self.history_reader = None
         output_root = Path(output_root).resolve()
         self.root = output_root / spec.run_id
         self.root.mkdir(parents=True, exist_ok=False)
@@ -131,6 +134,9 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
     def open(cls, run_directory: Path, model: JsonModel) -> FactorMiner:
         self = cls.__new__(cls)
         self.root, self.model = Path(run_directory), model
+        self.history_index = []
+        self.allowed_history_record_ids = set()
+        self.history_reader = None
         self.spec = ResearchSpec.from_dict(json.loads((self.root / "contract.json").read_text()))
         self._attach()
         return self
@@ -416,7 +422,16 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
         return compiled
 
 
-    def explore(self, panel: FactorInputPanel, *, goal_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    def explore(self, panel: FactorInputPanel, *, goal_context: dict[str, Any] | None = None,
+                history_index: list[dict[str, Any]] | None = None,
+                allowed_history_record_ids: set[str] | None = None,
+                history_reader: Callable[[str, str, int, int], Any] | None = None) -> dict[str, Any]:
+        if history_index is not None:
+            self.history_index = list(history_index)
+        if allowed_history_record_ids is not None:
+            self.allowed_history_record_ids = set(allowed_history_record_ids)
+        if history_reader is not None:
+            self.history_reader = history_reader
         require(not self.store.all() and not (self.root / "frozen_batch.json").exists(), "exploration can start only in a new research run")
         self._validate_panel(panel, "A")
         universe_path = self.root / "A-universe.csv"
@@ -434,8 +449,17 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
             self.store.append("goal-context", "goal_context", goal_context)
         return self._run_exploration(panel)
 
-    def resume_explore(self, panel: FactorInputPanel) -> dict[str, Any]:
+    def resume_explore(self, panel: FactorInputPanel, *,
+                       history_index: list[dict[str, Any]] | None = None,
+                       allowed_history_record_ids: set[str] | None = None,
+                       history_reader: Callable[[str, str, int, int], Any] | None = None) -> dict[str, Any]:
         """Replay committed A checkpoints; never reopen a run after B was frozen."""
+        if history_index is not None:
+            self.history_index = list(history_index)
+        if allowed_history_record_ids is not None:
+            self.allowed_history_record_ids = set(allowed_history_record_ids)
+        if history_reader is not None:
+            self.history_reader = history_reader
         require(not (self.root / "frozen_batch.json").exists(), "cannot resume A after freezing B")
         self._validate_panel(panel, "A")
         records = {r["id"]: r for r in self.store.all()}
@@ -467,6 +491,7 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
         def ideate(state):
             round_no = state["round_no"] + 1
             pending = {pid: p for pid, p in self.proposals.items() if p["status"] == "pending"}
+            review_ref = state.get("evaluator_review_ref")
             ideation_id = f"round-{round_no:03d}-ideation"
             if ideation_id in saved:
                 response = saved[ideation_id]
@@ -483,7 +508,11 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                 response = self._ask_ideator(
                     pending, ideation_id=ideation_id,
                     factor_landscape_ref=landscape_ref,
-                    allowed_record_ids=visible_ids)
+                    allowed_record_ids=visible_ids,
+                    evaluator_review_ref=review_ref,
+                    history_index=self.history_index,
+                    allowed_history_record_ids=self.allowed_history_record_ids,
+                    history_reader=self.history_reader)
             definitions, experiments, self.routes, self.proposals = self._check_ideation(response, pending)
             if ideation_id not in saved:
                 self.store.append(ideation_id, "ideation", response)
@@ -580,38 +609,128 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                     self.routes[item["experiment"]["route_id"]]["decision"] = item["comparison"]["route_decision"]
                 else:
                     self._compare(cid, values, panel, labels)
-            narrative = saved[f"{cid}-report"] if f"{cid}-report" in saved else self._try_report(cid, self.gateway)
-            if narrative is not None:
-                item["model_report"] = narrative
+            if f"{cid}-report" in saved:
+                item["model_report"] = saved[f"{cid}-report"]
             return {**state, "index": state["index"] + 1, "values": None}
 
-        def optimize(state):
+        def review(state):
             round_ids, round_no = state["round_ids"], state["round_no"]
             review_ids = list(dict.fromkeys(round_ids + [cid for cid, decision in self.decisions.items()
                                                         if decision["continue_optimization"]]))
             optimization_id = f"round-{round_no:03d}-optimization"
-            optimization = ({k: v for k, v in saved[optimization_id].items() if k != "route_states"}
-                            if optimization_id in saved else self._ask_optimizer(round_ids, review_ids))
-            decisions, self.routes, self.proposals = self._check_optimization(optimization, review_ids)
+            review_id = f"round-{round_no:03d}-review"
+
+            # Existing optimizer decisions are immutable history. Replay their exact
+            # result only when no new review record exists for this round.
+            if review_id not in saved and optimization_id in saved \
+                    and "decisions" in saved[optimization_id]:
+                legacy = saved[optimization_id]
+                decisions = self._check_candidate_decisions(legacy["decisions"], review_ids)
+                self.decisions.update(decisions)
+                authorized_ids = [cid for cid, value in decisions.items()
+                                  if value["continue_optimization"]]
+                proposals = {"proposals": legacy["proposals"]}
+                self.routes, self.proposals = self._check_proposals(proposals, authorized_ids)
+                if "route_states" in legacy:
+                    require(self.routes == legacy["route_states"],
+                            "legacy optimizer route states differ from their saved proposals")
+                saved_route_action = "continue_optimization" if legacy["proposals"] else "end_direction"
+                return {**state, "continue_research": bool(legacy["proposals"]),
+                        "stop_reason": ("optimizer returned no authorized optimization proposals"
+                                        if not legacy["proposals"] else None),
+                        "evaluator_review_record_id": None,
+                        "round_action": saved_route_action,
+                        "legacy_decision_replay": True}
+
+            if review_id in saved:
+                review = saved[review_id]
+                require(review.get("round_no") == round_no
+                        and review.get("round_candidate_ids") == round_ids
+                        and review.get("review_candidate_ids") == review_ids,
+                        "saved evaluator review differs from the replayed A round")
+                require(set(review) == set(ROUND_REVIEW_SCHEMA["properties"])
+                        | {"round_no", "round_candidate_ids", "review_candidate_ids", "report_candidate_ids"},
+                        "saved evaluator review has unexpected fields")
+                report_ids = review["report_candidate_ids"]
+                response = {key: review[key] for key in (
+                    "round_action", "candidate_decisions", "information_request",
+                    "candidate_reports", "analysis")}
+                decisions, reports = self._check_round_review(response, review_ids, report_ids)
+            else:
+                report_ids = [cid for cid in review_ids
+                              if "evaluation" in self.candidates[cid]
+                              and "model_report" not in self.candidates[cid]]
+                response = self._review_round(
+                    round_no, round_ids, review_ids, report_ids, self.gateway,
+                    evaluator_review_ref=state.get("evaluator_review_ref"))
+                decisions, reports = self._check_round_review(response, review_ids, report_ids)
+                review = {**response, "round_no": round_no, "round_candidate_ids": round_ids,
+                          "review_candidate_ids": review_ids, "report_candidate_ids": report_ids}
+                self.store.append(review_id, "research_review", review)
+                saved[review_id] = review
+
             self.decisions.update(decisions)
+            for cid, report in reports.items():
+                self.candidates[cid]["model_report"] = report
+                record_data = {"candidate_id": cid, **report}
+                if f"{cid}-report" in saved:
+                    require(saved[f"{cid}-report"] == record_data,
+                            "saved A report differs from its evaluator review")
+                else:
+                    self.store.append(f"{cid}-report", "model_report", record_data)
+                    saved[f"{cid}-report"] = record_data
+
+            action = review["round_action"]
+            require(action in {"continue_ideation", "continue_optimization", "end_direction"},
+                    "saved evaluator review has an invalid round action")
+            evaluator_review_ref = (None if review["information_request"] is None else
+                                    {"record_id": review_id, "pointer": "/information_request"})
+            if action == "continue_ideation":
+                return {**state, "continue_research": True, "round_action": action,
+                        "evaluator_review_record_id": review_id,
+                        "evaluator_review_ref": evaluator_review_ref}
+            if action == "end_direction":
+                return {**state, "continue_research": False, "round_action": action,
+                        "stop_reason": "evaluator ended the current A research direction",
+                        "evaluator_review_record_id": review_id,
+                        "evaluator_review_ref": None}
+
+            authorized_ids = [cid for cid, value in decisions.items()
+                              if value["continue_optimization"]]
+            require(bool(authorized_ids), "continue_optimization requires evaluator-authorized candidates")
+            if optimization_id in saved:
+                optimization_record = saved[optimization_id]
+                require("decisions" not in optimization_record,
+                        "new evaluator review cannot be paired with a legacy optimizer decision record")
+                optimization = {"proposals": optimization_record["proposals"]}
+            else:
+                optimization = self._ask_optimizer(authorized_ids)
+            self.routes, self.proposals = self._check_proposals(optimization, authorized_ids)
             if optimization_id not in saved:
-                self.store.append(optimization_id, "optimization", {**optimization, "route_states": self.routes})
-            return {**state, "continue_research": bool(optimization["proposals"])}
+                optimization_record = {**optimization, "route_states": self.routes}
+                self.store.append(optimization_id, "optimization", optimization_record)
+                saved[optimization_id] = optimization_record
+            elif "route_states" in optimization_record:
+                require(self.routes == optimization_record["route_states"],
+                        "saved optimizer route states differ from its proposals")
+            return {**state, "continue_research": bool(optimization["proposals"]),
+                    "round_action": action, "evaluator_review_record_id": review_id,
+                    "evaluator_review_ref": evaluator_review_ref}
 
         def next_candidate(state):
-            return "calculate" if state["index"] < len(state["definitions"]) else "optimize"
+            return "calculate" if state["index"] < len(state["definitions"]) else "review"
 
         graph = StateGraph(dict)
         graph.add_node("ideate", self.progress.track("factor.A.ideate", ideate))
         graph.add_node("calculate", self.progress.track("factor.A.calculate", calculate))
         graph.add_node("evaluate", self.progress.track("factor.A.evaluate", evaluate_candidate))
-        graph.add_node("optimize", self.progress.track("factor.A.optimize", optimize))
+        graph.add_node("review", self.progress.track("factor.A.review", review))
         graph.add_edge(START, "ideate")
-        graph.add_conditional_edges("ideate", next_candidate, ["calculate", "optimize"])
+        graph.add_conditional_edges("ideate", next_candidate, ["calculate", "review"])
         graph.add_conditional_edges("calculate", lambda state: "evaluate" if state["computed"] else next_candidate(state),
-                                    ["evaluate", "calculate", "optimize"])
-        graph.add_conditional_edges("evaluate", next_candidate, ["calculate", "optimize"])
-        graph.add_conditional_edges("optimize", lambda state: "ideate" if state["continue_research"] else END,
+                                    ["evaluate", "calculate", "review"])
+        graph.add_conditional_edges("evaluate", next_candidate, ["calculate", "review"])
+        graph.add_conditional_edges("review", lambda state: "ideate" if state["continue_research"] else END,
                                     ["ideate", END])
         self.graph = graph.compile()
         final = self.graph.invoke({"round_no": 0}, config=GRAPH_CONFIG)
@@ -623,7 +742,7 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                                              if "evaluation" in item and "model_report" not in item],
                       "candidate_decisions": self.decisions,
                       "routes": self.routes, "proposals": self.proposals,
-                      "stop_reason": "optimizer returned no authorized optimization proposals"}
+                      "stop_reason": final["stop_reason"]}
         write_research_report(self.root / "A-report.md", self.spec.run_id, self.spec.purpose, self.store.all(), "A", replace=True)
         path = self.root / "a-complete.json"
         if path.exists():
@@ -675,8 +794,15 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                 data = record["data"]
                 key = "model_report" if record["kind"] == "model_report" else record["kind"]
                 self.candidates[data["candidate_id"]][key] = data
+            elif record["kind"] == "research_review":
+                self.decisions.update({decision["candidate_id"]: decision
+                                       for decision in record["data"]["candidate_decisions"]})
             elif record["kind"] == "optimization":
-                self.decisions.update({decision["candidate_id"]: decision for decision in record["data"]["decisions"]})
+                # Pre-review runs stored candidate decisions in optimizer records.
+                # Keep them readable for their saved checkpoint and B freeze.
+                if "decisions" in record["data"]:
+                    self.decisions.update({decision["candidate_id"]: decision
+                                           for decision in record["data"]["decisions"]})
 
     def freeze(self, candidate_ids: list[str], validation_universe: pd.Series) -> dict[str, Any]:
         require((self.root / "a-complete.json").exists(), "complete A exploration before freezing B")

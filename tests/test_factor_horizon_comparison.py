@@ -47,8 +47,8 @@ def _source_a(root: Path) -> dict:
         if request["role"] == "ideator":
             result["candidates"] = [definition("div(perp_close,ts_mean(perp_close,3))")]
             result["dispositions"] = []
-        elif request["role"] == "optimizer":
-            result["decisions"] = [research_decision("candidate-0001", "retain")]
+        elif request["role"] == "evaluator" and "candidate_decisions" in result:
+            result["candidate_decisions"] = [research_decision("candidate-0001", "retain")]
 
     miner = FactorMiner(spec, ScenarioModel(transform=transform, propose_once=False), source_runs)
     miner.explore(input_panel(spec))
@@ -228,8 +228,8 @@ class HorizonComparisonToolTests(unittest.TestCase):
                 reply = super().complete(messages, max_output_tokens=max_output_tokens, session_id=session_id)
                 request = json.loads(messages[1]["content"])
                 response = json.loads(reply.text)
-                if request["role"] == "optimizer" and "decisions" in response["result"]:
-                    for decision in response["result"]["decisions"]:
+                if request["role"] == "evaluator" and "candidate_decisions" in response["result"]:
+                    for decision in response["result"]["candidate_decisions"]:
                         if decision["disposition"] == "retain":
                             decision["retained_horizons"] = [24]
                     reply.text = dumps(response)

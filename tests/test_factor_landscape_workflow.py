@@ -14,7 +14,7 @@ import pandas as pd
 
 from crypto_quant.features.factor_expressions import compile_expression
 from crypto_quant.features.factor_inputs import FactorInputPanel, INPUT_COLUMNS
-from crypto_quant.research.factor_mining.agent_optimizer import RESEARCH_QUESTIONS
+from crypto_quant.research.factor_mining.agent_evaluator import RESEARCH_QUESTIONS
 from crypto_quant.research.factor_mining.contracts import ResearchSpec, dumps
 from crypto_quant.research.factor_mining.landscape import build_factor_landscape
 from crypto_quant.research.factor_mining.model import ModelReply
@@ -152,19 +152,31 @@ class ExploreGraphModel:
                       "repair_expression": payload["current_expression"],
                       "reason": "脚本模型保留无效公式以验证失败证据。"}
         elif role == "evaluator":
-            result = {"analysis": "脚本报告用于验证A历史保留。", "mechanism": "反转假设待检验。",
-                      "conditions": ["合成数据"], "falsifiers": ["不具研究效力"],
-                      "limitations": ["脚本模型不作有效性结论"], "next_steps": ["不开展真实研究"]}
-        elif role == "optimizer":
-            if payload["round_candidate_ids"]:
-                result = {
-                    "analysis": "脚本模型提供完整结构，仅检查任务流转。",
-                    "decisions": [
+            if "round_no" not in payload:
+                result = {"analysis": "脚本报告用于验证A历史保留。", "mechanism": "反转假设待检验。",
+                          "conditions": ["合成数据"], "falsifiers": ["不具研究效力"],
+                          "limitations": ["脚本模型不作有效性结论"], "next_steps": ["不开展真实研究"]}
+            else:
+                if payload["round_no"] == 1:
+                    decisions = [
                         self._decision("candidate-0001", "retain", True, "candidate-0001-evaluation"),
                         self._decision("candidate-0002", "pause", False, "candidate-0002-calculation"),
-                    ],
-                    "diagnostics": ["仅为集成夹具"],
-                    "proposals": [{
+                    ]
+                    round_action = "continue_optimization"
+                else:
+                    decisions = [self._decision("candidate-0001", "retain", False,
+                                                "candidate-0001-evaluation")]
+                    round_action = "end_direction"
+                report = {"analysis": "脚本报告用于验证A历史保留。", "mechanism": "反转假设待检验。",
+                          "conditions": ["合成数据"], "falsifiers": ["不具研究效力"],
+                          "limitations": ["脚本模型不作有效性结论"], "next_steps": ["不开展真实研究"]}
+                result = {"round_action": round_action, "candidate_decisions": decisions,
+                          "information_request": None,
+                          "candidate_reports": [{"candidate_id": cid, **report}
+                                                for cid in payload["report_candidate_ids"]],
+                          "analysis": "脚本评估只核对A研究流程，不代表有效性结论。"}
+        elif role == "optimizer":
+            result = {"proposals": [{
                         "proposal_id": "proposal-D", "route_id": "rank-displacement-route",
                         "control_id": "candidate-0001", "evidence_refs": ["candidate-0001-evaluation"],
                         "modification_task": {
@@ -183,14 +195,8 @@ class ExploreGraphModel:
                             "horizon_hours": 4, "displacement_hours": 1,
                         },
                         "restart_of": None, "new_evidence": None,
-                    }],
-                }
-                self.first_proposal = copy.deepcopy(result["proposals"][0])
-            else:
-                result = {"analysis": "脚本模型结束第二轮。",
-                          "decisions": [self._decision("candidate-0001", "retain", False,
-                                                        "candidate-0001-evaluation")],
-                          "diagnostics": ["仅为集成夹具"], "proposals": []}
+                    }]}
+            self.first_proposal = copy.deepcopy(result["proposals"][0])
         else:
             raise AssertionError(f"unexpected role: {role}")
         return ModelReply(dumps({"result": result, "read_records": []}), {}, "fixture")
@@ -304,7 +310,12 @@ class FactorLandscapeWorkflowTests(unittest.TestCase):
             self.assertNotIn("candidate-0002", dumps(request))
             landscape_record = next(record for record in request["records"]
                                     if record["id"] == landscape_ref["record_id"])
-            snapshot = landscape_record["data"]["snapshot"]
+            snapshot_ref = landscape_record["data"]["snapshot"]["members"]
+            self.assertEqual(snapshot_ref, {"record_id": landscape_ref["record_id"],
+                                            "pointer": "/snapshot/members", "rows": 2,
+                                            "read_records": "request an explicit offset and limit to read the complete saved factor landscape"})
+            snapshot = miner.store._load(
+                miner.store.root / f"{landscape_ref['record_id']}.json")["data"]["snapshot"]
             self.assertEqual(snapshot["status"], "computed")
             self.assertEqual({member["candidate_ref"] for member in snapshot["members"]}, {
                 "landscape-fixture/candidate-0001", "prior-run/candidate-0001"})

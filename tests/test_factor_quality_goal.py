@@ -3,6 +3,7 @@ import copy
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,6 +15,7 @@ from crypto_quant.research.factor_mining.contracts import dumps
 from crypto_quant.research.factor_mining.evaluation import evaluate_factor
 from crypto_quant.research.factor_mining.goal import GoalRunner, GoalSpec
 from crypto_quant.research.factor_mining.model import ModelReply
+from crypto_quant.research.data_policy import factor_usage
 
 
 TARGET = {"metric": "rank_displacement", "horizon_hours": 24, "displacement_hours": 1,
@@ -31,14 +33,20 @@ class QualityModel(GoalModel):
         request = json.loads(messages[1]["content"])
         if "goal_phase" in request["payload"]:
             return super().complete(messages, max_output_tokens=max_output_tokens, session_id=session_id)
+        if (request["role"] == "optimizer" and self.weaken
+                and "response_error" in json.loads(messages[-1]["content"])):
+            # Stop the scripted run after rejection; an optimizer cannot end the direction.
+            raise KeyboardInterrupt()
         reply = self.factor_model.complete(messages, max_output_tokens=max_output_tokens, session_id=session_id)
-        if request["role"] == "optimizer":
+        if request["role"] == "evaluator" and "round_no" in request["payload"]:
             result = json.loads(reply.text)
-            for decision in result["result"]["decisions"]:
+            for decision in result["result"]["candidate_decisions"]:
                 decision["retained_horizons"] = self.horizons
-            if self.weaken:
-                for proposal in result["result"]["proposals"]:
-                    proposal["experiment_design"]["min_improvement"] = 0.00001
+            return ModelReply(dumps(result), reply.usage, reply.model)
+        if request["role"] == "optimizer" and self.weaken:
+            result = json.loads(reply.text)
+            for proposal in result["result"]["proposals"]:
+                proposal["experiment_design"]["min_improvement"] = 0.00001
             return ModelReply(dumps(result), reply.usage, reply.model)
         return reply
 
@@ -47,6 +55,8 @@ class QualityGoalTests(unittest.TestCase):
     def create(self, directory, *, stable=False, model=None, cycles=1):
         spec = _spec()
         a, b = _panel(spec, "A"), _panel(spec, "B")
+        # Exercise research admission while identifying the synthetic input as engineering data.
+        a.diagnostics["data_usage"] = factor_usage(replace(spec, purpose="engineering_check"), "A")
         if not stable:
             a.values["perp_close"] = 100 + np.random.default_rng(14).normal(0, 1, len(a.values))
         goal = GoalSpec("quality-fixture", "研究有依据的差异与配对改善", quality_target=copy.deepcopy(TARGET),
@@ -172,12 +182,18 @@ class QualityGoalTests(unittest.TestCase):
     def test_optimizer_cannot_weaken_frozen_quality_target(self):
         with tempfile.TemporaryDirectory() as directory:
             runner, a, b = self.create(directory, model=QualityModel(weaken=True))
-            result = self.run_goal(runner, a, b)
-            self.assertEqual(result["status"], "budget_exhausted")
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_goal(runner, a, b)
+            self.assertEqual(runner.state["status"], "paused")
             comparisons = list((runner.root / "runs").glob("*/a_records/*-comparison.json"))
             self.assertFalse(comparisons)
             calls = list((runner.root / "runs").glob("*/model_calls/*-response.json"))
             self.assertTrue(calls)
             records = list((runner.root / "runs").glob("*/a_records/*.json"))
             self.assertTrue(any("frozen Goal quality target" in path.read_text() for path in records))
+            self.assertFalse(list((runner.root / "runs").glob("*/a_records/*-optimization.json")))
+            reviews = list((runner.root / "runs").glob("*/a_records/*-review.json"))
+            self.assertEqual(len(reviews), 1)
+            self.assertEqual(json.loads(reviews[0].read_text())["data"]["round_action"],
+                             "continue_optimization")
             self.assertEqual(runner.state["qualified_ideas"], [])
