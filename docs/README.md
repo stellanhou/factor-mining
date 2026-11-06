@@ -13,3 +13,9 @@
 - [因子挖掘Agent改造Plan](plans/因子挖掘Agent改造Plan.md)
 - [2026-09-19-factor-mining-goal-v22-deadlock-and-lookback-error](postmortems/2026-09-19-factor-mining-goal-v22-deadlock-and-lookback-error.md)
 - [构想 Agent 信息获取循环改造 Plan（已实现）](plans/构想Agent信息获取循环改造Plan_20261011.md)
+- [因子挖掘 DeepSeek Harness 三会话实施 Plan（当前方案）](plans/因子挖掘DeepSeekHarness三会话实施Plan_20261017.md)
+- [因子挖掘原生聊天合成验收说明](guides/因子挖掘原生聊天合成验收说明.md)
+- [因子挖掘原生三会话 P2-P5 实施核验（2026-10-15）](reports/因子挖掘原生三会话P2-P5实施核验_20261015.md)
+
+- [DSH 因子研究本地安装与操作](guides/因子挖掘DSH本地安装与操作.md)
+- [DSH 本地工程交付与验收（2026-10-18）](reports/DSH本地工程交付与验收_20261018.md)
