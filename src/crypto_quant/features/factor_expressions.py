@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -229,7 +229,10 @@ def wilder_rsi(values: pd.DataFrame, periods: int) -> pd.DataFrame:
     return result
 
 
-def evaluate_expression(expression: str, panel: FactorInputPanel) -> ExpressionResult:
+def evaluate_expression(expression: str, panel: FactorInputPanel, *,
+                        stop_check: Callable[[], Any] | None = None) -> ExpressionResult:
+    if stop_check is not None:
+        stop_check()
     compiled = compile_expression(expression)
     universe = validate_universe(panel.universe)
     if not panel.values.index.equals(universe.index):
@@ -244,6 +247,8 @@ def evaluate_expression(expression: str, panel: FactorInputPanel) -> ExpressionR
         return pd.DataFrame(number, index=members.index, columns=members.columns)
 
     def evaluate(node: ast.AST) -> pd.DataFrame:
+        if stop_check is not None:
+            stop_check()
         if isinstance(node, (ast.Constant, ast.UnaryOp)):
             return constant(_number(node))
         if isinstance(node, ast.Name):
@@ -296,8 +301,12 @@ def evaluate_expression(expression: str, panel: FactorInputPanel) -> ExpressionR
                     output = output.where(valid)
                 elif name == "ts_cov": output = rolling.cov(args[1], pairwise=False, ddof=0)
                 else: raise RuntimeError(f"operator has no implementation: {name}")
+        if stop_check is not None:
+            stop_check()
         return output.where(np.isfinite(output))
 
     calculated = evaluate(compiled.tree).where(members)
+    if stop_check is not None:
+        stop_check()
     result = pd.Series(calculated.to_numpy().reshape(-1), index=universe.index, name="factor_value")
     return ExpressionResult(result, compiled.description(), pd.DataFrame(counts, index=members.index))

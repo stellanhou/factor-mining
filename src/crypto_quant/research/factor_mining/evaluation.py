@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from statistics import NormalDist
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -104,7 +104,10 @@ def _summary(frame: pd.DataFrame, spec: ResearchSpec, direction: int) -> dict[st
 
 
 def evaluate_factor(values: pd.Series, labels: pd.DataFrame, spec: ResearchSpec, stage: str,
-                    direction: int, *, horizon_hours: int = 24) -> dict[str, Any]:
+                    direction: int, *, horizon_hours: int = 24,
+                    stop_check: Callable[[], Any] | None = None) -> dict[str, Any]:
+    if stop_check is not None:
+        stop_check()
     require(horizon_hours in (1, 4, 24), "supported horizons: 1, 4, 24 hours")
     require(stage == "A" or horizon_hours in spec.b_horizons,
             "B horizon must be declared by the research contract")
@@ -117,6 +120,8 @@ def evaluate_factor(values: pd.Series, labels: pd.DataFrame, spec: ResearchSpec,
     rows = []
     sampled = frame.loc[frame.index.get_level_values("timestamp").isin(times)]
     for timestamp in times:
+        if stop_check is not None:
+            stop_check()
         group = sampled.xs(timestamp, level="timestamp")
         eligible = group.loc[group["eligible"] & ~group["purged"]]
         clean = eligible[["factor", "forward_return"]].replace([np.inf, -np.inf], np.nan).dropna()
@@ -152,6 +157,8 @@ def evaluate_factor(values: pd.Series, labels: pd.DataFrame, spec: ResearchSpec,
     stages = []
     stage_index = ((periods.index - start) // pd.Timedelta(hours=spec.stage_hours)).astype(int)
     for _, part in periods.groupby(stage_index):
+        if stop_check is not None:
+            stop_check()
         stages.append({"start": part.index.min(), "end": part.index.max(), **_summary(part, spec, direction)})
     stage_valid = [s for s in stages if s["rank_ic"]["n"] >= spec.min_periods
                    and s["directional_spread"]["n"] >= spec.min_periods]
@@ -164,6 +171,8 @@ def evaluate_factor(values: pd.Series, labels: pd.DataFrame, spec: ResearchSpec,
     periods = periods.join(rolling)
     per_symbol = []
     for symbol, part in sampled.groupby(level="symbol"):
+        if stop_check is not None:
+            stop_check()
         valid = part.loc[part["eligible"] & ~part["purged"], ["factor", "forward_return"]].dropna()
         per_symbol.append({"symbol": symbol, "n": len(valid), "mean_forward_return": valid["forward_return"].mean(),
                            "factor_mean": valid["factor"].mean()})
@@ -180,18 +189,22 @@ def evaluate_factor(values: pd.Series, labels: pd.DataFrame, spec: ResearchSpec,
 
 
 def evaluate_horizon_comparison(values: pd.Series, labels_by_horizon: dict[int, pd.DataFrame],
-                                spec: ResearchSpec, direction: int, *, stage: str = "A") -> dict[str, Any]:
+                                spec: ResearchSpec, direction: int, *, stage: str = "A",
+                                stop_check: Callable[[], Any] | None = None) -> dict[str, Any]:
     """Compare a fixed factor on identical observations; retain the contract's HAC bandwidth."""
     common = np.isfinite(values)
     for labels in labels_by_horizon.values():
         common = common & labels["eligible"] & np.isfinite(labels["forward_return"])
     reports = {}
     for horizon in (1, 4, 24):
+        if stop_check is not None:
+            stop_check()
         labels = labels_by_horizon[horizon].copy()
         # Use the same boundary and asset mask so all three rank sorts are identical.
         labels["purged"] = labels_by_horizon[24]["purged"]
         reports[str(horizon)] = evaluate_factor(
-            values.where(common), labels, spec, stage, direction, horizon_hours=horizon)
+            values.where(common), labels, spec, stage, direction, horizon_hours=horizon,
+            stop_check=stop_check)
     return {"interpretation": f"{stage}-stage horizon comparison on common finite observations and the 24h boundary; "
             "same formula, direction, groups and HAC bandwidth. Unadjusted exploratory p-values; "
             "batch admission is computed separately. Returns exclude trading costs and funding.",
@@ -232,7 +245,10 @@ def correct_batch(reports: dict[str, dict[str, Any]], spec: ResearchSpec) -> dic
 
 
 def compare_experiment(report: dict[str, Any], control: dict[str, Any], plan: dict[str, Any],
-                       spec: ResearchSpec) -> dict[str, Any]:
+                       spec: ResearchSpec, *,
+                       stop_check: Callable[[], Any] | None = None) -> dict[str, Any]:
+    if stop_check is not None:
+        stop_check()
     require(report["segment"] == control["segment"] == "A", "optimization comparisons use A only")
     require(report["direction"] == control["direction"], "a controlled modification cannot flip direction")
     trial = pd.DataFrame(report["periods"]).set_index("timestamp")
@@ -247,8 +263,11 @@ def compare_experiment(report: dict[str, Any], control: dict[str, Any], plan: di
     if delta["ci"] and ic_delta["ci"]:
         if delta["ci"][1] < design["min_improvement"] or ic_delta["ci"][1] < -design["max_ic_loss"]:
             state, reason = "stop", "upper confidence bound is below the predeclared improvement or IC-loss limit"
-        elif delta["ci"][0] >= design["min_improvement"] and ic_delta["ci"][0] >= -design["max_ic_loss"]:
-            state, reason = "continue", "paired lower bounds meet the predeclared improvement and IC-loss limits"
+        elif (delta["mean"] >= design["min_improvement"] and delta["ci"][0] > 0
+              and ic_delta["ci"][0] >= -design["max_ic_loss"]):
+            state, reason = "continue", "paired mean meets the improvement limit, its lower bound is positive, and the IC-loss limit holds"
+    if stop_check is not None:
+        stop_check()
     return {"plan": plan, "paired_improvement": delta, "paired_ic_change": ic_delta,
             "decision": state, "reason": reason,
             "scope": "adaptive A-stage diagnostic, not independent validation"}
@@ -328,7 +347,8 @@ def _displacement_stages(periods: pd.DataFrame, start: pd.Timestamp, spec: Resea
 
 
 def evaluate_rank_displacement(values: pd.Series, universe: pd.Series, spec: ResearchSpec,
-                               stage: str) -> dict[str, Any]:
+                               stage: str, *,
+                               stop_check: Callable[[], Any] | None = None) -> dict[str, Any]:
     """Describe exact-hour cross-sectional rank changes for 1h, 4h and 24h.
 
     Each endpoint is sorted only over symbols that are eligible and finite at
@@ -348,6 +368,8 @@ def evaluate_rank_displacement(values: pd.Series, universe: pd.Series, spec: Res
     result: dict[str, Any] = {"definition_version": RANK_DISPLACEMENT_VERSION, "segment": stage, "deltas": {}}
 
     for delta in RANK_DISPLACEMENT_HOURS:
+        if stop_check is not None:
+            stop_check()
         n_times = len(times)
         previous_factor = np.full_like(factor, np.nan, dtype=float)
         previous_eligible = np.zeros_like(eligible, dtype=bool)
@@ -445,8 +467,11 @@ def _rank_correlation(left: np.ndarray, right: np.ndarray, mask: np.ndarray) -> 
 
 def compare_rank_displacement_experiment(trial_values: pd.Series, control_values: pd.Series,
                                          labels: pd.DataFrame, spec: ResearchSpec, direction: int,
-                                         plan: dict[str, Any], *, universe: pd.Series) -> dict[str, Any]:
+                                         plan: dict[str, Any], *, universe: pd.Series,
+                                         stop_check: Callable[[], Any] | None = None) -> dict[str, Any]:
     """Compare D and frozen-direction Rank IC on strict common A-stage samples."""
+    if stop_check is not None:
+        stop_check()
     require(direction in {-1, 1}, "direction must be frozen before evaluation")
     require(isinstance(universe, pd.Series), "universe must be a Series")
     require(trial_values.index.equals(control_values.index), "trial and control indices differ")
@@ -536,6 +561,8 @@ def compare_rank_displacement_experiment(trial_values: pd.Series, control_values
               & np.isfinite(trial_values_matrix) & np.isfinite(control_values_matrix)
               & np.isfinite(trial_previous) & np.isfinite(control_previous))
     common_counts = common.sum(axis=1).astype(np.int64)
+    if stop_check is not None:
+        stop_check()
     trial_displacement, trial_unique, trial_previous_unique = _rank_displacement_rows(
         trial_values_matrix, trial_previous, common)
     control_displacement, control_unique, control_previous_unique = _rank_displacement_rows(
@@ -582,8 +609,9 @@ def compare_rank_displacement_experiment(trial_values: pd.Series, control_values
         state, reason = "stop", "an estimated upper confidence bound is below its predeclared D improvement or IC-loss limit"
     elif (improvement_summary["status"] == "estimated" and ic_summary["status"] == "estimated"
           and improvement_ci and ic_ci
-          and improvement_ci[0] >= minimum_improvement and ic_ci[0] >= -maximum_ic_loss):
-        state, reason = "continue", "paired lower bounds meet the predeclared D improvement and IC-loss limits"
+          and improvement_summary["mean"] >= minimum_improvement and improvement_ci[0] > 0
+          and ic_ci[0] >= -maximum_ic_loss):
+        state, reason = "continue", "paired D mean meets its predeclared limit, its lower bound is positive, and the IC-loss limit holds"
 
     eligible_now = eligible.sum(axis=1)
     eligible_previous_count = eligible_previous.sum(axis=1)
@@ -594,6 +622,8 @@ def compare_rank_displacement_experiment(trial_values: pd.Series, control_values
                              out=np.full(n_times, np.nan, dtype=float), where=eligible_union > 0)
     paired_periods = []
     for i, timestamp in enumerate(times):
+        if stop_check is not None:
+            stop_check()
         paired_periods.append({
             "timestamp": timestamp,
             "status": period_status[i],

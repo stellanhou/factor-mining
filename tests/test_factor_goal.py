@@ -852,12 +852,12 @@ class GoalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             runner, _, _ = self.create(directory)
             args = parser.parse_args(["goal-status", "--goal-dir", str(runner.root)])
-            with patch("crypto_quant.research.factor_mining.model_config.CodexModel") as model:
+            with patch("crypto_quant.research.factor_mining.model_config._codex_model") as model:
                 result = execute(args)
                 model.assert_not_called()
             self.assertEqual(result["phase"], "select_task")
             resume = parser.parse_args(["goal-resume", "--goal-dir", str(runner.root)])
-            with patch("crypto_quant.research.factor_mining.model_config.CodexModel") as model, patch(
+            with patch("crypto_quant.research.factor_mining.model_config._codex_model") as model, patch(
                     "crypto_quant.research.factor_mining.cli._run_goal") as run:
                 model.return_value.settings.return_value = SETTINGS
                 execute(resume)

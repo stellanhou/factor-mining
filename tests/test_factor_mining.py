@@ -1065,7 +1065,39 @@ class WorkflowTests(unittest.TestCase):
         uncertain = compare_experiment(report(base_values + rng.normal(0, .5, 300)), base, plans, spec)
         self.assertEqual(supported["decision"], "continue")
         self.assertEqual(stopped["decision"], "stop")
+        self.assertLess(uncertain["paired_improvement"]["mean"], plans["experiment_design"]["min_improvement"])
+        self.assertGreaterEqual(uncertain["paired_improvement"]["ci"][1],
+                                plans["experiment_design"]["min_improvement"])
         self.assertEqual(uncertain["decision"], "pause_insufficient")
+
+    def test_predeclared_mean_at_threshold_and_positive_lower_bound_can_continue(self):
+        spec = specification()
+        rng = np.random.default_rng(55)
+        grid = pd.date_range("2026-01-01", periods=300, freq="h", tz="UTC")
+        base_values = rng.normal(0, 0.1, 300)
+
+        def report(values):
+            return {"segment": "A", "direction": 1, "periods": [
+                {"timestamp": t.isoformat(), "rank_ic": float(x), "directional_spread": float(x / 100)}
+                for t, x in zip(grid, values)]}
+
+        plan = experiment()
+        threshold_noise = rng.normal(0, 0.03, 300)
+        threshold_noise -= threshold_noise.mean()
+        at_threshold = compare_experiment(report(base_values + 0.01 + threshold_noise),
+                                          report(base_values), plan, spec)
+        self.assertAlmostEqual(at_threshold["paired_improvement"]["mean"], 0.01)
+        self.assertGreater(at_threshold["paired_improvement"]["ci"][0], 0)
+        self.assertLess(at_threshold["paired_improvement"]["ci"][0], 0.01)
+        self.assertEqual(at_threshold["decision"], "continue")
+
+        above_noise = rng.normal(0, 0.12, 300)
+        above_threshold = compare_experiment(report(base_values + 0.02 + above_noise),
+                                             report(base_values), plan, spec)
+        self.assertGreater(above_threshold["paired_improvement"]["mean"], 0.01)
+        self.assertGreater(above_threshold["paired_improvement"]["ci"][0], 0)
+        self.assertLess(above_threshold["paired_improvement"]["ci"][0], 0.01)
+        self.assertEqual(above_threshold["decision"], "continue")
 
     def test_missing_meaning_does_not_block_formula_calculation(self):
         spec, model = specification(), Mock()

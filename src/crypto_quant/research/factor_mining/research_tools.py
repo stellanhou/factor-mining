@@ -8,6 +8,7 @@ from typing import Any
 
 from .contracts import dumps, identifier, require
 from .model import RecoverableToolError
+from .records import InvalidRecordPointer
 
 
 _SEARCH_LIMIT = 20
@@ -102,7 +103,9 @@ class AResearchEvidenceTools:
                 "description": (
                     "Read one authorized immutable A-segment record by its record ID, JSON pointer "
                     "and page. offset/limit page only arrays; for large objects, request a narrower "
-                    "JSON pointer. No filesystem paths are accepted."
+                    "JSON pointer. Oversized responses return a narrowing hint without content. "
+                    "Use exact source pointers supplied by an action result or search match; do not "
+                    "infer source paths from compact result field names. No filesystem paths are accepted."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -163,14 +166,20 @@ class AResearchEvidenceTools:
                 "use a JSON pointer into A record data")
         require(type(offset) is int and offset >= 0 and type(limit) is int and limit > 0,
                 "invalid A evidence page")
-        if record_id in self.allowed_record_ids:
-            _require_source_a_only(self._records[record_id])
-            data = self.store.read(record_id, pointer, offset, limit)
-        elif record_id in self.allowed_history_record_ids and self.history_reader is not None:
-            self._require_history_record_a_only(record_id)
-            data = self.history_reader(record_id, pointer, offset, limit)
-        else:
-            raise ValueError("record ID is outside the authorized A evidence set")
+        try:
+            if record_id in self.allowed_record_ids:
+                _require_source_a_only(self._records[record_id])
+                data = self.store.read(record_id, pointer, offset, limit)
+            elif record_id in self.allowed_history_record_ids and self.history_reader is not None:
+                self._require_history_record_a_only(record_id)
+                data = self.history_reader(record_id, pointer, offset, limit)
+            else:
+                raise ValueError("record ID is outside the authorized A evidence set")
+        except InvalidRecordPointer as exc:
+            raise RecoverableToolError(
+                f"JSON pointer {pointer!r} does not resolve in authorized A record {record_id}; "
+                f"component {exc.component!r} is missing. Use an exact pointer from "
+                "evaluate_candidate.evidence_pointers or search_a_evidence.") from None
         _require_a_only(data)
         response = {"record_id": record_id, "pointer": pointer, "offset": offset,
                     "limit": limit, "data": data}

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -14,7 +15,9 @@ from test_factor_rank_displacement_workflow import DeterministicModel, _panel, _
 from crypto_quant.research.factor_mining.contracts import dumps
 from crypto_quant.research.factor_mining.evaluation import evaluate_factor
 from crypto_quant.research.factor_mining.goal import GoalRunner, GoalSpec
+from crypto_quant.research.factor_mining.goal_evidence import quality_evidence
 from crypto_quant.research.factor_mining.model import ModelReply
+from crypto_quant.research.factor_mining.records import RecordStore
 from crypto_quant.research.data_policy import factor_usage
 
 
@@ -78,6 +81,29 @@ class QualityGoalTests(unittest.TestCase):
                    side_effect=evaluation or self.passing_B):
             return runner.run(lambda: a, lambda: b, lambda: b.universe, runner.root / "ideas",
                               poll_seconds=1)
+
+    def test_quality_uses_mean_threshold_and_strictly_positive_improvement_lower_bound(self):
+        def check(*, mean, lower_bound):
+            with tempfile.TemporaryDirectory() as directory:
+                plan = {"control_id": "control-1", "experiment_design": {
+                    "metric": "rank_displacement", "horizon_hours": 24, "displacement_hours": 1,
+                    "min_improvement": TARGET["min_improvement"], "max_ic_loss": TARGET["max_ic_loss"]}}
+                comparison = {
+                    "candidate_id": "candidate-1", "plan": plan, "horizon_hours": 24,
+                    "displacement_hours": 1, "route_decision": "continue",
+                    "paired_improvement": {"status": "estimated", "mean": mean,
+                                            "ci": [lower_bound, max(lower_bound, 0.03)]},
+                    "paired_ic_change": {"status": "estimated", "mean": 0.0, "ci": [-0.1, 0.1]},
+                }
+                store = RecordStore(Path(directory))
+                store.append("candidate-1-comparison", "experiment_result", comparison)
+                miner = SimpleNamespace(candidates={"candidate-1": {"experiment": plan}}, store=store)
+                goal = SimpleNamespace(quality_target=TARGET)
+                return quality_evidence(goal, miner, "candidate-1", [24])["passed"]
+
+        self.assertTrue(check(mean=0.01, lower_bound=0.005))
+        self.assertFalse(check(mean=0.01, lower_bound=0.0))
+        self.assertFalse(check(mean=0.009, lower_bound=0.001))
 
     def test_quality_contract_is_explicit_and_exclusive(self):
         goal = GoalSpec("quality", "配对质量", quality_target=TARGET, max_cycles=12)

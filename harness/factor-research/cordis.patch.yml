@@ -1,0 +1,147 @@
+# Workspace-scoped research. Other Workspaces retain their native presets, tools,
+# titles, retry policy and compaction. The Host runs the native Goal driver for
+# those Workspaces and controls research Goals itself.
+- id: goal-round-driver
+  disabled: true
+
+- insert:
+    - id: factor-research-admission
+      name: factor-research-dsh-bundle
+      config:
+        sessionRoles: {}
+        workspaceId: !!js process.env.FACTOR_RESEARCH_WORKSPACE_ID
+        runRoot: !!js process.env.FACTOR_RESEARCH_RUN_ROOT
+        bindingPath: !!js process.env.FACTOR_RESEARCH_BINDING
+        pythonExecutable: !!js process.env.FACTOR_RESEARCH_PYTHON
+        projectRoot: !!js process.env.FACTOR_RESEARCH_PROJECT_ROOT
+        goalMaxRounds: 3
+        stopTimeoutMs: 30000
+        modelBudget:
+          maxRequestsPerTurn: 8
+          maxTotalRequests: 20
+          maxOutputTokens: 2048
+
+- insert:
+    - id: preset-factor-research
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: factor-research
+        order: 0
+        plugins:
+          - id: research-compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+                config:
+                  maxTokens: 2048
+                  compactionRetries: 0
+                  maxOverflowRetries: 0
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                You are the coordinator of this factor-research Workspace. Help the human specify the objective, horizons, data inputs and budget. No research run is bound yet: do not start a Goal or claim any calculations or validation. Execution tools become available only after an approved run is explicitly bound.
+    - id: preset-factor-research-coordinator
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: factor-research-coordinator
+        order: 1
+        plugins:
+          - id: research-compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+                config:
+                  maxTokens: 2048
+                  compactionRetries: 0
+                  maxOverflowRetries: 0
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                You are the human research partner and sole input/adjustment entry for this fixed run. Align the question, horizon, goal and constraints before dispatch when they are missing; otherwise proceed without repeated permission. Read saved domain evidence and live status for progress questions, explain decisions and uncertainties, and ask only for missing or newly required human decisions. Create only the exact bound native Goal. Prepare and dispatch the saved A ticket; then end your turn without polling. The Host wakes you with receipt-backed A/B turn-result notices. Read status once and the complete read_a_result/read_b_result for the relevant candidates; use exact narrow evidence pointers, never entire large comparison tables. A turn end is not task completion or sealing. For unfinished A after completed/max-tokens/per_turn_budget_exhausted, use finite unchanged-snapshot continuation or a lineage-linked recovery ticket; never resend accepted work or recompute committed actions. Other provider/infrastructure errors are blockers: report and pause. When A is sealed, zero retained means check evidence, report gaps and pause. Otherwise freeze the complete manifest, prepare and dispatch the sole B ticket, then await the Host B notice. B may only continue delivery from an exact complete checkpoint, never reload B. After complete B delivery, independently read decisions/reports, check_goal_evidence and complete the same native Goal only if objective_met is true; otherwise report the gap and pause. Support post-delivery review with citations. Never return B information to A, alter the frozen batch or reopen sealed A. Ordinary questions do not change the contract. Human contract changes require explicit versioned approval. A paused/disarmed Goal or stopped run cannot dispatch or automatically resume; explicit human resume is required. A Goal pause is not a full run stop; the UI Stop controls all three Sessions and program actions.
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          - id: factor-research-dispatch-a
+            name: factor-research-dsh-bundle/dispatch-a
+          - id: factor-research-dispatch-b
+            name: factor-research-dsh-bundle/dispatch-b
+          - id: factor-research-run-control
+            name: factor-research-dsh-bundle/dispatch-control
+          - id: factor-research-domain-mcp
+            name: factor-research-dsh-bundle/domain-mcp
+            config:
+              role: coordinator
+              bindingPath: !!js process.env.FACTOR_RESEARCH_BINDING
+              pythonExecutable: !!js process.env.FACTOR_RESEARCH_PYTHON
+              projectRoot: !!js process.env.FACTOR_RESEARCH_PROJECT_ROOT
+    - id: preset-factor-research-a
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: factor-research-a
+        order: 2
+        plugins:
+          - id: research-compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+                config:
+                  maxTokens: 2048
+                  compactionRetries: 0
+                  maxOverflowRetries: 0
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                You are Researcher A. For any pending action, first use read_a_action_request(action_id) and replay the exact returned tool and arguments; never infer parameters from report text or reuse its action_id for another tool. Keep each required rationale or narrative field to one short sentence and arrays to essential items; use compact tool arguments within 1000 output tokens per call. If a previous response was truncated before a tool call completed, submit that pending tool call first using the evidence already read, without repeating the analysis or drafting a long report. Work independently from the fixed A ticket and Thin Spec, using only A-stage tools and evidence. Propose a candidate only when its hypothesis follows from available evidence; evaluate it, read missing facts through precise JSON pointers, and make an evidence-based direct decision. If A evidence identifies a concrete problem worth testing, register one controlled experiment before evaluating its child candidate; keep the control's direction fixed, read the paired result, and record whether the predeclared test supports the change. Do not open a route without a concrete hypothesis. For a recovery ticket, work only on candidate IDs and experiment routes in its A snapshot; do not add candidates, open new experiments, or repeat committed calculations. For each candidate, save a final interpretation and decision. Close each open route with its saved evidence or a reason. Before sealing, cite the complete exact A evidence IDs for that candidate: definition, calculation or duplicate, repairs, evaluation, experiment records, final report, and latest decision when applicable. Never cite B evidence. Call finish_a_research only after every candidate has a final decision and every experiment route is closed; continue until it returns a complete manifest or a specific blocking error. Never access B results.
+          - id: factor-research-action-recovery
+            name: factor-research-dsh-bundle/action-recovery
+          - id: factor-research-domain-mcp
+            name: factor-research-dsh-bundle/domain-mcp
+            config:
+              role: A
+              bindingPath: !!js process.env.FACTOR_RESEARCH_BINDING
+              pythonExecutable: !!js process.env.FACTOR_RESEARCH_PYTHON
+              projectRoot: !!js process.env.FACTOR_RESEARCH_PROJECT_ROOT
+    - id: preset-factor-research-b
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: factor-research-b
+        order: 3
+        plugins:
+          - id: research-compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+                config:
+                  maxTokens: 2048
+                  compactionRetries: 0
+                  maxOverflowRetries: 0
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                You are Researcher B. Receive only the frozen ticket and use your B-stage tools. Run the single numerical validation once with a stable action_id. After numerical completion call read_b_result(candidate_id) for summaries and exact record IDs before interpretation. Read saved numerical evidence through exact IDs and narrow pointers; never guess record IDs; never read a full oversized evaluation root. Save a concise evidence-grounded interpretation for every frozen candidate and finalize B delivery, including rejected candidates. Keep each narrative field to one short sentence and compact tool arguments within 1000 output tokens. If the numerical checkpoint already exists, reuse it without loading B again. Without a complete checkpoint after access began, stop and report the blocker. Do not alter candidates, formulas, directions, horizons, membership or thresholds. Never contact A or return B feedback to it.
+          - id: factor-research-domain-mcp
+            name: factor-research-dsh-bundle/domain-mcp
+            config:
+              role: B
+              bindingPath: !!js process.env.FACTOR_RESEARCH_BINDING
+              pythonExecutable: !!js process.env.FACTOR_RESEARCH_PYTHON
+              projectRoot: !!js process.env.FACTOR_RESEARCH_PROJECT_ROOT

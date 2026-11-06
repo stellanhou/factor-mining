@@ -1,0 +1,44 @@
+{
+  "name": "factor-research-dsh-bundle",
+  "version": "0.4.4",
+  "private": true,
+  "type": "module",
+  "main": "./src/host.js",
+  "exports": {
+    ".": "./src/host.js",
+    "./client": "./src/client.js",
+    "./dispatch-a": "./src/dispatch-a.js",
+    "./dispatch-b": "./src/dispatch-b.js",
+    "./dispatch-control": "./src/dispatch-control.js",
+    "./domain-mcp": "./src/domain-mcp.js",
+    "./action-recovery": "./src/action-recovery.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "src/*.js",
+    "README.md"
+  ],
+  "engines": {
+    "dsh": "0.2.1-rc.2"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-mcp-client": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-goal-round-driver": "0.2.1-rc.2"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

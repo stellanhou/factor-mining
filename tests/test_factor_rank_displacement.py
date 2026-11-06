@@ -246,6 +246,26 @@ def test_d_upper_bound_can_stop_when_common_ic_change_is_degenerate():
     assert result["paired_improvement"]["grid_periods"] == result["paired_ic_change"]["grid_periods"]
 
 
+def test_positive_d_improvement_can_continue_when_lower_bound_is_below_threshold():
+    spec = make_spec(hours=120, min_symbols=4)
+    hours, index, universe = panel(spec)
+    trial_matrix = np.tile(np.arange(6, dtype=float), (len(hours), 1))
+    control_matrix = trial_matrix.copy()
+    changes = np.random.default_rng(101).random(len(hours)) < 0.3
+    control_matrix[changes, 2], control_matrix[changes, 3] = trial_matrix[changes, 3], trial_matrix[changes, 2]
+    labels = make_labels(index, 1, np.tile(np.arange(6, dtype=float), len(hours)))
+
+    result = compare_rank_displacement_experiment(
+        series_from_matrix(index, trial_matrix), series_from_matrix(index, control_matrix),
+        labels, spec, 1, rank_plan(min_improvement=0.02, max_ic_loss=0.2), universe=universe)
+
+    improvement = result["paired_improvement"]
+    assert improvement["mean"] >= 0.02
+    assert 0 < improvement["ci"][0] < 0.02
+    assert result["paired_ic_change"]["ci"][0] >= -0.2
+    assert result["decision"] == "continue"
+
+
 def test_tied_factor_ic_requires_the_existing_group_count_of_distinct_values():
     spec = make_spec(hours=120, min_symbols=6, groups=3)
     hours, index, universe = panel(spec)

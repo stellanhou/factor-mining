@@ -6,7 +6,6 @@ cannot repair a formula or send feedback into the exploration loop.
 
 from __future__ import annotations
 
-import ast
 import json
 import os
 from datetime import datetime, timezone
@@ -16,16 +15,18 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
-from crypto_quant.features.factor_expressions import compile_expression, evaluate_expression
+from crypto_quant.features.factor_expressions import evaluate_expression
 from crypto_quant.features.factor_inputs import FactorInputPanel, INPUT_COLUMNS, validate_universe
 from crypto_quant.research.progress import ProgressLog
-from .agent_calculator import CalculatorRole, FormulaBudgetError
+from .agent_calculator import CalculatorRole
+from .research_actions import (ResearchActions, _latest_model_reports, compare_candidates,
+                               compile_factor_formula, evaluate_a_candidate)
 from .agent_evaluator import EvaluatorRole, ROUND_REVIEW_SCHEMA
 from .agent_ideator import IdeatorRole
 from .agent_optimizer import OptimizerRole
-from .contracts import ResearchSpec, dumps, require, without_hash_metadata
+from .contracts import ResearchSpec, dumps, identifier, require
 from .evaluation import (build_labels, compare_experiment, compare_rank_displacement_experiment,
-                         correct_batch, evaluate_factor, evaluate_horizon_comparison,
+                         evaluate_factor, evaluate_horizon_comparison,
                          RANK_DISPLACEMENT_VERSION,
                          evaluate_rank_displacement)
 from .factor_archive import EvaluationKey, FactorArchive, FactorIdentity
@@ -412,14 +413,7 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
         validate_panel(panel, self.spec, stage)
 
     def _compile(self, expression: str):
-        if len(expression) > self.spec.max_formula_nodes * 100:
-            raise FormulaBudgetError("formula exceeds complexity budget")
-        compiled = compile_expression(expression)
-        if sum(1 for _ in ast.walk(compiled.tree)) > self.spec.max_formula_nodes:
-            raise FormulaBudgetError("formula exceeds node budget")
-        if compiled.lookback_hours > self.spec.max_lookback_hours:
-            raise FormulaBudgetError("formula exceeds declared history budget")
-        return compiled
+        return compile_factor_formula(expression, self.spec)
 
 
     def explore(self, panel: FactorInputPanel, *, goal_context: dict[str, Any] | None = None,
@@ -454,6 +448,8 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                        allowed_history_record_ids: set[str] | None = None,
                        history_reader: Callable[[str, str, int, int], Any] | None = None) -> dict[str, Any]:
         """Replay committed A checkpoints; never reopen a run after B was frozen."""
+        require(not (self.root / "a-action-input-binding.json").exists(),
+                "action-bound A runs must resume through program actions")
         if history_index is not None:
             self.history_index = list(history_index)
         if allowed_history_record_ids is not None:
@@ -461,6 +457,8 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
         if history_reader is not None:
             self.history_reader = history_reader
         require(not (self.root / "frozen_batch.json").exists(), "cannot resume A after freezing B")
+        require(self._a_manifest_state()[0] is None,
+                "A manifest is sealed; cannot resume A exploration")
         self._validate_panel(panel, "A")
         records = {r["id"]: r for r in self.store.all()}
         require("inputs" in records, "A input record is missing")
@@ -566,10 +564,9 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
             item = self.candidates[cid]
             definition = item["definition"]
             report = (saved[f"{cid}-evaluation"] if f"{cid}-evaluation" in saved else
-                      evaluate_factor(values, labels, self.spec, "A", definition["direction"]))
-            if f"{cid}-evaluation" not in saved:
-                report["horizon_comparison"] = evaluate_horizon_comparison(
-                    values, labels_by_horizon, self.spec, definition["direction"])
+                      evaluate_a_candidate(values, labels_by_horizon, self.spec, definition["direction"],
+                                           evaluate_fn=evaluate_factor,
+                                           horizon_fn=evaluate_horizon_comparison))
             item["evaluation"] = report
             if f"{cid}-evaluation" not in saved:
                 expression = item["calculation"]["executed_expression"]["expanded_expression"]
@@ -757,26 +754,15 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
         plan = item["experiment"]
         control = self.candidates[plan["control_id"]]
         baseline = evaluate_expression(control["calculation"]["executed_expression"]["expression"], panel).values
-        design = plan["experiment_design"]
-        if design["metric"] == "rank_displacement":
-            require(self.rank_displacement_version == RANK_DISPLACEMENT_VERSION,
-                    "rank-displacement experiments require the declared evaluator definition")
-            require(item["definition"]["direction"] == control["definition"]["direction"],
-                    "rank-displacement comparisons keep the frozen direction")
-            comparison_labels = build_labels(
-                panel, self.spec, "A", horizon_hours=design["horizon_hours"])
-            comparison = compare_rank_displacement_experiment(
-                values, baseline, comparison_labels, self.spec,
-                item["definition"]["direction"], plan, universe=panel.universe)
-        else:
-            common = values.notna() & baseline.notna()
-            # Both candidates are ranked/grouped again on the identical valid assets.
-            trial = evaluate_factor(values.where(common), labels, self.spec, "A", item["definition"]["direction"])
-            base = evaluate_factor(baseline.where(common), labels, self.spec, "A", control["definition"]["direction"])
-            comparison = compare_experiment(trial, base, plan, self.spec)
-            comparison["common_asset_observations"] = int(common.sum())
-            comparison["trial_on_common_assets"] = trial
-            comparison["control_on_common_assets"] = base
+        # Both candidates are ranked/grouped on the common valid assets for the
+        # legacy IC/spread metrics; rank-displacement keeps its declared H and Δ.
+        comparison = compare_candidates(
+            values, baseline, panel, labels, self.spec,
+            item["definition"]["direction"], control["definition"]["direction"],
+            plan, self.rank_displacement_version, evaluate_fn=evaluate_factor,
+            compare_fn=compare_experiment,
+            rank_compare_fn=compare_rank_displacement_experiment,
+            build_labels_fn=build_labels)
         route = self.routes[plan["route_id"]]
         route["decision"] = comparison["decision"]
         comparison["route_decision"] = route["decision"]
@@ -785,15 +771,15 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
 
     def _load_candidates(self) -> None:
         self.decisions = {}
-        for record in self.store.all():
+        records = self.store.all()
+        for record in records:
             data = record["data"]
             if record["kind"] == "candidate":
                 self.candidates[data["id"]] = data
-        for record in self.store.all():
-            if record["kind"] in {"calculation", "evaluation", "model_report"}:
+        for record in records:
+            if record["kind"] in {"calculation", "evaluation"}:
                 data = record["data"]
-                key = "model_report" if record["kind"] == "model_report" else record["kind"]
-                self.candidates[data["candidate_id"]][key] = data
+                self.candidates[data["candidate_id"]][record["kind"]] = data
             elif record["kind"] == "research_review":
                 self.decisions.update({decision["candidate_id"]: decision
                                        for decision in record["data"]["candidate_decisions"]})
@@ -803,9 +789,58 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                 if "decisions" in record["data"]:
                     self.decisions.update({decision["candidate_id"]: decision
                                            for decision in record["data"]["decisions"]})
+        for candidate_id, record in _latest_model_reports(records).items():
+            require(candidate_id in self.candidates,
+                    "A model report belongs to a missing candidate")
+            self.candidates[candidate_id]["model_report"] = record["data"]
 
-    def freeze(self, candidate_ids: list[str], validation_universe: pd.Series) -> dict[str, Any]:
-        require((self.root / "a-complete.json").exists(), "complete A exploration before freezing B")
+    def _a_manifest_state(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Return a saved native A manifest and its completion checkpoint, if present."""
+        completion_path = self.root / "a-complete.json"
+        completion = json.loads(completion_path.read_text()) if completion_path.exists() else None
+        records = self.store.all()
+        manifests = [record for record in records if record["kind"] == "a_manifest"]
+        fixed_manifest_path = self.store.root / "a-manifest.json"
+        if fixed_manifest_path.exists():
+            fixed_manifest = self.store._load(fixed_manifest_path)
+            require(fixed_manifest["id"] == "a-manifest" and fixed_manifest["kind"] == "a_manifest",
+                    "saved A manifest record has an invalid identifier or kind")
+            if not any(record["id"] == fixed_manifest["id"] for record in manifests):
+                manifests.append(fixed_manifest)
+
+        if completion is not None and "manifest_ref" in completion:
+            manifest_ref = identifier(completion["manifest_ref"])
+            matches = [record for record in manifests if record["id"] == manifest_ref]
+            require(len(manifests) == 1 and len(matches) == 1,
+                    "A completion references a missing or ambiguous manifest record")
+            manifest = matches[0]
+            require(completion.get("status") == "complete"
+                    and all(field in completion and field in manifest["data"]
+                            and completion[field] == manifest["data"][field]
+                            for field in ("candidate_ids", "evaluated_ids", "retained_ids")),
+                    "A completion checkpoint differs from its manifest")
+            return manifest, completion
+
+        require(len(manifests) <= 1, "A run contains ambiguous manifest records")
+        return (manifests[0] if manifests else None), completion
+
+    def freeze(self, candidate_ids: list[str], validation_universe: pd.Series, *,
+               a_manifest_ref: str | None = None) -> dict[str, Any]:
+        completion_path = self.root / "a-complete.json"
+        require(completion_path.exists(), "complete A exploration before freezing B")
+        manifest, completion = self._a_manifest_state()
+        if manifest is None:
+            require(a_manifest_ref is None,
+                    "A manifest reference does not identify a completed A manifest")
+        else:
+            require(a_manifest_ref is not None,
+                    "freezing a native A manifest requires its manifest_ref")
+            manifest_ref = identifier(a_manifest_ref)
+            require(completion is not None and completion.get("manifest_ref") == manifest_ref
+                    and manifest["id"] == manifest_ref,
+                    "A manifest reference differs from the completed A checkpoint")
+            require(candidate_ids == manifest["data"]["retained_ids"],
+                    "native B freeze must include every retained candidate from the A manifest")
         require(candidate_ids and len(set(candidate_ids)) == len(candidate_ids), "freeze a nonempty unique candidate batch")
         validation_universe = validate_universe(validation_universe)
         start, end = self.spec.bounds("B")
@@ -877,10 +912,14 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
             definitions[cid] = frozen_candidate
         frozen = {"contract": self.spec.as_dict(), "candidates": definitions,
                   "frozen_at": datetime.now(timezone.utc).isoformat()}
+        if a_manifest_ref is not None:
+            frozen["a_manifest_ref"] = a_manifest_ref
         write_json(self.root / "frozen_batch.json", frozen)
         return {"candidate_ids": candidate_ids}
 
     def validate(self, load_panel: Callable[[], FactorInputPanel], idea_pool: Path) -> dict[str, Any]:
+        require(self._a_manifest_state()[0] is None,
+                "native manifest B validation must use the program action")
         already_accessed = (self.root / "b-access-started.json").exists()
         try:
             return self._validate_once(load_panel, idea_pool)
@@ -894,6 +933,19 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
         frozen = json.loads((self.root / "frozen_batch.json").read_text())
         require(frozen["contract"] == json.loads((self.root / "contract.json").read_text()), "research contract changed")
         require(frozen["contract"] == self.spec.as_dict(), "loaded research contract changed")
+        manifest, completion = self._a_manifest_state()
+        if manifest is None:
+            require("a_manifest_ref" not in frozen,
+                    "frozen A manifest reference does not identify a saved A manifest record")
+        else:
+            require("a_manifest_ref" in frozen,
+                    "native B freeze is missing its A manifest reference")
+            manifest_ref = identifier(frozen["a_manifest_ref"])
+            require(completion is not None and completion.get("manifest_ref") == manifest_ref
+                    and manifest["id"] == manifest_ref,
+                    "frozen A manifest reference differs from the completed A checkpoint")
+            require(list(frozen["candidates"]) == manifest["data"]["retained_ids"],
+                    "frozen candidates differ from the completed A manifest retained list")
         self._load_candidates()
         for cid, item in frozen["candidates"].items():
             require(cid in self.candidates and "calculation" in self.candidates[cid],
@@ -968,60 +1020,136 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                         "frozen A horizon evidence differs from the archived report")
         return frozen
 
-    def _validate_once(self, load_panel: Callable[[], FactorInputPanel], idea_pool: Path) -> dict[str, Any]:
+    def validate_numerical(self, load_panel: Callable[[], FactorInputPanel], *,
+                           commit: Callable[[Callable[[], Any]], Any] | None = None,
+                           stop_check: Callable[[], Any] | None = None) -> dict[str, Any]:
+        """Read or calculate the frozen B batch without invoking role models or finalizing delivery."""
+        checkpoint = self.root / "b-numerical-complete.json"
+        access_marker = self.root / "b-access-started.json"
+        if checkpoint.exists():
+            from .research_actions import read_b_checkpoint
+
+            return read_b_checkpoint(self)
+        manifest, _ = self._a_manifest_state()
+        if manifest is not None:
+            require(commit is not None and stop_check is not None,
+                    "native manifest B validation requires action-bound commit and stop checks")
+        if stop_check is not None:
+            stop_check()
+        require(not access_marker.exists(),
+                "B access was attempted without a complete numerical checkpoint; inspect existing evidence before retrying")
+
+        def commit_operation(operation):
+            return operation() if commit is None else commit(operation)
+
+        try:
+            return self._validate_once(load_panel, complete_reports=False,
+                                       commit=commit, stop_check=stop_check)
+        except Exception as exc:
+            if access_marker.exists() and not checkpoint.exists():
+                if stop_check is not None:
+                    stop_check()
+                stopped = {
+                    "error_type": type(exc).__name__, "reason": str(exc),
+                    "B_status": "access was attempted; inspect existing evidence before any subsequent research"}
+                commit_operation(lambda: write_json(self.root / "validation-stopped.json", stopped))
+            raise
+
+    def _validate_once(self, load_panel: Callable[[], FactorInputPanel], idea_pool: Path | None = None,
+                       *, complete_reports: bool = True,
+                       commit: Callable[[Callable[[], Any]], Any] | None = None,
+                       stop_check: Callable[[], Any] | None = None) -> dict[str, Any]:
+        def check_stop():
+            if stop_check is not None:
+                stop_check()
+
+        def commit_operation(operation):
+            return operation() if commit is None else commit(operation)
+
         frozen = self._checked_frozen()
+        check_stop()
         # This marker is committed before even invoking the B data loader.
         access_marker = {"candidate_ids": list(frozen["candidates"]),
                          "time": datetime.now(timezone.utc).isoformat(),
                          "use": "fixed_batch_validation"}
-        write_json(self.root / "b-access-started.json", access_marker)
+        commit_operation(lambda: write_json(self.root / "b-access-started.json", access_marker))
+        check_stop()
         panel = load_panel()
+        check_stop()
         self._validate_panel(panel, "B")
+        check_stop()
         frozen_membership = self.root / "B-membership-frozen.csv"
+        membership_csv = panel.universe.rename("eligible").to_csv()
         if frozen_membership.exists():
-            require(frozen_membership.read_text() == panel.universe.rename("eligible").to_csv(),
+            require(frozen_membership.read_text() == membership_csv,
                     "B membership changed after the batch was frozen")
-        with (self.root / "B-universe.csv").open("x") as handle:
-            panel.universe.rename("eligible").to_csv(handle)
+        def write_universe():
+            with (self.root / "B-universe.csv").open("x") as handle:
+                handle.write(membership_csv)
+        commit_operation(write_universe)
+        check_stop()
         requested_horizons = {horizon for item in frozen["candidates"].values()
                               for horizon in item["retained_horizons"]}
-        labels_by_horizon = {horizon: build_labels(
-            panel, self.spec, "B", horizon_hours=horizon) for horizon in sorted(requested_horizons)}
-        store = RecordStore(self.root / "b_records", run_root=self.root.resolve(),
-                            archive_root=self.archive_root)
-        store.append("inputs", "data_provenance", {
-            "panel": _panel_metadata(panel), "catalog": panel.ideation_context()})
+        check_stop()
+        labels_by_horizon = {}
+        for horizon in sorted(requested_horizons):
+            check_stop()
+            labels_by_horizon[horizon] = build_labels(
+                panel, self.spec, "B", horizon_hours=horizon)
+        check_stop()
+        store = commit_operation(lambda: RecordStore(
+            self.root / "b_records", run_root=self.root.resolve(), archive_root=self.archive_root))
+        provenance = {"panel": _panel_metadata(panel), "catalog": panel.ideation_context()}
+        commit_operation(lambda: store.append("inputs", "data_provenance", provenance))
         reports = {}
         for cid, item in frozen["candidates"].items():
-            store.append(f"{cid}-frozen", "frozen_definition_and_A_evidence", item)
-            result = evaluate_expression(item["executed"]["expression"], panel)
+            check_stop()
+            commit_operation(lambda cid=cid, item=item: store.append(
+                f"{cid}-frozen", "frozen_definition_and_A_evidence", item))
+            check_stop()
+            result = evaluate_expression(item["executed"]["expression"], panel,
+                                         stop_check=check_stop)
             require(result.definition == item["executed"], "B execution differs from frozen formula")
+            check_stop()
             identity = self._factor_identity(result.definition["expanded_expression"],
                                              item["definition"]["direction"])
             displacement = None
             if item.get("rank_displacement_version") is not None:
+                check_stop()
                 require(item["rank_displacement_version"] == self.rank_displacement_version
                         == RANK_DISPLACEMENT_VERSION,
                         "frozen rank-displacement definition differs from this run")
                 displacement = evaluate_rank_displacement(
-                    result.values, panel.universe, self.spec, "B")
+                    result.values, panel.universe, self.spec, "B", stop_check=check_stop)
+                check_stop()
                 require(displacement["definition_version"] == item["rank_displacement_version"],
                         "B rank-displacement implementation differs from frozen A")
             horizon_reports, locators = {}, {}
             for horizon in item["retained_horizons"]:
+                check_stop()
                 horizon_report = evaluate_factor(
                     result.values, labels_by_horizon[horizon], self.spec, "B",
-                    item["definition"]["direction"], horizon_hours=horizon)
+                    item["definition"]["direction"], horizon_hours=horizon,
+                    stop_check=check_stop)
+                check_stop()
                 horizon_reports[horizon] = horizon_report
-                locators[horizon] = self._write_evaluation(
-                    cid, "B", horizon_report, identity, definition=item["definition"])
-                write_group_plot(self.root / "plots" / f"{cid}-B-{horizon}h.svg", horizon_report)
+                locators[horizon] = commit_operation(lambda cid=cid, horizon_report=horizon_report,
+                                                     identity=identity, item=item: self._write_evaluation(
+                    cid, "B", horizon_report, identity, definition=item["definition"]))
+                commit_operation(lambda cid=cid, horizon=horizon, horizon_report=horizon_report:
+                                 write_group_plot(
+                                     self.root / "plots" / f"{cid}-B-{horizon}h.svg", horizon_report))
+                check_stop()
             displacement_locator = None
             if displacement is not None:
-                displacement_locator = self._write_rank_displacement(
-                    cid, "B", displacement, identity,
-                    source={"frozen_A_rank_displacement_archive": item["a_rank_displacement_archive"],
-                            "B_factor_evaluations": locators})
+                check_stop()
+                displacement_locator = commit_operation(lambda cid=cid, displacement=displacement,
+                                                        identity=identity, item=item, locators=locators:
+                    self._write_rank_displacement(
+                        cid, "B", displacement, identity,
+                        source={"frozen_A_rank_displacement_archive": item["a_rank_displacement_archive"],
+                                "B_factor_evaluations": locators}))
+                check_stop()
             reports[cid] = {"segment": "B", "direction": item["definition"]["direction"],
                             "retained_horizons": list(item["retained_horizons"]),
                             "horizons": {str(horizon): horizon_reports[horizon]
@@ -1029,30 +1157,48 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
             if displacement is not None:
                 reports[cid]["rank_displacement"] = displacement
                 reports[cid]["rank_displacement_archive"] = displacement_locator
-            store.append(f"{cid}-evaluation", "evaluation",
-                         self._multi_horizon_evaluation_record_data(
-                             cid, horizon_reports, locators, item["retained_horizons"],
-                             displacement, displacement_locator))
-        correction = correct_batch(reports, self.spec)
-        store.append("batch-correction", "multiple_testing", correction)
-        decisions = {}
-        for cid, report in reports.items():
-            decisions[cid] = b_candidate_decision(cid, report, correction, self.spec)
-            store.append(f"{cid}-validation", "validation_result", {"candidate_id": cid, **decisions[cid]})
+            evaluation_record = self._multi_horizon_evaluation_record_data(
+                cid, horizon_reports, locators, item["retained_horizons"],
+                displacement, displacement_locator)
+            commit_operation(lambda cid=cid, evaluation_record=evaluation_record: store.append(
+                f"{cid}-evaluation", "evaluation", evaluation_record))
+        check_stop()
+        program = ResearchActions(self).correct_and_admit(reports)
+        check_stop()
+        correction = program["batch_correction"]
+        commit_operation(lambda: store.append("batch-correction", "multiple_testing", correction))
+        decisions = program["decisions"]
+        for cid, decision in decisions.items():
+            check_stop()
+            commit_operation(lambda cid=cid, decision=decision: store.append(
+                f"{cid}-validation", "validation_result", {"candidate_id": cid, **decision}))
         checkpoint = {"candidate_ids": list(reports),
                       "retained_horizons": {cid: report["retained_horizons"]
                                             for cid, report in reports.items()}}
-        write_json(self.root / "b-numerical-complete.json", checkpoint)
-        return self._complete_b_reports(idea_pool)
+        check_stop()
+        commit_operation(lambda: write_json(self.root / "b-numerical-complete.json", checkpoint))
+        if complete_reports:
+            require(idea_pool is not None, "B report completion requires an idea-pool destination")
+            return self._complete_b_reports(idea_pool)
+        from .research_actions import read_b_checkpoint
+
+        return read_b_checkpoint(self)
 
     def complete_reports(self, stage: str, idea_pool: Path) -> dict[str, Any]:
         """Fill missing narratives from saved evidence only; never reload A/B prices."""
         require(stage in {"A", "B"}, "report stage must be A or B")
+        if stage == "A":
+            require(not (self.root / "a-action-input-binding.json").exists(),
+                    "action-bound A runs must complete reports through program actions")
         require(json.loads((self.root / "contract.json").read_text()) == self.spec.as_dict(),
                 "research contract changed")
         if stage == "B":
+            require(self._a_manifest_state()[0] is None,
+                    "native manifest B reports must use the program action")
             return self._complete_b_reports(idea_pool)
         require(not (self.root / "frozen_batch.json").exists(), "A evidence cannot change after freezing B")
+        require(self._a_manifest_state()[0] is None,
+                "A manifest is sealed; cannot complete A reports")
         records = self.store.all()
         evaluated = [r["data"]["candidate_id"] for r in records if r["kind"] == "evaluation"]
         require(bool(evaluated), "no saved A evaluations to explain")
@@ -1068,113 +1214,21 @@ class FactorMiner(IdeatorRole, CalculatorRole, EvaluatorRole, OptimizerRole):
                 "exploration_complete": (self.root / "a-complete.json").exists()}
 
     def _complete_b_reports(self, idea_pool: Path) -> dict[str, Any]:
-        frozen = self._checked_frozen()
-        require((self.root / "b-numerical-complete.json").exists(), "complete B numerical validation before completing reports")
-        require((self.root / "b-access-started.json").exists(), "B access marker is missing")
+        result = self._complete_b_reports_program(idea_pool)
+        if result["status"] != "reports_pending":
+            return result
         store = RecordStore(self.root / "b_records", run_root=self.root.resolve(),
                             archive_root=self.archive_root)
-        records = store.all()
-        evaluation_records = [record for record in records if record["kind"] == "evaluation"]
-        validation_records = [record for record in records if record["kind"] == "validation_result"]
-        correction_records = [record for record in records if record["kind"] == "multiple_testing"]
-        require(len(evaluation_records) == len(validation_records) == len(frozen["candidates"])
-                and len(correction_records) == 1, "B numerical records are incomplete or repeated")
-        reports = {record["data"]["candidate_id"]: {
-            key: value for key, value in record["data"].items() if key != "candidate_id"}
-            for record in evaluation_records}
-        decisions = {record["data"]["candidate_id"]: {
-            key: value for key, value in record["data"].items() if key != "candidate_id"}
-            for record in validation_records}
-        require(set(reports) == set(decisions) == set(frozen["candidates"]), "B numerical batch is incomplete")
-        expected_checkpoint = {"candidate_ids": list(frozen["candidates"]),
-                               "retained_horizons": {cid: item["retained_horizons"]
-                                                     for cid, item in frozen["candidates"].items()}}
-        require(json.loads((self.root / "b-numerical-complete.json").read_text()) == expected_checkpoint,
-                "B numerical checkpoint differs from the frozen batch")
-        for cid, report in reports.items():
-            frozen_item = frozen["candidates"][cid]
-            require(report["segment"] == "B"
-                    and report["direction"] == frozen["candidates"][cid]["definition"]["direction"]
-                    and report["retained_horizons"] == frozen["candidates"][cid]["retained_horizons"]
-                    and set(report["horizons"]) == {str(horizon) for horizon in report["retained_horizons"]},
-                    "B evaluation horizons differ from the frozen batch")
-            if frozen_item.get("rank_displacement_version") is not None:
-                displacement = report.get("rank_displacement")
-                displacement_locator = report.get("rank_displacement_archive")
-                expected_displacement_key = EvaluationKey(
-                    f"{self.spec.run_id}/B", dumps(self.spec.as_dict()),
-                    frozen_item["rank_displacement_version"], "B", "rank-displacement").as_dict()
-                require(frozen_item["rank_displacement_version"] == self.rank_displacement_version
-                        == RANK_DISPLACEMENT_VERSION
-                        and displacement is not None and displacement_locator is not None
-                        and displacement.get("definition_version") == frozen_item["rank_displacement_version"]
-                        and displacement.get("segment") == "B"
-                        and displacement_locator["identity"]
-                        == report["horizons"][str(report["retained_horizons"][0])]["factor_archive"]["identity"]
-                        and displacement_locator["evaluation_key"] == expected_displacement_key,
-                        "B rank-displacement diagnostic differs from frozen A definition")
-            else:
-                require("rank_displacement" not in report and "rank_displacement_archive" not in report
-                        and self.rank_displacement_version is None,
-                        "legacy frozen B cannot receive new rank-displacement diagnostics")
-            identity = self._factor_identity(
-                frozen["candidates"][cid]["executed"]["expanded_expression"], report["direction"]).as_dict()
-            for horizon in report["retained_horizons"]:
-                horizon_report = report["horizons"][str(horizon)]
-                locator = horizon_report["factor_archive"]
-                require(horizon_report["segment"] == "B"
-                        and horizon_report["direction"] == frozen["candidates"][cid]["definition"]["direction"]
-                        and horizon_report["horizon_hours"] == horizon
-                        and locator["identity"] == identity
-                        and locator["evaluation_key"] == self._evaluation_key("B", horizon).as_dict(),
-                        "B archive identity differs from its frozen formula, direction or horizon")
-        correction = correction_records[0]["data"]
-        require(correction == correct_batch(reports, self.spec), "B batch correction differs from saved evaluations")
-        for cid, report in reports.items():
-            expected = b_candidate_decision(cid, report, correction, self.spec)
-            require(decisions[cid] == expected, "B program decision differs from saved evaluation")
-        completed_path = self.root / "validation.json"
-        if completed_path.exists():
-            completed = json.loads(completed_path.read_text())
-            prior_decisions = {cid: {key: value for key, value in decision.items() if key != "idea_card"}
-                               for cid, decision in completed["decisions"].items()}
-            require(prior_decisions == decisions and completed["batch_correction"] == correction,
-                    "completed validation differs from saved evidence")
-        narratives = {r["data"]["candidate_id"]: r for r in records if r["kind"] == "model_report"}
         gateway = AgentGateway(self.model, self.spec, store, self.root / "model_calls", stage="B",
                                progress=self.progress)
-        for cid in reports:
-            if cid not in narratives:
-                self._try_report(cid, gateway)
-        records = store.all()
-        narratives = {r["data"]["candidate_id"]: r for r in records if r["kind"] == "model_report"}
-        pending = [cid for cid in reports if cid not in narratives]
-        for cid, decision in decisions.items():
-            if decision["eligible_for_idea_pool"] and cid in narratives:
-                narrative = narratives[cid]
-                card = self._idea_card(cid, frozen["candidates"][cid], reports[cid], narrative["data"], decision,
-                                       narrative["created_at"])
-                path = Path(idea_pool) / f"{self.spec.run_id}--{cid}.json"
-                if path.exists():
-                    existing_card = json.loads(path.read_text())
-                    require(without_hash_metadata(existing_card) == without_hash_metadata(card),
-                            "existing idea card differs from saved research evidence")
-                else:
-                    write_json(path, card)
-                decision["idea_card"] = str(path)
-        output = {"batch_correction": correction, "decisions": decisions,
-                  "status": "reports_pending" if pending else "complete", "pending_report_ids": pending,
-                  "B_use": "used for fixed-candidate selection; not untouched data for subsequent strategy development",
-                  "C_use": "reserved; never loaded by factor mining"}
-        write_research_report(self.root / "B-report.md", self.spec.run_id, self.spec.purpose, records, "B", replace=True)
-        if not pending:
-            path = self.root / "validation.json"
-            if path.exists():
-                prior = json.loads(path.read_text())
-                require(prior == output, "completed validation differs from saved evidence")
-            else:
-                write_json(path, output)
-        return output
+        for cid in result["pending_report_ids"]:
+            self._try_report(cid, gateway)
+        return self._complete_b_reports_program(idea_pool)
+
+    def _complete_b_reports_program(self, idea_pool: Path) -> dict[str, Any]:
+        from .research_actions import complete_b_reports_program
+
+        return complete_b_reports_program(self, idea_pool)
 
     def _idea_card(self, cid: str, item: dict[str, Any], report: dict[str, Any], narrative: dict[str, Any],
                    decision: dict[str, Any], report_created_at: str) -> dict[str, Any]:

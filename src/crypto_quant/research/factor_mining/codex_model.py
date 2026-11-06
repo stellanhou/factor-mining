@@ -29,12 +29,9 @@ from openai_codex.generated.v2_all import (
 )
 
 from .contracts import require, text
+from .codex_model_metadata import DEFAULT_MODEL, PROVIDER
 from .model import ApiCallError, ModelReply, RecoverableToolError
 from .structured_output import validate_schema
-
-
-DEFAULT_MODEL = "gpt-5.6-luna"
-PROVIDER = "codex-sdk-chatgpt"
 
 
 def _config(directory, codex_bin=None, *, service_tier=None, experimental_api=None):
@@ -144,6 +141,8 @@ def _validate_dynamic_tools(tools: list[dict[str, Any]]) -> tuple[list[dict[str,
 
 
 class CodexModel:
+    supports_native_tools = True
+
     def __init__(self, model=DEFAULT_MODEL, *, reasoning_effort="max", timeout_seconds=300,
                  codex_bin=None, service_tier=None):
         self.model = text(model, "model")

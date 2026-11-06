@@ -1,20 +1,14 @@
 """Calculator role: deterministic formula execution and formula-error repair."""
 from __future__ import annotations
 
-import os
-
 import pandas as pd
 
 from crypto_quant.features.factor_expressions import evaluate_expression
 from crypto_quant.features.factor_inputs import FactorInputPanel
 from .contracts import _object_schema, _text_schema, require
-from .factor_archive import FactorArchive
+from .research_actions import FormulaBudgetError, archive_factor_values
 from .model import ApiCallError
 from .records import ModelResponseError
-
-
-class FormulaBudgetError(ValueError):
-    """A valid formula exceeds its contract; simplifying it is new research."""
 
 
 class CalculatorRole:
@@ -73,19 +67,8 @@ class CalculatorRole:
                        "executed_expression": result.definition if result is not None else None}
         if result is not None:
             calculation["valid_values"] = int(result.values.notna().sum())
-            identity = self._factor_identity(result.definition["expanded_expression"], definition["direction"])
-            archive = FactorArchive.open_for(self.archive_root, identity)
-            data_version = f"{self.spec.run_id}/A"
-            value_set = archive.append_value_set(
-                data_version, "factor-eval-v1", result.values.to_csv().encode("utf-8"),
-                provenance={"run_id": self.spec.run_id, "candidate_id": cid, "segment": "A",
-                            "definition": definition, "executed_expression": result.definition})
-            calculation["values_artifact"] = {
-                "root": os.path.relpath(self.archive_root.resolve(), self.root.resolve()),
-                "identity": identity.as_dict(), "data_version": data_version,
-                "computation_semantics": "factor-eval-v1",
-                "value_set_id": value_set["value_set_id"], "rows": len(result.values),
-            }
+            calculation["values_artifact"] = archive_factor_values(
+                self.archive_root, self.root, self.spec, cid, definition, result)
         item["calculation"] = calculation
         self.store.append(f"{cid}-calculation", "calculation", {"candidate_id": cid, **calculation})
         return result.values if result is not None else None

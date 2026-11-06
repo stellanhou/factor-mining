@@ -17,7 +17,6 @@ from typing import Any, Callable
 from .contracts import ResearchSpec, digest, dumps, identifier, model_fields, require
 from .factor_archive import EvaluationKey, FactorArchive, FactorIdentity
 from .model import ApiCallError, JsonModel, ModelReply, RoleModels
-from .codex_model import CodexModel
 from crypto_quant.research.progress import ProgressLog
 
 
@@ -31,6 +30,14 @@ class ContextBudgetError(ValueError):
 
 class EvidenceIntegrityError(ValueError):
     """Stored evidence cannot be parsed; never send this back as a model correction."""
+
+
+class InvalidRecordPointer(KeyError):
+    """A caller-supplied JSON pointer does not resolve within valid record data."""
+
+    def __init__(self, component: str):
+        self.component = component
+        super().__init__(f"JSON pointer component {component!r} does not exist")
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -257,7 +264,16 @@ def read_pointer(value: Any, pointer: str, offset: int, limit: int) -> Any:
     require(type(offset) is int and offset >= 0 and type(limit) is int and limit > 0, "invalid record page")
     for part in pointer.split("/")[1:]:
         part = part.replace("~1", "/").replace("~0", "~")
-        value = value[int(part)] if isinstance(value, list) else value[part]
+        if isinstance(value, dict):
+            if part not in value:
+                raise InvalidRecordPointer(part)
+            value = value[part]
+        elif isinstance(value, list):
+            if not part.isdecimal() or int(part) >= len(value):
+                raise InvalidRecordPointer(part)
+            value = value[int(part)]
+        else:
+            raise InvalidRecordPointer(part)
     if isinstance(value, list):
         return {"total": len(value), "offset": offset, "items": value[offset:offset + limit]}
     require(offset == 0, "offset applies only to arrays")
@@ -719,7 +735,8 @@ class AgentGateway:
                                for record in records]}
         role_model = (self.model.get_model_for_role(role) if isinstance(self.model, RoleModels)
                       else self.model)
-        native_ideator = role == "ideator" and self.stage == "A" and isinstance(role_model, CodexModel)
+        native_ideator = (role == "ideator" and self.stage == "A"
+                          and getattr(role_model, "supports_native_tools", False) is True)
         system = SYSTEM if self.stage == "A" else SYSTEM.replace(
             "探索只使用A，禁止请求B/C。", "当前仅解释冻结候选的B段验证及与A的对照，禁止修改候选或请求C。")
         native_tools = native_handler = native_model = None

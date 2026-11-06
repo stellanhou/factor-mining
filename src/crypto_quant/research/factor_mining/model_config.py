@@ -4,8 +4,18 @@ from pathlib import Path
 
 from .contracts import require
 from .model import FACTOR_ROLES, RoleModels
-from .codex_model import CodexModel, DEFAULT_MODEL as LUNA_MODEL, PROVIDER as CODEX_PROVIDER
+from .codex_model_metadata import DEFAULT_MODEL as LUNA_MODEL, PROVIDER as CODEX_PROVIDER
 from .mimo_model import MimoModel, DEFAULT_MODEL as MIMO_MODEL, PROVIDER as MIMO_PROVIDER
+
+
+def _codex_model(*args, **kwargs):
+    try:
+        from .codex_model import CodexModel
+    except ModuleNotFoundError as exc:
+        if exc.name == "openai_codex":
+            raise RuntimeError("install factor-mining[codex] to use the Codex model adapter") from exc
+        raise
+    return CodexModel(*args, **kwargs)
 
 
 def add_model_arguments(parser, *, include_model=True, include_roles=False):
@@ -36,8 +46,8 @@ def model_from_args(args):
                     and {"model", "reasoning_effort"} <= set(settings)
                     and set(settings) <= {"model", "reasoning_effort", "service_tier"},
                     "each role requires model and reasoning_effort; service_tier is optional")
-            models[role] = CodexModel(**settings, timeout_seconds=args.timeout_seconds,
-                                      codex_bin=args.codex_bin)
+            models[role] = _codex_model(**settings, timeout_seconds=args.timeout_seconds,
+                                        codex_bin=args.codex_bin)
         return RoleModels(models)
     if args.provider == "mimo":
         require(args.reasoning_effort is None, "MiMo uses --thinking, not --reasoning-effort")
@@ -46,8 +56,8 @@ def model_from_args(args):
                          thinking=args.thinking or "enabled")
     require(args.provider == "codex", "unknown model provider")
     require(args.thinking is None, "--thinking is only supported by MiMo")
-    return CodexModel(args.model or LUNA_MODEL, timeout_seconds=args.timeout_seconds,
-                      reasoning_effort=args.reasoning_effort or "max", codex_bin=args.codex_bin)
+    return _codex_model(args.model or LUNA_MODEL, timeout_seconds=args.timeout_seconds,
+                        reasoning_effort=args.reasoning_effort or "max", codex_bin=args.codex_bin)
 
 
 def model_from_settings(settings):
@@ -67,7 +77,7 @@ def model_from_settings(settings):
         require(settings["provider"] == CODEX_PROVIDER, "unsupported saved model provider")
         codex_bin = {"codex_bin": settings["codex_bin"]} if "codex_bin" in settings else {}
         service_tier = {"service_tier": settings["service_tier"]} if "service_tier" in settings else {}
-        model = CodexModel(settings["model"], timeout_seconds=settings["timeout_seconds"],
-                           reasoning_effort=settings["reasoning_effort"], **codex_bin, **service_tier)
+        model = _codex_model(settings["model"], timeout_seconds=settings["timeout_seconds"],
+                             reasoning_effort=settings["reasoning_effort"], **codex_bin, **service_tier)
     require(model.settings() == settings, "saved model configuration or runtime changed; create a new Goal")
     return model
